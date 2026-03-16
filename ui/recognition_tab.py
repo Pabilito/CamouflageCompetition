@@ -200,7 +200,36 @@ class RecognitionTab(ctk.CTkFrame):
         self._status = ctk.CTkLabel(
             cam_col, text="Start camera to begin.",
             font=ctk.CTkFont(size=11), text_color="#888")
-        self._status.grid(row=5, column=0, pady=(0, 6))
+        self._status.grid(row=5, column=0, pady=(0, 4))
+
+        # ── Image Summary (shown after accept) ────────────────────────────────
+        self._img_summary_frame = ctk.CTkFrame(
+            cam_col, corner_radius=8, fg_color=("#0d1b2a", "#0d1b2a"))
+        self._img_summary_frame.grid(row=6, column=0, sticky="ew", pady=(4, 6))
+        self._img_summary_frame.columnconfigure(1, weight=1)
+        self._img_summary_frame.grid_remove()
+
+        def _img_stat(label: str, row: int):
+            ctk.CTkLabel(self._img_summary_frame, text=label,
+                         font=ctk.CTkFont(size=11), text_color="#888",
+                         anchor="w").grid(row=row, column=0, padx=(12, 6), pady=3, sticky="w")
+            val = ctk.CTkLabel(self._img_summary_frame, text="—",
+                               font=ctk.CTkFont(size=12, weight="bold"),
+                               text_color="#aaa", anchor="e")
+            val.grid(row=row, column=1, padx=(0, 12), pady=3, sticky="e")
+            return val
+
+        ctk.CTkLabel(self._img_summary_frame, text="Image Summary",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="#00d4ff").grid(
+            row=0, column=0, columnspan=2, padx=12, pady=(8, 2), sticky="w")
+
+        self._lbl_img_name      = _img_stat("Attacker:",          1)
+        self._lbl_avg_score     = _img_stat("Avg score:",         2)
+        self._lbl_rank          = _img_stat("Image rank:",        3)
+
+        ctk.CTkFrame(self._img_summary_frame, height=4, fg_color="transparent").grid(
+            row=4, column=0, columnspan=2)
 
         # ── Scores column ──────────────────────────────────────────────────────
         scores_col = ctk.CTkScrollableFrame(
@@ -216,7 +245,7 @@ class RecognitionTab(ctk.CTkFrame):
         for i, name in enumerate(self._engine.model_names):
             self._build_model_row(scores_col, name, row=i + 1)
 
-        # ── Summary panel ──────────────────────────────────────────────────────
+        # ── Session Summary ────────────────────────────────────────────────────
         n = len(self._engine.model_names)
 
         sep = ctk.CTkFrame(scores_col, height=1, fg_color="#333")
@@ -242,14 +271,13 @@ class RecognitionTab(ctk.CTkFrame):
                      text_color="#00d4ff").grid(
             row=0, column=0, columnspan=2, padx=12, pady=(8, 2), sticky="w")
 
-        self._lbl_avg_score     = _stat_row(summary_frame, "Avg score (this image):", 1)
-        self._lbl_rank          = _stat_row(summary_frame, "Image rank:",             2)
-        self._lbl_global_best   = _stat_row(summary_frame, "Current best score:",     3)
-        self._lbl_your_best     = _stat_row(summary_frame, "Your best score:",        4)
-        self._lbl_your_place    = _stat_row(summary_frame, "Your current place:",     5)
+        self._lbl_global_best   = _stat_row(summary_frame, "Current best score:", 1)
+        self._lbl_your_best     = _stat_row(summary_frame, "Your best score:",    2)
+        self._lbl_your_place    = _stat_row(summary_frame, "Your current place:", 3)
+        self._lbl_best_score    = self._lbl_your_best   # alias for existing code
 
-        # Keep _lbl_best_score as alias so existing _refresh_best_score code still works
-        self._lbl_best_score = self._lbl_your_best
+        ctk.CTkFrame(summary_frame, height=4, fg_color="transparent").grid(
+            row=4, column=0, columnspan=2)
 
         self._save_note = ctk.CTkLabel(
             scores_col, text="", font=ctk.CTkFont(size=10), text_color="#666")
@@ -317,6 +345,47 @@ class RecognitionTab(ctk.CTkFrame):
 
     # ── Gallery loading ───────────────────────────────────────────────────────
 
+    def add_control_image(self, user_name: str, image_path: str) -> None:
+        """
+        Incrementally add one new control image to the in-memory gallery.
+        Called by CaptureTab after a new image is accepted, so the gallery
+        stays in sync without a full reload.
+        """
+        if not self._gallery_ready:
+            return  # full load still in progress; it will pick this image up
+
+        def _embed():
+            try:
+                face_rgb = np.array(Image.open(image_path).convert("RGB"))
+            except Exception:
+                return
+
+            for model_name in self._engine.model_names:
+                emb = self._engine.embed(model_name, face_rgb)
+
+                # Update mean-embedding gallery
+                existing = self._galleries.setdefault(model_name, {})
+                existing.setdefault(user_name, []).append(emb)
+
+                # Update per-path gallery
+                paths = self._gallery_paths.setdefault(model_name, {})
+                paths.setdefault(user_name, []).append((image_path, emb))
+
+            # Refresh identity dropdown in case this is a brand-new user
+            all_users = sorted({u for g in self._galleries.values() for u in g})
+            def _ui():
+                current = self._identity_var.get()
+                self._identity_menu.configure(values=all_users)
+                if current not in all_users and all_users:
+                    self._identity_var.set(all_users[0])
+                self._gallery_status.configure(
+                    text=f"✓  {len(all_users)} identit"
+                         f"{'y' if len(all_users) == 1 else 'ies'} loaded.",
+                    text_color="#00ff9f")
+            self.after(0, _ui)
+
+        threading.Thread(target=_embed, daemon=True).start()
+
     def _reload_gallery(self) -> None:
         user_dir = Path(self._data_dir) / "users"
         if not user_dir.exists():
@@ -378,6 +447,7 @@ class RecognitionTab(ctk.CTkFrame):
             score_lbl.configure(text="—", text_color="#aaa")
             verdict_lbl.configure(text="")
             self.after(0, self._draw_bar, canvas, 0.0, "#333", threshold)
+        self._img_summary_frame.grid_remove()
         self._refresh_thumbnails()
         self._refresh_best_score()
 
@@ -394,6 +464,7 @@ class RecognitionTab(ctk.CTkFrame):
         if identity == "—":
             self._lbl_avg_score.configure(text="—", text_color="#aaa")
             self._lbl_rank.configure(text="—", text_color="#aaa")
+            self._img_summary_frame.grid_remove()
             return
 
         # Current best score = top-1 image globally
@@ -427,11 +498,14 @@ class RecognitionTab(ctk.CTkFrame):
                 text=f"#{your_place} / {total_users}", text_color=place_col)
 
     def _update_summary(self, scores: list[float], save_path: str) -> None:
-        """Called after inference: show avg score and image rank for the just-saved image."""
+        """Called after inference: populate and show the image summary box."""
         if not scores:
             return
         avg = sum(scores) / len(scores)
         col = _score_colour(avg, None)
+
+        identity = self._identity_var.get()
+        self._lbl_img_name.configure(text=identity, text_color="#e0e0e0")
         self._lbl_avg_score.configure(text=f"{avg:.4f}", text_color=col)
 
         # Image rank among all individual images
@@ -446,7 +520,9 @@ class RecognitionTab(ctk.CTkFrame):
                 "#ffd166" if rank <= total // 2 else "#ff6b6b")
             self._lbl_rank.configure(text=f"#{rank} / {total}", text_color=rank_col)
 
-        # Refresh all other stats (best scores, user place)
+        self._img_summary_frame.grid()   # make visible
+
+        # Refresh session summary stats
         self._refresh_best_score()
 
     # ── Adversarial thumbnail strip ───────────────────────────────────────────
@@ -466,6 +542,12 @@ class RecognitionTab(ctk.CTkFrame):
             self._adv_count_label.configure(text="No images yet.")
             return
 
+        # Build a quick path → avg_score lookup from the DB
+        all_ranking = self._db.get_average_ranking()
+        score_map: dict[str, float] = {
+            e["image_path"]: e["avg_score"] for e in all_ranking
+        }
+
         images = sorted(adv_dir.glob("*.jpg")) + sorted(adv_dir.glob("*.png"))
         for i, p in enumerate(images):
             try:
@@ -473,12 +555,29 @@ class RecognitionTab(ctk.CTkFrame):
                 img.thumbnail((_THUMB_SIZE, _THUMB_SIZE))
                 ctk_img = ctk.CTkImage(light_image=img, dark_image=img,
                                        size=(_THUMB_SIZE, _THUMB_SIZE))
-                lbl = ctk.CTkLabel(self._thumb_frame, image=ctk_img, text="",
-                                   cursor="hand2")
-                lbl.grid(row=i // 3, column=i % 3, padx=3, pady=3)
+
+                # Wrapper frame holds thumbnail + score label
+                cell = ctk.CTkFrame(self._thumb_frame, fg_color="transparent")
+                cell.grid(row=i // 3, column=i % 3, padx=3, pady=3)
+
+                lbl = ctk.CTkLabel(cell, image=ctk_img, text="", cursor="hand2")
+                lbl.pack()
                 lbl.bind("<Button-1>", lambda e, path=str(p): self._open_viewer(path))
                 lbl.bind("<Button-3>", lambda e, path=str(p):
                          self._thumb_context_menu(e, path))
+
+                # Score badge below the thumbnail
+                avg = score_map.get(str(p))
+                if avg is not None:
+                    score_col = _score_colour(avg, None)
+                    score_text = f"{avg:.3f}"
+                else:
+                    score_col  = "#555"
+                    score_text = "—"
+                ctk.CTkLabel(cell, text=score_text,
+                             font=ctk.CTkFont(size=9, weight="bold"),
+                             text_color=score_col).pack(pady=(1, 0))
+
                 self._thumb_refs.append(ctk_img)
             except Exception:
                 pass

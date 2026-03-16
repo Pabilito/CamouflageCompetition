@@ -109,6 +109,14 @@ class App(ctk.CTk):
             else None
         ))
 
+        # Pre-load gallery on startup so Adversarial Pictures is ready immediately
+        self.after(200, self._recognition_tab.on_tab_shown)
+
+        # Incremental gallery update: when a control image is accepted,
+        # add it directly to the recognition tab's in-memory gallery
+        self._capture_tab._on_image_accepted = \
+            self._recognition_tab.add_control_image
+
     def on_close(self) -> None:
         self.destroy()
 

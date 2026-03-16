@@ -38,8 +38,8 @@ class CaptureTab(ctk.CTkFrame):
         self._current_user_id: int | None = None
         self._latest_frame  = None
         self._photo_ref     = None
-        # pending review state
         self._pending_frame: Image.Image | None = None
+        self._on_image_accepted = None   # set by main.py after construction
 
         self._build_ui()
         self._refresh_user_list()
@@ -380,6 +380,9 @@ class CaptureTab(ctk.CTkFrame):
         self._refresh_thumbnails(user_row.id)
         self._pending_frame = None
         self._review_frame.grid_remove()
+        # Notify recognition tab to add this image to gallery incrementally
+        if self._on_image_accepted is not None:
+            self._on_image_accepted(user_row.name, str(save_path))
 
     def _retake_frame(self) -> None:
         self._pending_frame = None
