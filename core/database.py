@@ -236,6 +236,29 @@ class Database:
             ).fetchall()
         return [AttackRow(**dict(r)) for r in rows]
 
+    def get_average_ranking(self, limit: int = 10_000) -> list[dict]:
+        """Averaged score per image across all models, sorted ASC (best attack first)."""
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT image_path, AVG(similarity_score) AS avg_score, "
+                "COUNT(*) AS n_models "
+                "FROM attacks GROUP BY image_path "
+                "ORDER BY avg_score ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_best_avg_score_for_identity(self, identity_name: str) -> float | None:
+        """Lowest average-across-models score for any image vs this identity."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT AVG(similarity_score) AS avg_score "
+                "FROM attacks WHERE identity_name = ? "
+                "GROUP BY image_path ORDER BY avg_score ASC LIMIT 1",
+                (identity_name,),
+            ).fetchone()
+        return row["avg_score"] if row else None
+
 
 def _now() -> str:
     return datetime.now(tz=timezone.utc).isoformat()

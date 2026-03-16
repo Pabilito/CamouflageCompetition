@@ -152,19 +152,10 @@ class CaptureTab(ctk.CTkFrame):
                       fg_color="#5a0000", hover_color="#8b0000",
                       command=self._retake_frame).pack(side="left", padx=6)
 
-        # Take another (shown after accept)
-        self._another_frame = ctk.CTkFrame(right, fg_color="transparent")
-        self._another_frame.grid(row=5, column=0, pady=4)
-        self._another_frame.grid_remove()
-
-        ctk.CTkButton(self._another_frame, text="📷  Take Another", width=160,
-                      fg_color="#005f73", hover_color="#0a9396",
-                      command=self._take_another).pack()
-
         self._status = ctk.CTkLabel(
             right, text="Start the camera to begin.",
             font=ctk.CTkFont(size=11), text_color="#888")
-        self._status.grid(row=6, column=0, pady=(0, 12))
+        self._status.grid(row=5, column=0, pady=(0, 12))
 
     # ── User management ───────────────────────────────────────────────────────
 
@@ -277,7 +268,6 @@ class CaptureTab(ctk.CTkFrame):
             self._capture_btn.configure(state="normal")
             self._status.configure(text="Camera running.", text_color="#888")
             self._review_frame.grid_remove()
-            self._another_frame.grid_remove()
             self._pending_frame = None
             threading.Thread(target=self._camera_loop, args=(my_gen,), daemon=True).start()
 
@@ -332,7 +322,6 @@ class CaptureTab(ctk.CTkFrame):
         self._pending_frame = _center_crop_square(img)
         self._show_review_image(self._pending_frame)
         self._review_frame.grid()
-        self._another_frame.grid_remove()
         self._status.configure(text="Review the image — accept or retake.", text_color="#ffd166")
 
     def _show_review_image(self, img: Image.Image) -> None:
@@ -362,25 +351,20 @@ class CaptureTab(ctk.CTkFrame):
         self._refresh_thumbnails(user_row.id)
         self._pending_frame = None
         self._review_frame.grid_remove()
-        self._another_frame.grid()   # show "Take Another" button
 
     def _retake_frame(self) -> None:
         self._pending_frame = None
         self._review_frame.grid_remove()
-        self._another_frame.grid_remove()
-        self._camera.close()   # fully release before re-opening
+        self._camera.close()
         self._running = True
         self._thread_gen += 1
         my_gen = self._thread_gen
         self._camera.open()
+        self._cam_btn.configure(text="⏹  Stop Camera")
         self._capture_btn.configure(state="normal")
         self._status.configure(text="Camera running.", text_color="#888")
         threading.Thread(target=self._camera_loop, args=(my_gen,), daemon=True).start()
 
-    def _take_another(self) -> None:
-        """After accepting, start camera again for the next shot."""
-        self._another_frame.grid_remove()
-        self._retake_frame()
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 

@@ -134,7 +134,17 @@ class RecognitionTab(ctk.CTkFrame):
 
         self._adv_count_label = ctk.CTkLabel(
             left, text="", font=ctk.CTkFont(size=11), text_color="#aaa")
-        self._adv_count_label.grid(row=6, column=0, padx=14, pady=(0, 12), sticky="w")
+        self._adv_count_label.grid(row=6, column=0, padx=14, pady=(0, 4), sticky="w")
+
+        # Best score badge
+        best_row = ctk.CTkFrame(left, fg_color="transparent")
+        best_row.grid(row=7, column=0, padx=14, pady=(0, 12), sticky="ew")
+        ctk.CTkLabel(best_row, text="Your best score:",
+                     font=ctk.CTkFont(size=11), text_color="#888").pack(side="left")
+        self._lbl_left_best = ctk.CTkLabel(
+            best_row, text="—",
+            font=ctk.CTkFont(size=12, weight="bold"), text_color="#aaa")
+        self._lbl_left_best.pack(side="left", padx=(6, 0))
 
         # ═══════════════════════════════════════════════════════════════════════
         # RIGHT panel — camera preview + scores
@@ -187,17 +197,10 @@ class RecognitionTab(ctk.CTkFrame):
                       fg_color="#5a0000", hover_color="#8b0000",
                       command=self._retake_frame).pack(side="left", padx=4)
 
-        self._another_btn_frame = ctk.CTkFrame(cam_col, fg_color="transparent")
-        self._another_btn_frame.grid(row=5, column=0, pady=4)
-        self._another_btn_frame.grid_remove()
-        ctk.CTkButton(self._another_btn_frame, text="📷  Take Another", width=160,
-                      fg_color="#005f73", hover_color="#0a9396",
-                      command=self._take_another).pack()
-
         self._status = ctk.CTkLabel(
             cam_col, text="Start camera to begin.",
             font=ctk.CTkFont(size=11), text_color="#888")
-        self._status.grid(row=6, column=0, pady=(0, 6))
+        self._status.grid(row=5, column=0, pady=(0, 6))
 
         # ── Scores column ──────────────────────────────────────────────────────
         scores_col = ctk.CTkScrollableFrame(
@@ -213,11 +216,43 @@ class RecognitionTab(ctk.CTkFrame):
         for i, name in enumerate(self._engine.model_names):
             self._build_model_row(scores_col, name, row=i + 1)
 
+        # ── Summary panel ──────────────────────────────────────────────────────
+        n = len(self._engine.model_names)
+
+        sep = ctk.CTkFrame(scores_col, height=1, fg_color="#333")
+        sep.grid(row=n + 1, column=0, sticky="ew", pady=(10, 6))
+
+        summary_frame = ctk.CTkFrame(
+            scores_col, corner_radius=8, fg_color=("#0d1b2a", "#0d1b2a"))
+        summary_frame.grid(row=n + 2, column=0, sticky="ew", pady=(0, 4))
+        summary_frame.columnconfigure(1, weight=1)
+
+        def _stat_row(parent, label: str, row: int):
+            ctk.CTkLabel(parent, text=label,
+                         font=ctk.CTkFont(size=11), text_color="#888",
+                         anchor="w").grid(row=row, column=0, padx=(12, 6), pady=3, sticky="w")
+            val = ctk.CTkLabel(parent, text="—",
+                               font=ctk.CTkFont(size=12, weight="bold"),
+                               text_color="#aaa", anchor="e")
+            val.grid(row=row, column=1, padx=(0, 12), pady=3, sticky="e")
+            return val
+
+        ctk.CTkLabel(summary_frame, text="Session Summary",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="#00d4ff").grid(
+            row=0, column=0, columnspan=2, padx=12, pady=(8, 2), sticky="w")
+
+        self._lbl_avg_score  = _stat_row(summary_frame, "Avg score (this image):", 1)
+        self._lbl_rank       = _stat_row(summary_frame, "Current rank (overall):", 2)
+        self._lbl_best_score = _stat_row(summary_frame, "Best score ever:",        3)
+
+        # Spacer
+        ctk.CTkFrame(summary_frame, height=4, fg_color="transparent").grid(
+            row=4, column=0, columnspan=2)
+
         self._save_note = ctk.CTkLabel(
             scores_col, text="", font=ctk.CTkFont(size=10), text_color="#666")
-        self._save_note.grid(
-            row=len(self._engine.model_names) + 1, column=0,
-            pady=(6, 0), sticky="w")
+        self._save_note.grid(row=n + 3, column=0, pady=(4, 0), sticky="w")
 
     # ── Model score rows ──────────────────────────────────────────────────────
 
@@ -328,6 +363,7 @@ class RecognitionTab(ctk.CTkFrame):
                              f"{'y' if len(all_users) == 1 else 'ies'} loaded.",
                         text_color="#00ff9f")
                     self._refresh_thumbnails()
+                    self._refresh_best_score()
                 else:
                     self._gallery_status.configure(
                         text="⚠  No control images found.", text_color="#ff6b6b")
@@ -342,6 +378,51 @@ class RecognitionTab(ctk.CTkFrame):
             verdict_lbl.configure(text="")
             self.after(0, self._draw_bar, canvas, 0.0, "#333", threshold)
         self._refresh_thumbnails()
+        self._refresh_best_score()
+
+    # ── Summary panel helpers ─────────────────────────────────────────────────
+
+    def _refresh_best_score(self) -> None:
+        """Show the best-ever avg score for the selected identity (pre-capture)."""
+        identity = self._identity_var.get()
+        if identity == "—":
+            self._lbl_best_score.configure(text="—", text_color="#aaa")
+            self._lbl_left_best.configure(text="—", text_color="#aaa")
+            self._lbl_avg_score.configure(text="—", text_color="#aaa")
+            self._lbl_rank.configure(text="—", text_color="#aaa")
+            return
+        best = self._db.get_best_avg_score_for_identity(identity)
+        if best is None:
+            self._lbl_best_score.configure(text="no data", text_color="#555")
+            self._lbl_left_best.configure(text="no data", text_color="#555")
+        else:
+            col = _score_colour(best, None)
+            self._lbl_best_score.configure(text=f"{best:.4f}", text_color=col)
+            self._lbl_left_best.configure(text=f"{best:.4f}", text_color=col)
+
+    def _update_summary(self, scores: list[float], save_path: str) -> None:
+        """Called after inference: show avg score and rank for the just-saved image."""
+        if not scores:
+            return
+        avg = sum(scores) / len(scores)
+        col = _score_colour(avg, None)
+        self._lbl_avg_score.configure(text=f"{avg:.4f}", text_color=col)
+
+        # Compute rank among all images in the overall ranking
+        ranking = self._db.get_average_ranking()
+        rank = next(
+            (i + 1 for i, e in enumerate(ranking) if e["image_path"] == save_path),
+            None,
+        )
+        total = len(ranking)
+        if rank is not None:
+            rank_col = "#00ff9f" if rank <= max(1, total // 4) else (
+                "#ffd166" if rank <= total // 2 else "#ff6b6b")
+            self._lbl_rank.configure(
+                text=f"#{rank} / {total}", text_color=rank_col)
+
+        # Refresh best score (may have improved)
+        self._refresh_best_score()
 
     # ── Adversarial thumbnail strip ───────────────────────────────────────────
 
@@ -422,7 +503,6 @@ class RecognitionTab(ctk.CTkFrame):
             self._cam_btn.configure(text="⏹  Stop Camera")
             self._capture_btn.configure(state="normal")
             self._review_btns.grid_remove()
-            self._another_btn_frame.grid_remove()
             self._pending_frame = None
             self._status.configure(text="Camera running.", text_color="#888")
             threading.Thread(target=self._camera_loop, args=(my_gen,), daemon=True).start()
@@ -475,7 +555,6 @@ class RecognitionTab(ctk.CTkFrame):
         self._pending_frame = _center_crop_square(img)
         self._show_review_image(self._pending_frame)
         self._review_btns.grid()
-        self._another_btn_frame.grid_remove()
         self._status.configure(
             text="Review — accept to log or retake.", text_color="#ffd166")
 
@@ -512,7 +591,6 @@ class RecognitionTab(ctk.CTkFrame):
                 text=f"✓  Saved {save_path.name}  (gallery not ready — scores skipped)",
                 text_color="#ffd166")
             self._pending_frame = None
-            self._another_btn_frame.grid()
             return
 
         def _infer():
@@ -546,10 +624,11 @@ class RecognitionTab(ctk.CTkFrame):
                 self.after(0, self._update_row, model_name, score)
 
             self._write_log(identity, save_path, results)
+            all_scores = [r["score"] for r in results]
+            self.after(0, self._update_summary, all_scores, str(save_path))
             self.after(0, self._status.configure,
                        {"text": f"✓  Saved & logged → {save_path.name}",
                         "text_color": "#00ff9f"})
-            self.after(0, self._another_btn_frame.grid)
 
         self._pending_frame = None
         threading.Thread(target=_infer, daemon=True).start()
@@ -557,19 +636,16 @@ class RecognitionTab(ctk.CTkFrame):
     def _retake_frame(self) -> None:
         self._pending_frame = None
         self._review_btns.grid_remove()
-        self._another_btn_frame.grid_remove()
         self._camera.close()
         self._running = True
         self._thread_gen += 1
         my_gen = self._thread_gen
         self._camera.open()
+        self._cam_btn.configure(text="⏹  Stop Camera")
         self._capture_btn.configure(state="normal")
         self._status.configure(text="Camera running.", text_color="#888")
         threading.Thread(target=self._camera_loop, args=(my_gen,), daemon=True).start()
 
-    def _take_another(self) -> None:
-        self._another_btn_frame.grid_remove()
-        self._retake_frame()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
