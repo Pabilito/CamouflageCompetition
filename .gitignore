@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 *$py.class
+Pretrained_Models/*
+data/*
+db.sqlite
 
 # C extensions
 *.so
