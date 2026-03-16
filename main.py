@@ -100,10 +100,13 @@ class App(ctk.CTk):
         )
         self._ranking_tab.pack(fill="both", expand=True)
 
-        # Auto-reload gallery when switching to Adversarial Pictures
+        # Auto-reload on tab switch
         tabs.configure(command=lambda: (
             self._recognition_tab.on_tab_shown()
-            if tabs.get() == "Adversarial Pictures" else None
+            if tabs.get() == "Adversarial Pictures"
+            else self._ranking_tab.on_tab_shown()
+            if tabs.get() == "Ranking"
+            else None
         ))
 
     def on_close(self) -> None:

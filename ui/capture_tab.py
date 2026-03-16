@@ -222,11 +222,33 @@ class CaptureTab(ctk.CTkFrame):
                 img.thumbnail((_THUMB_SIZE, _THUMB_SIZE))
                 ctk_img = ctk.CTkImage(light_image=img, dark_image=img,
                                        size=(_THUMB_SIZE, _THUMB_SIZE))
-                lbl = ctk.CTkLabel(self._thumb_frame, image=ctk_img, text="")
+                lbl = ctk.CTkLabel(self._thumb_frame, image=ctk_img, text="",
+                                   cursor="hand2")
                 lbl.grid(row=i // 3, column=i % 3, padx=3, pady=3)
+                lbl.bind("<Button-1>",
+                         lambda e, p=cap.image_path: self._open_viewer(p))
                 self._thumb_refs.append(ctk_img)
             except Exception:
                 pass
+
+    def _open_viewer(self, path: str) -> None:
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception:
+            return
+        popup = tk.Toplevel(self)
+        popup.title(Path(path).name)
+        popup.configure(bg="#0d0d1a")
+        sw, sh = popup.winfo_screenwidth(), popup.winfo_screenheight()
+        img.thumbnail((int(sw * 0.8), int(sh * 0.8)), Image.LANCZOS)
+        tk_img = ImageTk.PhotoImage(img)
+        lbl = tk.Label(popup, image=tk_img, bg="#0d0d1a")
+        lbl.image = tk_img
+        lbl.pack(padx=10, pady=10)
+        tk.Label(popup, text=path, fg="#555", bg="#0d0d1a",
+                 font=("Courier New", 9), wraplength=int(sw * 0.8)).pack(pady=(0, 6))
+        popup.bind("<Escape>", lambda e: popup.destroy())
+        lbl.bind("<Button-1>", lambda e: popup.destroy())
 
     def _clear_thumbnails(self) -> None:
         for w in self._thumb_frame.winfo_children():
@@ -236,14 +258,17 @@ class CaptureTab(ctk.CTkFrame):
 
     def _toggle_camera(self) -> None:
         if self._running:
+            # Close capture device FIRST — this unblocks read_frame() immediately.
+            # Then invalidate the thread so the loop exits cleanly.
+            self._camera.close()
             self._running = False
             self._thread_gen += 1
-            self._camera.close()
             self._cam_btn.configure(text="▶  Start Camera")
             self._capture_btn.configure(state="disabled")
             self._canvas.delete("all")
             self._status.configure(text="Camera stopped.", text_color="#888")
         else:
+            self._camera.close()   # ensure fully released before re-opening
             self._running = True
             self._thread_gen += 1
             my_gen = self._thread_gen
@@ -251,7 +276,6 @@ class CaptureTab(ctk.CTkFrame):
             self._cam_btn.configure(text="⏹  Stop Camera")
             self._capture_btn.configure(state="normal")
             self._status.configure(text="Camera running.", text_color="#888")
-            # Hide review/accept panels if restarting camera
             self._review_frame.grid_remove()
             self._another_frame.grid_remove()
             self._pending_frame = None
@@ -297,13 +321,16 @@ class CaptureTab(ctk.CTkFrame):
         frame = self._latest_frame
         if frame is None:
             return
-        # Pause live feed and show review UI
+        # Close camera so the button state is consistent — Stop Camera can't
+        # be clicked while reviewing, and restarting works cleanly after.
+        self._camera.close()
         self._running = False
         self._thread_gen += 1
+        self._cam_btn.configure(text="▶  Start Camera")
+        self._capture_btn.configure(state="disabled")
         img = Image.fromarray(frame)
         self._pending_frame = _center_crop_square(img)
         self._show_review_image(self._pending_frame)
-        self._capture_btn.configure(state="disabled")
         self._review_frame.grid()
         self._another_frame.grid_remove()
         self._status.configure(text="Review the image — accept or retake.", text_color="#ffd166")
@@ -338,11 +365,10 @@ class CaptureTab(ctk.CTkFrame):
         self._another_frame.grid()   # show "Take Another" button
 
     def _retake_frame(self) -> None:
-        """Discard pending frame and restart the live camera."""
         self._pending_frame = None
         self._review_frame.grid_remove()
         self._another_frame.grid_remove()
-        # Restart camera
+        self._camera.close()   # fully release before re-opening
         self._running = True
         self._thread_gen += 1
         my_gen = self._thread_gen

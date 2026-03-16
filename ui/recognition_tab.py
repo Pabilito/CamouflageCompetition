@@ -1,5 +1,12 @@
 """
 ui/recognition_tab.py  —  Adversarial Pictures tab
+
+Layout mirrors the Control Pictures tab:
+  Left panel  — identity dropdown (for mated comparison) + scrollable thumbnail
+                strip of saved adversarial images (clickable to enlarge)
+  Right panel — live camera preview (with blue crop square) + model score bars
+
+Adversarial images are saved to data/adversarial/<identity>/ on accept.
 """
 
 import csv
@@ -16,9 +23,10 @@ from core.camera import Camera
 from core.database import Database
 from core.embeddings import EmbeddingEngine
 
-_PREVIEW_W = 420
-_PREVIEW_H = 420
-_BAR_H     = 14
+_PREVIEW_SIZE = 420
+_THUMB_SIZE   = 72
+_BAR_H        = 14
+_CROP_COLOUR  = "#00d4ff"
 
 THRESHOLDS_LFW: dict[str, float] = {
     "IResNet_R18_Glint360K":    0.2411,
@@ -46,6 +54,14 @@ def _score_colour(score: float, threshold: float | None) -> str:
     return "#00ff9f" if diff >= 0.05 else "#ffd166" if diff >= 0 else "#ff6b6b"
 
 
+def _center_crop_square(img: Image.Image) -> Image.Image:
+    w, h  = img.size
+    side  = min(w, h)
+    left  = (w - side) // 2
+    top   = (h - side) // 2
+    return img.crop((left, top, left + side, top + side))
+
+
 class RecognitionTab(ctk.CTkFrame):
     def __init__(self, parent, engine: EmbeddingEngine, db: Database, data_dir: str):
         super().__init__(parent, fg_color="transparent")
@@ -62,8 +78,7 @@ class RecognitionTab(ctk.CTkFrame):
         self._photo_ref     = None
         self._score_widgets: dict = {}
         self._pending_frame: Image.Image | None = None
-        self._pending_save_path: Path | None    = None
-        self._pending_results: list | None      = None
+        self._thumb_refs: list = []
 
         self._build_ui()
 
@@ -75,46 +90,96 @@ class RecognitionTab(ctk.CTkFrame):
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
-        self.columnconfigure(0, weight=2)
-        self.columnconfigure(1, weight=3)
+        self.columnconfigure(0, weight=1, minsize=260)
+        self.columnconfigure(1, weight=4)
         self.rowconfigure(0, weight=1)
 
-        # ── Left: camera ──────────────────────────────────────────────────────
+        # ═══════════════════════════════════════════════════════════════════════
+        # LEFT panel — identity + saved adversarial thumbnails
+        # ═══════════════════════════════════════════════════════════════════════
         left = ctk.CTkFrame(self, corner_radius=10, fg_color=("#1e1e2e", "#1e1e2e"))
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         left.columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(left, text="Live Camera",
+        ctk.CTkLabel(left, text="Compare Against",
                      font=ctk.CTkFont(size=13, weight="bold"),
                      text_color="#00d4ff").grid(
-            row=0, column=0, padx=14, pady=(14, 6), sticky="w")
+            row=0, column=0, padx=14, pady=(14, 4), sticky="w")
 
-        self._canvas = tk.Canvas(left, width=_PREVIEW_W, height=_PREVIEW_H,
+        self._identity_var = ctk.StringVar(value="—")
+        self._identity_menu = ctk.CTkOptionMenu(
+            left, variable=self._identity_var,
+            values=["—"], width=210,
+            command=self._on_identity_changed)
+        self._identity_menu.grid(row=1, column=0, padx=14, pady=4, sticky="ew")
+
+        # Gallery loading indicator
+        self._gallery_status = ctk.CTkLabel(
+            left,
+            text="⏳  Loading…",
+            font=ctk.CTkFont(size=10), text_color="#ffd166")
+        self._gallery_status.grid(row=2, column=0, padx=14, pady=(2, 6), sticky="w")
+
+        ctk.CTkFrame(left, height=1, fg_color="#333").grid(
+            row=3, column=0, sticky="ew", padx=14, pady=4)
+
+        ctk.CTkLabel(left, text="Saved Adversarial Images",
+                     font=ctk.CTkFont(size=11), text_color="#888").grid(
+            row=4, column=0, padx=14, sticky="w")
+
+        self._thumb_frame = ctk.CTkScrollableFrame(
+            left, height=340, fg_color="transparent", label_text="")
+        self._thumb_frame.grid(row=5, column=0, padx=10, pady=(4, 10), sticky="nsew")
+        left.rowconfigure(5, weight=1)
+
+        self._adv_count_label = ctk.CTkLabel(
+            left, text="", font=ctk.CTkFont(size=11), text_color="#aaa")
+        self._adv_count_label.grid(row=6, column=0, padx=14, pady=(0, 12), sticky="w")
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # RIGHT panel — camera preview + scores
+        # ═══════════════════════════════════════════════════════════════════════
+        right_outer = ctk.CTkFrame(self, corner_radius=10, fg_color=("#1e1e2e", "#1e1e2e"))
+        right_outer.grid(row=0, column=1, sticky="nsew")
+        right_outer.columnconfigure(0, weight=2)
+        right_outer.columnconfigure(1, weight=3)
+        right_outer.rowconfigure(0, weight=1)
+
+        # ── Camera column ──────────────────────────────────────────────────────
+        cam_col = ctk.CTkFrame(right_outer, fg_color="transparent")
+        cam_col.grid(row=0, column=0, sticky="nsew", padx=(10, 6), pady=10)
+        cam_col.columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(cam_col, text="Live Camera",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color="#00d4ff").grid(
+            row=0, column=0, pady=(0, 4), sticky="w")
+        ctk.CTkLabel(cam_col, text="Blue square = saved crop region",
+                     font=ctk.CTkFont(size=10), text_color="#555").grid(
+            row=1, column=0, sticky="w")
+
+        self._canvas = tk.Canvas(cam_col, width=_PREVIEW_SIZE, height=_PREVIEW_SIZE,
                                  bg="#0d0d1a", highlightthickness=0)
-        self._canvas.grid(row=1, column=0, padx=14, pady=4)
+        self._canvas.grid(row=2, column=0, pady=(4, 4))
 
-        # Camera buttons
-        cam_btns = ctk.CTkFrame(left, fg_color="transparent")
-        cam_btns.grid(row=2, column=0, pady=6)
-
+        cam_btns = ctk.CTkFrame(cam_col, fg_color="transparent")
+        cam_btns.grid(row=3, column=0, pady=4)
         self._cam_btn = ctk.CTkButton(
-            cam_btns, text="▶  Start Camera", width=160, command=self._toggle_camera)
-        self._cam_btn.pack(side="left", padx=6)
-
-        self._run_btn = ctk.CTkButton(
-            cam_btns, text="📷  Capture", width=140,
+            cam_btns, text="▶  Start Camera", width=155, command=self._toggle_camera)
+        self._cam_btn.pack(side="left", padx=4)
+        self._capture_btn = ctk.CTkButton(
+            cam_btns, text="📷  Capture", width=130,
             fg_color="#005f73", hover_color="#0a9396",
             state="disabled", command=self._capture_frame)
-        self._run_btn.pack(side="left", padx=6)
+        self._capture_btn.pack(side="left", padx=4)
 
-        # Review buttons (hidden until frame captured)
-        self._review_btns = ctk.CTkFrame(left, fg_color="transparent")
-        self._review_btns.grid(row=3, column=0, pady=4)
+        # Review buttons
+        self._review_btns = ctk.CTkFrame(cam_col, fg_color="transparent")
+        self._review_btns.grid(row=4, column=0, pady=4)
         self._review_btns.grid_remove()
-
-        ctk.CTkLabel(self._review_btns, text="Accept this image?",
-                     font=ctk.CTkFont(size=12, weight="bold"),
-                     text_color="#ffd166").pack(side="left", padx=8)
+        ctk.CTkLabel(self._review_btns, text="Accept?",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="#ffd166").pack(side="left", padx=6)
         ctk.CTkButton(self._review_btns, text="✓  Accept & Log", width=130,
                       fg_color="#004d00", hover_color="#007700",
                       command=self._accept_frame).pack(side="left", padx=4)
@@ -122,58 +187,44 @@ class RecognitionTab(ctk.CTkFrame):
                       fg_color="#5a0000", hover_color="#8b0000",
                       command=self._retake_frame).pack(side="left", padx=4)
 
-        # Take another (shown after accept)
-        self._another_btn_frame = ctk.CTkFrame(left, fg_color="transparent")
-        self._another_btn_frame.grid(row=4, column=0, pady=4)
+        self._another_btn_frame = ctk.CTkFrame(cam_col, fg_color="transparent")
+        self._another_btn_frame.grid(row=5, column=0, pady=4)
         self._another_btn_frame.grid_remove()
         ctk.CTkButton(self._another_btn_frame, text="📷  Take Another", width=160,
                       fg_color="#005f73", hover_color="#0a9396",
                       command=self._take_another).pack()
 
         self._status = ctk.CTkLabel(
-            left, text="Start camera to begin.",
+            cam_col, text="Start camera to begin.",
             font=ctk.CTkFont(size=11), text_color="#888")
-        self._status.grid(row=5, column=0, pady=(0, 10))
+        self._status.grid(row=6, column=0, pady=(0, 6))
 
-        # ── Right: identity + scores ───────────────────────────────────────────
-        right = ctk.CTkScrollableFrame(
-            self, corner_radius=10, fg_color=("#1e1e2e", "#1e1e2e"), label_text="")
-        right.grid(row=0, column=1, sticky="nsew")
-        right.columnconfigure(0, weight=1)
+        # ── Scores column ──────────────────────────────────────────────────────
+        scores_col = ctk.CTkScrollableFrame(
+            right_outer, fg_color="transparent", label_text="")
+        scores_col.grid(row=0, column=1, sticky="nsew", padx=(0, 10), pady=10)
+        scores_col.columnconfigure(0, weight=1)
 
-        id_row = ctk.CTkFrame(right, fg_color="transparent")
-        id_row.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 6))
-        id_row.columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(id_row, text="Compare against:",
+        ctk.CTkLabel(scores_col, text="Similarity Scores",
                      font=ctk.CTkFont(size=12, weight="bold"),
-                     text_color="#00d4ff").grid(row=0, column=0, sticky="w")
-
-        self._identity_var = ctk.StringVar(value="—")
-        self._identity_menu = ctk.CTkOptionMenu(
-            id_row, variable=self._identity_var,
-            values=["—"], width=180, command=self._on_identity_changed)
-        self._identity_menu.grid(row=0, column=1, padx=8, sticky="ew")
-
-        # Gallery loading indicator
-        self._gallery_status = ctk.CTkLabel(
-            right, text="⏳  Gallery not loaded yet — you can still capture images.",
-            font=ctk.CTkFont(size=10), text_color="#ffd166")
-        self._gallery_status.grid(row=1, column=0, padx=14, pady=(0, 4), sticky="w")
+                     text_color="#00d4ff").grid(
+            row=0, column=0, pady=(0, 6), sticky="w")
 
         for i, name in enumerate(self._engine.model_names):
-            self._build_model_row(right, name, row=i + 2)
+            self._build_model_row(scores_col, name, row=i + 1)
 
         self._save_note = ctk.CTkLabel(
-            right, text="", font=ctk.CTkFont(size=10), text_color="#666")
+            scores_col, text="", font=ctk.CTkFont(size=10), text_color="#666")
         self._save_note.grid(
-            row=len(self._engine.model_names) + 2, column=0,
-            padx=14, pady=(6, 10), sticky="w")
+            row=len(self._engine.model_names) + 1, column=0,
+            pady=(6, 0), sticky="w")
+
+    # ── Model score rows ──────────────────────────────────────────────────────
 
     def _build_model_row(self, parent, model_name: str, row: int) -> None:
         threshold = THRESHOLDS_LFW.get(model_name)
         frame = ctk.CTkFrame(parent, corner_radius=8, fg_color=("#16213e", "#16213e"))
-        frame.grid(row=row, column=0, sticky="ew", padx=14, pady=4)
+        frame.grid(row=row, column=0, sticky="ew", pady=4)
         frame.columnconfigure(0, weight=1)
 
         top = ctk.CTkFrame(frame, fg_color="transparent")
@@ -187,9 +238,10 @@ class RecognitionTab(ctk.CTkFrame):
         score_lbl = ctk.CTkLabel(top, text="—",
                                  font=ctk.CTkFont(size=12, weight="bold"),
                                  text_color="#aaa", width=72, anchor="e")
-        score_lbl.grid(row=0, column=1, padx=(6, 6))
+        score_lbl.grid(row=0, column=1, padx=6)
 
-        verdict_lbl = ctk.CTkLabel(top, text="", font=ctk.CTkFont(size=10),
+        verdict_lbl = ctk.CTkLabel(top, text="",
+                                   font=ctk.CTkFont(size=10),
                                    text_color="#555", width=90, anchor="w")
         verdict_lbl.grid(row=0, column=2)
 
@@ -227,24 +279,23 @@ class RecognitionTab(ctk.CTkFrame):
                 tick_x - 4, h + 1, tick_x + 4, h + 1, tick_x, h + 7,
                 fill="#ff2222", outline="")
 
-    # ── Gallery ───────────────────────────────────────────────────────────────
+    # ── Gallery loading ───────────────────────────────────────────────────────
 
     def _reload_gallery(self) -> None:
         user_dir = Path(self._data_dir) / "users"
         if not user_dir.exists():
             self._gallery_status.configure(
-                text="⚠  No user images found. Capture control images first.",
-                text_color="#ff6b6b")
+                text="⚠  No control images found yet.", text_color="#ff6b6b")
             return
 
         self._gallery_ready = False
         self._gallery_status.configure(
-            text="⏳  Loading gallery embeddings — you can still capture images.",
-            text_color="#ffd166")
+            text="⏳  Loading — you can still capture images.", text_color="#ffd166")
 
         def _load():
             for model_name in self._engine.model_names:
-                self._galleries[model_name] = self._engine.build_gallery(model_name, user_dir)
+                self._galleries[model_name] = self._engine.build_gallery(
+                    model_name, user_dir)
 
             self._gallery_paths = {}
             for model_name in self._engine.model_names:
@@ -273,12 +324,13 @@ class RecognitionTab(ctk.CTkFrame):
                     if self._identity_var.get() not in all_users:
                         self._identity_var.set(all_users[0])
                     self._gallery_status.configure(
-                        text=f"✓  Gallery ready — {len(all_users)} identit"
-                             f"{'y' if len(all_users)==1 else 'ies'} loaded.",
+                        text=f"✓  {len(all_users)} identit"
+                             f"{'y' if len(all_users) == 1 else 'ies'} loaded.",
                         text_color="#00ff9f")
+                    self._refresh_thumbnails()
                 else:
                     self._gallery_status.configure(
-                        text="⚠  No user images found.", text_color="#ff6b6b")
+                        text="⚠  No control images found.", text_color="#ff6b6b")
 
             self.after(0, _done)
 
@@ -289,27 +341,90 @@ class RecognitionTab(ctk.CTkFrame):
             score_lbl.configure(text="—", text_color="#aaa")
             verdict_lbl.configure(text="")
             self.after(0, self._draw_bar, canvas, 0.0, "#333", threshold)
+        self._refresh_thumbnails()
+
+    # ── Adversarial thumbnail strip ───────────────────────────────────────────
+
+    def _refresh_thumbnails(self) -> None:
+        for w in self._thumb_frame.winfo_children():
+            w.destroy()
+        self._thumb_refs.clear()
+
+        identity = self._identity_var.get()
+        if identity == "—":
+            self._adv_count_label.configure(text="")
+            return
+
+        adv_dir = Path(self._data_dir) / "adversarial" / identity
+        if not adv_dir.exists():
+            self._adv_count_label.configure(text="No images yet.")
+            return
+
+        images = sorted(adv_dir.glob("*.jpg")) + sorted(adv_dir.glob("*.png"))
+        for i, p in enumerate(images):
+            try:
+                img = Image.open(p).convert("RGB")
+                img.thumbnail((_THUMB_SIZE, _THUMB_SIZE))
+                ctk_img = ctk.CTkImage(light_image=img, dark_image=img,
+                                       size=(_THUMB_SIZE, _THUMB_SIZE))
+                lbl = ctk.CTkLabel(self._thumb_frame, image=ctk_img, text="",
+                                   cursor="hand2")
+                lbl.grid(row=i // 3, column=i % 3, padx=3, pady=3)
+                lbl.bind("<Button-1>", lambda e, path=str(p): self._open_viewer(path))
+                self._thumb_refs.append(ctk_img)
+            except Exception:
+                pass
+
+        count = len(images)
+        self._adv_count_label.configure(
+            text=f"{count} image(s) saved for '{identity}'")
+
+    def _open_viewer(self, path: str) -> None:
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception:
+            return
+        popup = tk.Toplevel(self)
+        popup.title(Path(path).name)
+        popup.configure(bg="#0d0d1a")
+        sw, sh = popup.winfo_screenwidth(), popup.winfo_screenheight()
+        img.thumbnail((int(sw * 0.8), int(sh * 0.8)), Image.LANCZOS)
+        tk_img = ImageTk.PhotoImage(img)
+        lbl = tk.Label(popup, image=tk_img, bg="#0d0d1a")
+        lbl.image = tk_img
+        lbl.pack(padx=10, pady=10)
+        tk.Label(popup, text=path, fg="#555", bg="#0d0d1a",
+                 font=("Courier New", 9), wraplength=int(sw * 0.8)).pack(pady=(0, 6))
+        popup.bind("<Escape>", lambda e: popup.destroy())
+        lbl.bind("<Button-1>", lambda e: popup.destroy())
+        popup.update_idletasks()
+        popup.geometry(
+            f"+{(sw - popup.winfo_width()) // 2}+{(sh - popup.winfo_height()) // 2}")
 
     # ── Camera ────────────────────────────────────────────────────────────────
 
     def _toggle_camera(self) -> None:
         if self._running:
+            # Close capture device FIRST so read_frame() unblocks immediately.
+            self._camera.close()
             self._running = False
             self._thread_gen += 1
-            self._camera.close()
             self._cam_btn.configure(text="▶  Start Camera")
-            self._run_btn.configure(state="disabled")
+            self._capture_btn.configure(state="disabled")
             self._canvas.delete("all")
+            self._status.configure(text="Camera stopped.", text_color="#888")
         else:
+            self._camera.close()
             self._running = True
             self._thread_gen += 1
             my_gen = self._thread_gen
             self._camera.open()
             self._cam_btn.configure(text="⏹  Stop Camera")
-            self._run_btn.configure(state="normal")
+            self._capture_btn.configure(state="normal")
             self._review_btns.grid_remove()
             self._another_btn_frame.grid_remove()
             self._pending_frame = None
+            self._status.configure(text="Camera running.", text_color="#888")
             threading.Thread(target=self._camera_loop, args=(my_gen,), daemon=True).start()
 
     def _camera_loop(self, gen: int) -> None:
@@ -319,66 +434,82 @@ class RecognitionTab(ctk.CTkFrame):
                 continue
             self._latest_frame = frame
             img = Image.fromarray(frame)
-            img.thumbnail((_PREVIEW_W, _PREVIEW_H))
-            tk_img = ImageTk.PhotoImage(img)
+            w, h  = img.size
+            side  = min(w, h)
+            scale = _PREVIEW_SIZE / max(w, h)
+            disp_w, disp_h = int(w * scale), int(h * scale)
+            img_disp  = img.resize((disp_w, disp_h), Image.BILINEAR)
+            crop_side = int(side * scale)
+            cx = (disp_w - crop_side) // 2
+            cy = (disp_h - crop_side) // 2
+            tk_img = ImageTk.PhotoImage(img_disp)
 
-            def _upd(tk=tk_img, g=gen):
+            def _upd(tk=tk_img, dw=disp_w, dh=disp_h, g=gen,
+                     cx=cx, cy=cy, cs=crop_side):
                 if g != self._thread_gen:
                     return
+                ox = (_PREVIEW_SIZE - dw) // 2
+                oy = (_PREVIEW_SIZE - dh) // 2
                 self._canvas.delete("all")
-                ox = (_PREVIEW_W - tk.width()) // 2
-                oy = (_PREVIEW_H - tk.height()) // 2
                 self._canvas.create_image(ox, oy, anchor="nw", image=tk)
+                self._canvas.create_rectangle(
+                    ox + cx, oy + cy, ox + cx + cs, oy + cy + cs,
+                    outline=_CROP_COLOUR, width=2)
                 self._photo_ref = tk
 
             self.after(0, _upd)
 
-    # ── Capture → Review ──────────────────────────────────────────────────────
+    # ── Capture → Review → Accept ─────────────────────────────────────────────
 
     def _capture_frame(self) -> None:
         frame = self._latest_frame
         if frame is None:
             return
-        # Pause live feed
+        # Pause live feed — also close camera so Stop Camera button works correctly
+        self._camera.close()
         self._running = False
         self._thread_gen += 1
+        self._cam_btn.configure(text="▶  Start Camera")
+        self._capture_btn.configure(state="disabled")
         img = Image.fromarray(frame)
-        self._pending_frame = img
-        self._show_review_image(img)
-        self._run_btn.configure(state="disabled")
+        self._pending_frame = _center_crop_square(img)
+        self._show_review_image(self._pending_frame)
         self._review_btns.grid()
         self._another_btn_frame.grid_remove()
-        self._status.configure(text="Review — accept to log or retake.", text_color="#ffd166")
+        self._status.configure(
+            text="Review — accept to log or retake.", text_color="#ffd166")
 
     def _show_review_image(self, img: Image.Image) -> None:
         display = img.copy()
-        display.thumbnail((_PREVIEW_W, _PREVIEW_H), Image.LANCZOS)
+        display.thumbnail((_PREVIEW_SIZE, _PREVIEW_SIZE), Image.LANCZOS)
         tk_img = ImageTk.PhotoImage(display)
-        ox = (_PREVIEW_W - display.width) // 2
-        oy = (_PREVIEW_H - display.height) // 2
+        ox = (_PREVIEW_SIZE - display.width) // 2
+        oy = (_PREVIEW_SIZE - display.height) // 2
         self._canvas.delete("all")
         self._canvas.create_image(ox, oy, anchor="nw", image=tk_img)
         self._photo_ref = tk_img
 
     def _accept_frame(self) -> None:
-        frame_arr = self._latest_frame
-        img       = self._pending_frame
-        if img is None or frame_arr is None:
+        img = self._pending_frame
+        if img is None:
             return
         identity = self._identity_var.get()
 
-        # Save frame immediately
-        comp_dir  = Path(self._data_dir) / "comparisons" / (identity if identity != "—" else "unknown")
-        save_path = Camera.next_image_path(comp_dir)
+        # Save to data/adversarial/<identity>/
+        adv_dir   = Path(self._data_dir) / "adversarial" / (
+            identity if identity != "—" else "unknown")
+        save_path = Camera.next_image_path(adv_dir)
         img.save(str(save_path), format="JPEG", quality=95)
 
         self._review_btns.grid_remove()
         self._status.configure(text="Running inference…", text_color="#aaa")
 
+        # Refresh thumbnail strip immediately so image appears
+        self.after(50, self._refresh_thumbnails)
+
         if not self._gallery_ready or identity == "—":
-            # Save only, no scoring
             self._status.configure(
-                text=f"✓  Saved {save_path.name}  (no gallery — scores skipped)",
+                text=f"✓  Saved {save_path.name}  (gallery not ready — scores skipped)",
                 text_color="#ffd166")
             self._pending_frame = None
             self._another_btn_frame.grid()
@@ -427,11 +558,12 @@ class RecognitionTab(ctk.CTkFrame):
         self._pending_frame = None
         self._review_btns.grid_remove()
         self._another_btn_frame.grid_remove()
+        self._camera.close()
         self._running = True
         self._thread_gen += 1
         my_gen = self._thread_gen
         self._camera.open()
-        self._run_btn.configure(state="normal")
+        self._capture_btn.configure(state="normal")
         self._status.configure(text="Camera running.", text_color="#888")
         threading.Thread(target=self._camera_loop, args=(my_gen,), daemon=True).start()
 
@@ -440,32 +572,6 @@ class RecognitionTab(ctk.CTkFrame):
         self._retake_frame()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _write_log(self, identity: str, frame_path: Path, results: list[dict]) -> None:
-        log_dir  = Path(self._data_dir) / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"{identity}.csv"
-        ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        write_header = not log_file.exists()
-        with open(log_file, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                "timestamp", "identity", "frame_path",
-                "model", "score", "threshold", "match", "closest_image"])
-            if write_header:
-                writer.writeheader()
-            for r in results:
-                writer.writerow({
-                    "timestamp":     ts,
-                    "identity":      identity,
-                    "frame_path":    str(frame_path),
-                    "model":         r["model"],
-                    "score":         f"{r['score']:.6f}",
-                    "threshold":     r["threshold"] if r["threshold"] is not None else "",
-                    "match":         r["match"] if r["match"] is not None else "",
-                    "closest_image": r["closest_image"],
-                })
-        self.after(0, self._save_note.configure,
-                   {"text": f"📄 log → {log_file.name}"})
 
     def _update_row(self, model_name: str, score: float | None) -> None:
         score_lbl, verdict_lbl, canvas, threshold = self._score_widgets[model_name]
@@ -493,6 +599,33 @@ class RecognitionTab(ctk.CTkFrame):
             if s > best_score:
                 best_score, best_path = s, path
         return best_path
+
+    def _write_log(self, identity: str, frame_path: Path,
+                   results: list[dict]) -> None:
+        log_dir  = Path(self._data_dir) / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{identity}.csv"
+        ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        write_header = not log_file.exists()
+        with open(log_file, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "timestamp", "identity", "frame_path",
+                "model", "score", "threshold", "match", "closest_image"])
+            if write_header:
+                writer.writeheader()
+            for r in results:
+                writer.writerow({
+                    "timestamp":     ts,
+                    "identity":      identity,
+                    "frame_path":    str(frame_path),
+                    "model":         r["model"],
+                    "score":         f"{r['score']:.6f}",
+                    "threshold":     r["threshold"] if r["threshold"] is not None else "",
+                    "match":         r["match"] if r["match"] is not None else "",
+                    "closest_image": r["closest_image"],
+                })
+        self.after(0, self._save_note.configure,
+                   {"text": f"📄 log → {log_file.name}"})
 
     def destroy(self) -> None:
         self._running = False

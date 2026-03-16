@@ -166,6 +166,12 @@ class Database:
             cur = con.execute("DELETE FROM attacks")
             return cur.rowcount
 
+    def delete_attacks_by_image(self, image_path: str) -> int:
+        """Delete all attack records for a specific image path. Returns rows deleted."""
+        with self._connect() as con:
+            cur = con.execute("DELETE FROM attacks WHERE image_path = ?", (image_path,))
+            return cur.rowcount
+
     def clear_all_data(self) -> dict[str, int]:
         """Delete all attack records, captures, and users. Returns counts."""
         with self._connect() as con:
