@@ -158,6 +158,11 @@ class Database:
                 "SELECT COUNT(*) FROM captures WHERE user_id = ?", (user_id,)
             ).fetchone()[0]
 
+    def delete_capture_by_path(self, image_path: str) -> None:
+        """Remove a single capture record by its file path."""
+        with self._connect() as con:
+            con.execute("DELETE FROM captures WHERE image_path = ?", (image_path,))
+
     # ── Adversarial attacks ───────────────────────────────────────────────────
 
     def clear_attacks(self) -> int:
@@ -258,6 +263,34 @@ class Database:
                 (identity_name,),
             ).fetchone()
         return row["avg_score"] if row else None
+
+    def get_global_best_avg_score(self) -> float | None:
+        """Lowest average score across ALL identities and images (overall #1)."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT AVG(similarity_score) AS avg_score "
+                "FROM attacks GROUP BY image_path "
+                "ORDER BY avg_score ASC LIMIT 1",
+            ).fetchone()
+        return row["avg_score"] if row else None
+
+    def get_user_leaderboard(self) -> list[dict]:
+        """
+        Per-identity leaderboard: best (lowest) avg image score per identity,
+        sorted ASC. Returns list of {identity_name, best_avg_score}.
+        Use this to compute a user's rank among all participants.
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT identity_name, MIN(avg_score) AS best_avg_score FROM ("
+                "  SELECT identity_name, image_path, "
+                "         AVG(similarity_score) AS avg_score "
+                "  FROM attacks WHERE identity_name != '' "
+                "  GROUP BY identity_name, image_path"
+                ") GROUP BY identity_name "
+                "ORDER BY best_avg_score ASC",
+            ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def _now() -> str:

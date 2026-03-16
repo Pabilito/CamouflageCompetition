@@ -218,9 +218,38 @@ class CaptureTab(ctk.CTkFrame):
                 lbl.grid(row=i // 3, column=i % 3, padx=3, pady=3)
                 lbl.bind("<Button-1>",
                          lambda e, p=cap.image_path: self._open_viewer(p))
+                lbl.bind("<Button-3>",
+                         lambda e, p=cap.image_path, uid=user_id:
+                             self._thumb_context_menu(e, p, uid))
                 self._thumb_refs.append(ctk_img)
             except Exception:
                 pass
+
+    def _thumb_context_menu(self, event, image_path: str, user_id: int) -> None:
+        menu = tk.Menu(self, tearoff=0, bg="#1e1e2e", fg="white",
+                       activebackground="#333", activeforeground="white",
+                       bd=0, font=("Segoe UI", 10))
+        menu.add_command(label="🔍  View full size",
+                         command=lambda: self._open_viewer(image_path))
+        menu.add_separator()
+        menu.add_command(label="🗑  Delete this image",
+                         command=lambda: self._delete_capture(image_path, user_id))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _delete_capture(self, image_path: str, user_id: int) -> None:
+        import os
+        self._db.delete_capture_by_path(image_path)
+        try:
+            os.remove(image_path)
+        except OSError:
+            pass
+        self._refresh_thumbnails(user_id)
+        count = self._db.capture_count(user_id)
+        self._count_label.configure(
+            text=f"{count} image(s) saved for '{self._user_var.get()}'")
 
     def _open_viewer(self, path: str) -> None:
         try:

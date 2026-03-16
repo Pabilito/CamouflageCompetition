@@ -242,13 +242,14 @@ class RecognitionTab(ctk.CTkFrame):
                      text_color="#00d4ff").grid(
             row=0, column=0, columnspan=2, padx=12, pady=(8, 2), sticky="w")
 
-        self._lbl_avg_score  = _stat_row(summary_frame, "Avg score (this image):", 1)
-        self._lbl_rank       = _stat_row(summary_frame, "Current rank (overall):", 2)
-        self._lbl_best_score = _stat_row(summary_frame, "Best score ever:",        3)
+        self._lbl_avg_score     = _stat_row(summary_frame, "Avg score (this image):", 1)
+        self._lbl_rank          = _stat_row(summary_frame, "Image rank:",             2)
+        self._lbl_global_best   = _stat_row(summary_frame, "Current best score:",     3)
+        self._lbl_your_best     = _stat_row(summary_frame, "Your best score:",        4)
+        self._lbl_your_place    = _stat_row(summary_frame, "Your current place:",     5)
 
-        # Spacer
-        ctk.CTkFrame(summary_frame, height=4, fg_color="transparent").grid(
-            row=4, column=0, columnspan=2)
+        # Keep _lbl_best_score as alias so existing _refresh_best_score code still works
+        self._lbl_best_score = self._lbl_your_best
 
         self._save_note = ctk.CTkLabel(
             scores_col, text="", font=ctk.CTkFont(size=10), text_color="#666")
@@ -383,34 +384,59 @@ class RecognitionTab(ctk.CTkFrame):
     # ── Summary panel helpers ─────────────────────────────────────────────────
 
     def _refresh_best_score(self) -> None:
-        """Show the best-ever avg score for the selected identity (pre-capture)."""
+        """Refresh all static summary stats for the selected identity."""
         identity = self._identity_var.get()
+
+        # Reset all labels
+        for lbl in (self._lbl_global_best, self._lbl_your_best,
+                    self._lbl_your_place, self._lbl_left_best):
+            lbl.configure(text="—", text_color="#aaa")
         if identity == "—":
-            self._lbl_best_score.configure(text="—", text_color="#aaa")
-            self._lbl_left_best.configure(text="—", text_color="#aaa")
             self._lbl_avg_score.configure(text="—", text_color="#aaa")
             self._lbl_rank.configure(text="—", text_color="#aaa")
             return
-        best = self._db.get_best_avg_score_for_identity(identity)
-        if best is None:
-            self._lbl_best_score.configure(text="no data", text_color="#555")
-            self._lbl_left_best.configure(text="no data", text_color="#555")
+
+        # Current best score = top-1 image globally
+        global_best = self._db.get_global_best_avg_score()
+        if global_best is not None:
+            col = _score_colour(global_best, None)
+            self._lbl_global_best.configure(text=f"{global_best:.4f}", text_color=col)
+
+        # Your best score = best image for this identity
+        your_best = self._db.get_best_avg_score_for_identity(identity)
+        if your_best is not None:
+            col = _score_colour(your_best, None)
+            self._lbl_your_best.configure(text=f"{your_best:.4f}", text_color=col)
+            self._lbl_left_best.configure(text=f"{your_best:.4f}", text_color=col)
         else:
-            col = _score_colour(best, None)
-            self._lbl_best_score.configure(text=f"{best:.4f}", text_color=col)
-            self._lbl_left_best.configure(text=f"{best:.4f}", text_color=col)
+            self._lbl_your_best.configure(text="no data", text_color="#555")
+            self._lbl_left_best.configure(text="no data", text_color="#555")
+
+        # Your current place = rank among all identities by best image
+        leaderboard = self._db.get_user_leaderboard()
+        total_users = len(leaderboard)
+        your_place  = next(
+            (i + 1 for i, e in enumerate(leaderboard)
+             if e["identity_name"] == identity),
+            None,
+        )
+        if your_place is not None and total_users > 0:
+            place_col = "#00ff9f" if your_place == 1 else (
+                "#ffd166" if your_place <= max(2, total_users // 4) else "#ff6b6b")
+            self._lbl_your_place.configure(
+                text=f"#{your_place} / {total_users}", text_color=place_col)
 
     def _update_summary(self, scores: list[float], save_path: str) -> None:
-        """Called after inference: show avg score and rank for the just-saved image."""
+        """Called after inference: show avg score and image rank for the just-saved image."""
         if not scores:
             return
         avg = sum(scores) / len(scores)
         col = _score_colour(avg, None)
         self._lbl_avg_score.configure(text=f"{avg:.4f}", text_color=col)
 
-        # Compute rank among all images in the overall ranking
+        # Image rank among all individual images
         ranking = self._db.get_average_ranking()
-        rank = next(
+        rank  = next(
             (i + 1 for i, e in enumerate(ranking) if e["image_path"] == save_path),
             None,
         )
@@ -418,10 +444,9 @@ class RecognitionTab(ctk.CTkFrame):
         if rank is not None:
             rank_col = "#00ff9f" if rank <= max(1, total // 4) else (
                 "#ffd166" if rank <= total // 2 else "#ff6b6b")
-            self._lbl_rank.configure(
-                text=f"#{rank} / {total}", text_color=rank_col)
+            self._lbl_rank.configure(text=f"#{rank} / {total}", text_color=rank_col)
 
-        # Refresh best score (may have improved)
+        # Refresh all other stats (best scores, user place)
         self._refresh_best_score()
 
     # ── Adversarial thumbnail strip ───────────────────────────────────────────
@@ -452,6 +477,8 @@ class RecognitionTab(ctk.CTkFrame):
                                    cursor="hand2")
                 lbl.grid(row=i // 3, column=i % 3, padx=3, pady=3)
                 lbl.bind("<Button-1>", lambda e, path=str(p): self._open_viewer(path))
+                lbl.bind("<Button-3>", lambda e, path=str(p):
+                         self._thumb_context_menu(e, path))
                 self._thumb_refs.append(ctk_img)
             except Exception:
                 pass
@@ -459,6 +486,32 @@ class RecognitionTab(ctk.CTkFrame):
         count = len(images)
         self._adv_count_label.configure(
             text=f"{count} image(s) saved for '{identity}'")
+
+    def _thumb_context_menu(self, event, image_path: str) -> None:
+        menu = tk.Menu(self, tearoff=0, bg="#1e1e2e", fg="white",
+                       activebackground="#333", activeforeground="white",
+                       bd=0, font=("Segoe UI", 10))
+        menu.add_command(label="🔍  View full size",
+                         command=lambda: self._open_viewer(image_path))
+        menu.add_separator()
+        menu.add_command(label="🗑  Delete this image",
+                         command=lambda: self._delete_adversarial(image_path))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _delete_adversarial(self, image_path: str) -> None:
+        import os
+        # Remove DB attack records linked to this image
+        self._db.delete_attacks_by_image(image_path)
+        # Delete file from disk
+        try:
+            os.remove(image_path)
+        except OSError:
+            pass
+        self._refresh_thumbnails()
+        self._refresh_best_score()
 
     def _open_viewer(self, path: str) -> None:
         try:
