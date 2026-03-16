@@ -75,12 +75,13 @@ class App(ctk.CTk):
         for name in ("Control Pictures", "Adversarial Pictures", "Ranking"):
             tabs.add(name)
 
-        CaptureTab(
+        self._capture_tab = CaptureTab(
             tabs.tab("Control Pictures"),
             engine=self._engine,
             db=self._db,
             data_dir=self._data_dir,
-        ).pack(fill="both", expand=True)
+        )
+        self._capture_tab.pack(fill="both", expand=True)
 
         self._recognition_tab = RecognitionTab(
             tabs.tab("Adversarial Pictures"),
@@ -90,14 +91,16 @@ class App(ctk.CTk):
         )
         self._recognition_tab.pack(fill="both", expand=True)
 
-        RankingTab(
+        self._ranking_tab = RankingTab(
             tabs.tab("Ranking"),
             db=self._db,
             data_dir=self._data_dir,
             engine=self._engine,
-        ).pack(fill="both", expand=True)
+            capture_tab=self._capture_tab,
+        )
+        self._ranking_tab.pack(fill="both", expand=True)
 
-        # Auto-reload gallery whenever the Adversarial Pictures tab is selected
+        # Auto-reload gallery when switching to Adversarial Pictures
         tabs.configure(command=lambda: (
             self._recognition_tab.on_tab_shown()
             if tabs.get() == "Adversarial Pictures" else None
