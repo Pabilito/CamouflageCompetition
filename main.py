@@ -66,7 +66,7 @@ class App(ctk.CTk):
                               fg_color=("#1a1a2e", "#1a1a2e"))
         header.pack(fill="x", side="top")
         ctk.CTkLabel(
-            header, text="  🔍  RMA Face Camouflage Competition",
+            header, text=" RMA Face Camouflage Competition",
             font=ctk.CTkFont(family="Courier New", size=16, weight="bold"),
             text_color="#00d4ff",
         ).pack(side="left", padx=16, pady=10)
@@ -122,6 +122,9 @@ class App(ctk.CTk):
         # add it directly to the recognition tab's in-memory gallery
         self._capture_tab._on_image_accepted = \
             self._recognition_tab.add_control_image
+
+        # Let recognition tab refresh the ranking after scoring
+        self._recognition_tab._ranking_tab = self._ranking_tab
 
     def on_close(self) -> None:
         self.destroy()

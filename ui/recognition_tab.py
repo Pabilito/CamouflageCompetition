@@ -94,8 +94,7 @@ class RecognitionTab(ctk.CTkFrame):
         self._pending_frame: Image.Image | None = None
         self._raw_frame:     Image.Image | None = None
         self._thumb_refs: list = []
-
-        self._build_ui()
+        self._ranking_tab = None   # set by main.py after construction
 
     # ── Tab hook ──────────────────────────────────────────────────────────────
 
@@ -935,6 +934,8 @@ class RecognitionTab(ctk.CTkFrame):
                     text=f"✓  Saved & logged → {save_path.name}",
                     text_color="#00ff9f")
                 self._refresh_thumbnails()
+                if self._ranking_tab is not None:
+                    self._ranking_tab._refresh()
 
             self._write_log(identity, save_path, results)
             self.after(0, _update_all)
