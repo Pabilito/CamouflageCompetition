@@ -434,7 +434,14 @@ class RankingTab(ctk.CTkFrame):
         popup.title(f"{title}  —  {Path(path).name}")
         popup.configure(bg="#0d0d1a")
         sw, sh = popup.winfo_screenwidth(), popup.winfo_screenheight()
-        img.thumbnail((int(sw * 0.8), int(sh * 0.8)), Image.LANCZOS)
+        max_w, max_h = int(sw * 0.8), int(sh * 0.8)
+        # Upscale small images (e.g. 112x112 aligned faces) to a readable size
+        iw, ih = img.size
+        scale = max(max_w / iw, max_h / ih, 1.0)   # at least 1× (never shrink below original)
+        scale = min(scale, min(max_w / iw, max_h / ih))  # but cap at screen limit
+        nw, nh = int(iw * scale), int(ih * scale)
+        nw, nh = min(nw, max_w), min(nh, max_h)
+        img = img.resize((nw, nh), Image.LANCZOS)
         tk_img = ImageTk.PhotoImage(img)
         lbl = tk.Label(popup, image=tk_img, bg="#0d0d1a")
         lbl.image = tk_img

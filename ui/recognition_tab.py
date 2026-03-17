@@ -225,6 +225,10 @@ class RecognitionTab(ctk.CTkFrame):
             fg_color="#005f73", hover_color="#0a9396",
             state="disabled", command=self._capture_frame)
         self._capture_btn.pack(side="left", padx=4)
+        ctk.CTkButton(
+            cam_btns, text="📁  Upload Image", width=145,
+            fg_color="#2a2a4a", hover_color="#3a3a6a",
+            command=self._upload_image).pack(side="left", padx=4)
 
         # Normal review buttons (shown after successful alignment)
         self._review_btns = ctk.CTkFrame(cam_col, fg_color="transparent")
@@ -796,7 +800,14 @@ class RecognitionTab(ctk.CTkFrame):
         popup.title(Path(path).name)
         popup.configure(bg="#0d0d1a")
         sw, sh = popup.winfo_screenwidth(), popup.winfo_screenheight()
-        img.thumbnail((int(sw * 0.8), int(sh * 0.8)), Image.LANCZOS)
+        max_w, max_h = int(sw * 0.8), int(sh * 0.8)
+        # Upscale small images (e.g. 112x112 aligned faces) to a readable size
+        iw, ih = img.size
+        scale = max(max_w / iw, max_h / ih, 1.0)   # at least 1× (never shrink below original)
+        scale = min(scale, min(max_w / iw, max_h / ih))  # but cap at screen limit
+        nw, nh = int(iw * scale), int(ih * scale)
+        nw, nh = min(nw, max_w), min(nh, max_h)
+        img = img.resize((nw, nh), Image.LANCZOS)
         tk_img = ImageTk.PhotoImage(img)
         lbl = tk.Label(popup, image=tk_img, bg="#0d0d1a")
         lbl.image = tk_img
@@ -865,6 +876,32 @@ class RecognitionTab(ctk.CTkFrame):
                 self._photo_ref = tk
 
             self.after(0, _upd)
+
+    # ── Upload ────────────────────────────────────────────────────────────────
+
+    def _upload_image(self) -> None:
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select image",
+            filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.webp"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            raw = Image.open(path).convert("RGB")
+        except Exception as exc:
+            self._status.configure(text=f"⚠  Cannot open image: {exc}",
+                                   text_color="#ff6b6b")
+            return
+        # Stop camera if running
+        if self._running:
+            self._camera.close()
+            self._running = False
+            self._thread_gen += 1
+            self._cam_btn.configure(text="▶  Start Camera")
+            self._capture_btn.configure(state="disabled")
+        self._raw_frame = _center_crop_square(raw)
+        self._status.configure(text="Detecting face in uploaded image…", text_color="#aaa")
+        threading.Thread(target=self._detect_and_review, args=(raw,), daemon=True).start()
 
     # ── Capture → Detect → Review → Accept ───────────────────────────────────
 
