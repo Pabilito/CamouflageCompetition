@@ -53,6 +53,22 @@ class CaptureTab(ctk.CTkFrame):
         self._refresh_user_list()
         self._clear_thumbnails()
 
+    def on_tab_hidden(self) -> None:
+        """Stop the camera when leaving this tab."""
+        if self._running:
+            self._camera.close()
+            self._running = False
+            self._thread_gen += 1
+            self._cam_btn.configure(text="▶  Start Camera")
+            self._capture_btn.configure(state="disabled")
+            self._canvas.delete("all")
+            self._status.configure(text="Camera stopped (tab switched).", text_color="#888")
+
+    def _on_canvas_resize(self, event) -> None:
+        size = min(event.width, event.height)
+        if size > 10:
+            self._canvas_size = size
+
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
@@ -112,6 +128,8 @@ class CaptureTab(ctk.CTkFrame):
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
 
+        right.rowconfigure(2, weight=1)
+
         ctk.CTkLabel(right, text="Camera Preview",
                      font=ctk.CTkFont(size=13, weight="bold"),
                      text_color="#00d4ff").grid(
@@ -120,9 +138,10 @@ class CaptureTab(ctk.CTkFrame):
                      font=ctk.CTkFont(size=10), text_color="#555").grid(
             row=1, column=0, padx=14, sticky="w")
 
-        self._canvas = tk.Canvas(right, width=_PREVIEW_SIZE, height=_PREVIEW_SIZE,
-                                 bg="#0d0d1a", highlightthickness=0)
-        self._canvas.grid(row=2, column=0, padx=14, pady=(4, 4))
+        self._canvas_size = _PREVIEW_SIZE
+        self._canvas = tk.Canvas(right, bg="#0d0d1a", highlightthickness=0)
+        self._canvas.grid(row=2, column=0, padx=14, pady=(4, 4), sticky="nsew")
+        self._canvas.bind("<Configure>", self._on_canvas_resize)
 
         # Live controls
         self._live_btns = ctk.CTkFrame(right, fg_color="transparent")
@@ -328,7 +347,7 @@ class CaptureTab(ctk.CTkFrame):
             img = Image.fromarray(frame)
             w, h = img.size
             side  = min(w, h)
-            scale = _PREVIEW_SIZE / max(w, h)
+            scale = self._canvas_size / max(w, h)
             disp_w, disp_h = int(w * scale), int(h * scale)
             img_disp  = img.resize((disp_w, disp_h), Image.BILINEAR)
             crop_side = int(side * scale)
@@ -339,8 +358,8 @@ class CaptureTab(ctk.CTkFrame):
             def _update(tk=tk_img, dw=disp_w, dh=disp_h, cx=cx, cy=cy, cs=crop_side):
                 if gen != self._thread_gen:
                     return
-                ox = (_PREVIEW_SIZE - dw) // 2
-                oy = (_PREVIEW_SIZE - dh) // 2
+                ox = (self._canvas_size - dw) // 2
+                oy = (self._canvas_size - dh) // 2
                 self._canvas.delete("all")
                 self._canvas.create_image(ox, oy, anchor="nw", image=tk)
                 self._canvas.create_rectangle(
@@ -399,10 +418,10 @@ class CaptureTab(ctk.CTkFrame):
 
     def _show_review_image(self, img: Image.Image) -> None:
         display = img.copy()
-        display.thumbnail((_PREVIEW_SIZE, _PREVIEW_SIZE), Image.LANCZOS)
+        display.thumbnail((self._canvas_size, self._canvas_size), Image.LANCZOS)
         tk_img = ImageTk.PhotoImage(display)
-        ox = (_PREVIEW_SIZE - display.width) // 2
-        oy = (_PREVIEW_SIZE - display.height) // 2
+        ox = (self._canvas_size - display.width) // 2
+        oy = (self._canvas_size - display.height) // 2
         self._canvas.delete("all")
         self._canvas.create_image(ox, oy, anchor="nw", image=tk_img)
         self._photo_ref = tk_img

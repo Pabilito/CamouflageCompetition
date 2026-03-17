@@ -66,7 +66,7 @@ class App(ctk.CTk):
                               fg_color=("#1a1a2e", "#1a1a2e"))
         header.pack(fill="x", side="top")
         ctk.CTkLabel(
-            header, text=" RMA Face Camouflage Competition",
+            header, text="  🔍  RMA Face Camouflage Competition",
             font=ctk.CTkFont(family="Courier New", size=16, weight="bold"),
             text_color="#00d4ff",
         ).pack(side="left", padx=16, pady=10)
@@ -106,14 +106,20 @@ class App(ctk.CTk):
         )
         self._ranking_tab.pack(fill="both", expand=True)
 
-        # Auto-reload on tab switch
-        tabs.configure(command=lambda: (
-            self._recognition_tab.on_tab_shown()
-            if tabs.get() == "Adversarial Pictures"
-            else self._ranking_tab.on_tab_shown()
-            if tabs.get() == "Ranking"
-            else None
-        ))
+        # Auto-reload on tab switch; stop camera when leaving a camera tab
+        def _on_tab_change():
+            tab = tabs.get()
+            if tab == "Adversarial Pictures":
+                self._capture_tab.on_tab_hidden()
+                self._recognition_tab.on_tab_shown()
+            elif tab == "Ranking":
+                self._capture_tab.on_tab_hidden()
+                self._recognition_tab.on_tab_hidden()
+                self._ranking_tab.on_tab_shown()
+            elif tab == "Control Pictures":
+                self._recognition_tab.on_tab_hidden()
+
+        tabs.configure(command=_on_tab_change)
 
         # Pre-load gallery on startup so Adversarial Pictures is ready immediately
         self.after(200, self._recognition_tab.on_tab_shown)

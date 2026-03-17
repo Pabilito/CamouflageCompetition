@@ -88,7 +88,8 @@ class RecognitionTab(ctk.CTkFrame):
         self._galleries: dict = {}
         self._gallery_paths: dict = {}
         self._gallery_ready = False
-        self._gallery_mtime: float = 0.0   # mtime of users/ at last load
+        self._gallery_mtime: float = 0.0
+        self._gallery_loading = False   # guard against concurrent loads
         self._photo_ref     = None
         self._score_widgets: dict = {}
         self._pending_frame: Image.Image | None = None
@@ -98,7 +99,7 @@ class RecognitionTab(ctk.CTkFrame):
 
         self._build_ui()
 
-    # ── Tab hook ──────────────────────────────────────────────────────────────
+    # ── Tab hooks ─────────────────────────────────────────────────────────────
 
     def on_tab_shown(self) -> None:
         user_dir = Path(self._data_dir) / "users"
@@ -106,10 +107,26 @@ class RecognitionTab(ctk.CTkFrame):
             try:
                 mtime = user_dir.stat().st_mtime
                 if mtime == self._gallery_mtime:
-                    return   # nothing changed, skip reload
+                    return
             except OSError:
                 pass
         self._reload_gallery()
+
+    def on_tab_hidden(self) -> None:
+        """Stop the camera when leaving this tab."""
+        if self._running:
+            self._camera.close()
+            self._running = False
+            self._thread_gen += 1
+            self._cam_btn.configure(text="▶  Start Camera")
+            self._capture_btn.configure(state="disabled")
+            self._canvas.delete("all")
+            self._status.configure(text="Camera stopped (tab switched).", text_color="#888")
+
+    def _on_canvas_resize(self, event) -> None:
+        size = min(event.width, event.height)
+        if size > 10:
+            self._canvas_size = size
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -183,6 +200,7 @@ class RecognitionTab(ctk.CTkFrame):
         cam_col = ctk.CTkFrame(right_outer, fg_color="transparent")
         cam_col.grid(row=0, column=0, sticky="nsew", padx=(10, 6), pady=10)
         cam_col.columnconfigure(0, weight=1)
+        cam_col.rowconfigure(2, weight=1)
 
         ctk.CTkLabel(cam_col, text="Live Camera",
                      font=ctk.CTkFont(size=12, weight="bold"),
@@ -192,9 +210,10 @@ class RecognitionTab(ctk.CTkFrame):
                      font=ctk.CTkFont(size=10), text_color="#555").grid(
             row=1, column=0, sticky="w")
 
-        self._canvas = tk.Canvas(cam_col, width=_PREVIEW_SIZE, height=_PREVIEW_SIZE,
-                                 bg="#0d0d1a", highlightthickness=0)
-        self._canvas.grid(row=2, column=0, pady=(4, 4))
+        self._canvas_size = _PREVIEW_SIZE
+        self._canvas = tk.Canvas(cam_col, bg="#0d0d1a", highlightthickness=0)
+        self._canvas.grid(row=2, column=0, pady=(4, 4), sticky="nsew")
+        self._canvas.bind("<Configure>", self._on_canvas_resize)
 
         cam_btns = ctk.CTkFrame(cam_col, fg_color="transparent")
         cam_btns.grid(row=3, column=0, pady=4)
@@ -475,8 +494,9 @@ class RecognitionTab(ctk.CTkFrame):
         """Reset all gallery state and UI after a DB/file wipe."""
         self._galleries.clear()
         self._gallery_paths.clear()
-        self._gallery_ready = False
-        self._gallery_mtime = 0.0
+        self._gallery_ready   = False
+        self._gallery_loading = False
+        self._gallery_mtime   = 0.0
         self._identity_menu.configure(values=["—"])
         self._identity_var.set("—")
         self._gallery_status.configure(
@@ -495,12 +515,14 @@ class RecognitionTab(ctk.CTkFrame):
         self.after(100, self._reload_gallery)
 
     def _reload_gallery(self) -> None:
+        if self._gallery_loading:
+            return   # already loading, don't start a second thread
         user_dir = Path(self._data_dir) / "users"
         if not user_dir.exists():
-            # No users folder — clear gallery state and show neutral message
             self._galleries.clear()
             self._gallery_paths.clear()
-            self._gallery_ready = True  # nothing to load, ready for new captures
+            self._gallery_ready = True
+            self._gallery_loading = False
             self._identity_menu.configure(values=["—"])
             self._identity_var.set("—")
             self._gallery_status.configure(
@@ -510,56 +532,66 @@ class RecognitionTab(ctk.CTkFrame):
             self._refresh_best_score()
             return
 
-        self._gallery_ready = False
+        self._gallery_ready   = False
+        self._gallery_loading = True
         self._gallery_status.configure(
             text="⏳  Loading — you can still capture images.", text_color="#ffd166")
 
         def _load():
-            for model_name in self._engine.model_names:
-                self._galleries[model_name] = self._engine.build_gallery(
-                    model_name, user_dir)
-
-            self._gallery_paths = {}
-            for model_name in self._engine.model_names:
-                self._gallery_paths[model_name] = {}
-                for udir in sorted(Path(user_dir).iterdir()):
-                    if not udir.is_dir():
-                        continue
-                    pairs = []
-                    for p in sorted(udir.glob("*.jpg")) + sorted(udir.glob("*.png")):
-                        try:
-                            emb = self._engine.embed(
-                                model_name,
-                                np.array(Image.open(p).convert("RGB")))
-                            pairs.append((str(p), emb))
-                        except Exception:
-                            pass
-                    if pairs:
-                        self._gallery_paths[model_name][udir.name] = pairs
-
-            all_users = sorted({u for g in self._galleries.values() for u in g})
-            self._gallery_ready = True
             try:
-                self._gallery_mtime = Path(user_dir).stat().st_mtime
-            except OSError:
-                self._gallery_mtime = 0.0
+                for model_name in self._engine.model_names:
+                    self._galleries[model_name] = self._engine.build_gallery(
+                        model_name, user_dir)
 
-            def _done():
-                if all_users:
-                    self._identity_menu.configure(values=all_users)
-                    if self._identity_var.get() not in all_users:
-                        self._identity_var.set(all_users[0])
-                    self._gallery_status.configure(
-                        text=f"✓  {len(all_users)} identit"
-                             f"{'y' if len(all_users) == 1 else 'ies'} loaded.",
-                        text_color="#00ff9f")
-                    self._refresh_thumbnails()
-                    self._refresh_best_score()
-                else:
-                    self._gallery_status.configure(
-                        text="⚠  No control images found.", text_color="#ff6b6b")
+                gallery_paths = {}
+                for model_name in self._engine.model_names:
+                    gallery_paths[model_name] = {}
+                    for udir in sorted(Path(user_dir).iterdir()):
+                        if not udir.is_dir():
+                            continue
+                        pairs = []
+                        for p in sorted(udir.glob("*.jpg")) + sorted(udir.glob("*.png")):
+                            try:
+                                emb = self._engine.embed(
+                                    model_name,
+                                    np.array(Image.open(p).convert("RGB")))
+                                pairs.append((str(p), emb))
+                            except Exception:
+                                pass
+                        if pairs:
+                            gallery_paths[model_name][udir.name] = pairs
 
-            self.after(0, _done)
+                # Assign atomically so no partial state is ever visible
+                self._gallery_paths = gallery_paths
+                all_users = sorted({u for g in self._galleries.values() for u in g})
+                self._gallery_ready   = True
+                self._gallery_loading = False
+                try:
+                    self._gallery_mtime = Path(user_dir).stat().st_mtime
+                except OSError:
+                    self._gallery_mtime = 0.0
+
+                def _done():
+                    if all_users:
+                        self._identity_menu.configure(values=all_users)
+                        if self._identity_var.get() not in all_users:
+                            self._identity_var.set(all_users[0])
+                        self._gallery_status.configure(
+                            text=f"✓  {len(all_users)} identit"
+                                 f"{'y' if len(all_users) == 1 else 'ies'} loaded.",
+                            text_color="#00ff9f")
+                        self._refresh_thumbnails()
+                        self._refresh_best_score()
+                    else:
+                        self._gallery_status.configure(
+                            text="⚠  No control images found.", text_color="#ff6b6b")
+
+                self.after(0, _done)
+
+            except Exception as exc:
+                self._gallery_loading = False
+                self.after(0, self._gallery_status.configure,
+                           {"text": f"⚠  Load error: {exc}", "text_color": "#ff6b6b"})
 
         threading.Thread(target=_load, daemon=True).start()
 
@@ -811,7 +843,7 @@ class RecognitionTab(ctk.CTkFrame):
             img = Image.fromarray(frame)
             w, h  = img.size
             side  = min(w, h)
-            scale = _PREVIEW_SIZE / max(w, h)
+            scale = self._canvas_size / max(w, h)
             disp_w, disp_h = int(w * scale), int(h * scale)
             img_disp  = img.resize((disp_w, disp_h), Image.BILINEAR)
             crop_side = int(side * scale)
@@ -823,8 +855,8 @@ class RecognitionTab(ctk.CTkFrame):
                      cx=cx, cy=cy, cs=crop_side):
                 if g != self._thread_gen:
                     return
-                ox = (_PREVIEW_SIZE - dw) // 2
-                oy = (_PREVIEW_SIZE - dh) // 2
+                ox = (self._canvas_size - dw) // 2
+                oy = (self._canvas_size - dh) // 2
                 self._canvas.delete("all")
                 self._canvas.create_image(ox, oy, anchor="nw", image=tk)
                 self._canvas.create_rectangle(
@@ -876,10 +908,10 @@ class RecognitionTab(ctk.CTkFrame):
 
     def _show_review_image(self, img: Image.Image) -> None:
         display = img.copy()
-        display.thumbnail((_PREVIEW_SIZE, _PREVIEW_SIZE), Image.LANCZOS)
+        display.thumbnail((self._canvas_size, self._canvas_size), Image.LANCZOS)
         tk_img = ImageTk.PhotoImage(display)
-        ox = (_PREVIEW_SIZE - display.width) // 2
-        oy = (_PREVIEW_SIZE - display.height) // 2
+        ox = (self._canvas_size - display.width) // 2
+        oy = (self._canvas_size - display.height) // 2
         self._canvas.delete("all")
         self._canvas.create_image(ox, oy, anchor="nw", image=tk_img)
         self._photo_ref = tk_img
