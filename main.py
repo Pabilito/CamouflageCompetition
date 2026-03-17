@@ -20,6 +20,7 @@ import customtkinter as ctk
 from load_model import load_app_models
 from core.database import Database
 from core.embeddings import EmbeddingEngine
+from core.face_aligner import FaceAligner
 from ui.capture_tab import CaptureTab
 from ui.recognition_tab import RecognitionTab
 from ui.ranking_tab import RankingTab
@@ -41,7 +42,8 @@ def _parse_args() -> argparse.Namespace:
 # ── App window ────────────────────────────────────────────────────────────────
 
 class App(ctk.CTk):
-    def __init__(self, engine: EmbeddingEngine, db: Database, data_dir: str) -> None:
+    def __init__(self, engine: EmbeddingEngine, db: Database,
+                 data_dir: str, aligner: FaceAligner) -> None:
         super().__init__()
 
         self.title("Face Recognition")
@@ -54,6 +56,7 @@ class App(ctk.CTk):
         self._engine   = engine
         self._db       = db
         self._data_dir = data_dir
+        self._aligner  = aligner
 
         self._build_ui()
 
@@ -80,6 +83,7 @@ class App(ctk.CTk):
             engine=self._engine,
             db=self._db,
             data_dir=self._data_dir,
+            aligner=self._aligner,
         )
         self._capture_tab.pack(fill="both", expand=True)
 
@@ -88,6 +92,7 @@ class App(ctk.CTk):
             engine=self._engine,
             db=self._db,
             data_dir=self._data_dir,
+            aligner=self._aligner,
         )
         self._recognition_tab.pack(fill="both", expand=True)
 
@@ -144,7 +149,12 @@ def main() -> None:
     engine = EmbeddingEngine(bundles, device=device)
     db     = Database(args.db)
 
-    app = App(engine=engine, db=db, data_dir=args.data_dir)
+    print("[INFO] Loading face aligner (MTCNN)...")
+    aligner = FaceAligner(device=device)
+    aligner._get_mtcnn()   # force-load now so first capture has no delay
+    print("[INFO] Face aligner ready.")
+
+    app = App(engine=engine, db=db, data_dir=args.data_dir, aligner=aligner)
     app.protocol("WM_DELETE_WINDOW", app.on_close)
     app.mainloop()
 

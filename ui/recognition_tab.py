@@ -22,6 +22,7 @@ import numpy as np
 from core.camera import Camera
 from core.database import Database
 from core.embeddings import EmbeddingEngine
+from core.face_aligner import FaceAligner
 
 _PREVIEW_SIZE = 420
 _THUMB_SIZE   = 72
@@ -73,12 +74,14 @@ def _center_crop_square(img: Image.Image) -> Image.Image:
 
 
 class RecognitionTab(ctk.CTkFrame):
-    def __init__(self, parent, engine: EmbeddingEngine, db: Database, data_dir: str):
+    def __init__(self, parent, engine: EmbeddingEngine, db: Database,
+                 data_dir: str, aligner=None):
         super().__init__(parent, fg_color="transparent")
         self._engine        = engine
         self._db            = db
         self._data_dir      = data_dir
         self._camera        = Camera(index=0)
+        self._aligner       = aligner or FaceAligner()
         self._running       = False
         self._thread_gen    = 0
         self._latest_frame  = None
@@ -88,6 +91,7 @@ class RecognitionTab(ctk.CTkFrame):
         self._photo_ref     = None
         self._score_widgets: dict = {}
         self._pending_frame: Image.Image | None = None
+        self._raw_frame:     Image.Image | None = None
         self._thumb_refs: list = []
 
         self._build_ui()
@@ -161,8 +165,8 @@ class RecognitionTab(ctk.CTkFrame):
         # ═══════════════════════════════════════════════════════════════════════
         right_outer = ctk.CTkFrame(self, corner_radius=10, fg_color=("#1e1e2e", "#1e1e2e"))
         right_outer.grid(row=0, column=1, sticky="nsew")
-        right_outer.columnconfigure(0, weight=2)
-        right_outer.columnconfigure(1, weight=3)
+        right_outer.columnconfigure(0, weight=1)
+        right_outer.columnconfigure(1, weight=1)
         right_outer.rowconfigure(0, weight=1)
 
         # ── Camera column ──────────────────────────────────────────────────────
@@ -193,17 +197,31 @@ class RecognitionTab(ctk.CTkFrame):
             state="disabled", command=self._capture_frame)
         self._capture_btn.pack(side="left", padx=4)
 
-        # Review buttons
+        # Normal review buttons (shown after successful alignment)
         self._review_btns = ctk.CTkFrame(cam_col, fg_color="transparent")
         self._review_btns.grid(row=4, column=0, pady=4)
         self._review_btns.grid_remove()
-        ctk.CTkLabel(self._review_btns, text="Accept?",
+        ctk.CTkLabel(self._review_btns, text="Accept aligned face?",
                      font=ctk.CTkFont(size=11, weight="bold"),
                      text_color="#ffd166").pack(side="left", padx=6)
         ctk.CTkButton(self._review_btns, text="✓  Accept & Log", width=130,
                       fg_color="#004d00", hover_color="#007700",
                       command=self._accept_frame).pack(side="left", padx=4)
         ctk.CTkButton(self._review_btns, text="✗  Retake", width=100,
+                      fg_color="#5a0000", hover_color="#8b0000",
+                      command=self._retake_frame).pack(side="left", padx=4)
+
+        # Detection-failed fallback buttons
+        self._fail_btns = ctk.CTkFrame(cam_col, fg_color="transparent")
+        self._fail_btns.grid(row=4, column=0, pady=4)
+        self._fail_btns.grid_remove()
+        ctk.CTkLabel(self._fail_btns, text="⚠  No face detected",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="#ff6b6b").pack(side="left", padx=6)
+        ctk.CTkButton(self._fail_btns, text="💾  Save & Log Unprocessed", width=190,
+                      fg_color="#5a3a00", hover_color="#8b5a00",
+                      command=self._accept_unprocessed).pack(side="left", padx=4)
+        ctk.CTkButton(self._fail_btns, text="✗  Retake", width=100,
                       fg_color="#5a0000", hover_color="#8b0000",
                       command=self._retake_frame).pack(side="left", padx=4)
 
@@ -298,35 +316,42 @@ class RecognitionTab(ctk.CTkFrame):
     def _build_model_row(self, parent, model_name: str, row: int) -> None:
         threshold = THRESHOLDS_LFW.get(model_name)
         accuracy  = ACCURACY_LFW.get(model_name)
+
         frame = ctk.CTkFrame(parent, corner_radius=8, fg_color=("#16213e", "#16213e"))
         frame.grid(row=row, column=0, sticky="ew", pady=4)
-        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)   # whole frame expands
 
+        # ── Row 0: model name | score | verdict | threshold ────────────────────
         top = ctk.CTkFrame(frame, fg_color="transparent")
         top.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 2))
+        # col 0: model name (expands)  col 1: score  col 2: verdict  col 3: threshold
         top.columnconfigure(0, weight=1)
+        top.columnconfigure(1, weight=0)
+        top.columnconfigure(2, weight=0)
+        top.columnconfigure(3, weight=0)
 
         ctk.CTkLabel(top, text=model_name,
                      font=ctk.CTkFont(family="Courier New", size=11, weight="bold"),
-                     text_color="#e0e0e0", anchor="w").grid(row=0, column=0, sticky="w")
+                     text_color="#e0e0e0", anchor="w").grid(
+            row=0, column=0, sticky="w")
 
         score_lbl = ctk.CTkLabel(top, text="—",
                                  font=ctk.CTkFont(size=12, weight="bold"),
                                  text_color="#aaa", width=72, anchor="e")
-        score_lbl.grid(row=0, column=1, padx=6)
+        score_lbl.grid(row=0, column=1, padx=(8, 4))
 
         verdict_lbl = ctk.CTkLabel(top, text="",
                                    font=ctk.CTkFont(size=10),
-                                   text_color="#555", width=90, anchor="w")
-        verdict_lbl.grid(row=0, column=2)
+                                   text_color="#555", width=80, anchor="w")
+        verdict_lbl.grid(row=0, column=2, padx=(0, 4))
 
         if threshold is not None:
-            ctk.CTkLabel(top, text=f"Decision Threshold: {threshold:.4f}",
+            ctk.CTkLabel(top, text=f"Threshold: {threshold:.4f}",
                          font=ctk.CTkFont(size=10),
                          text_color="#ff4444", anchor="e").grid(
-                row=0, column=3, padx=(8, 0))
+                row=0, column=3, padx=(4, 0))
 
-        # Similarity score bar with threshold tick
+        # ── Row 1: similarity bar ──────────────────────────────────────────────
         sim_canvas = tk.Canvas(frame, height=_BAR_H + 10, bg="#16213e",
                                highlightthickness=0, bd=0)
         sim_canvas.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 4))
@@ -334,26 +359,27 @@ class RecognitionTab(ctk.CTkFrame):
                         lambda e, c=sim_canvas, t=threshold:
                             self._draw_bar(c, 0.0, "#333", t))
 
-        # Recognition accuracy bar (static, drawn once on configure)
+        # ── Row 2: accuracy bar ────────────────────────────────────────────────
         if accuracy is not None:
             acc_row = ctk.CTkFrame(frame, fg_color="transparent")
-            acc_row.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 2))
+            acc_row.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 4))
             acc_row.columnconfigure(1, weight=1)
-            ctk.CTkLabel(acc_row,
-                         text="Recognition accuracy:",
+
+            ctk.CTkLabel(acc_row, text="Recognition accuracy:",
                          font=ctk.CTkFont(size=9), text_color="#666",
                          anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 6))
-            ctk.CTkLabel(acc_row,
-                         text=f"{accuracy:.3f}",
-                         font=ctk.CTkFont(size=9, weight="bold"),
-                         text_color="#6699cc", anchor="e").grid(row=0, column=2, sticky="e")
+
             acc_canvas = tk.Canvas(acc_row, height=6, bg="#16213e",
                                    highlightthickness=0, bd=0)
-            acc_canvas.grid(row=0, column=1, sticky="ew", padx=4)
-            acc_canvas.bind(
-                "<Configure>",
-                lambda e, c=acc_canvas, a=accuracy:
-                    self._draw_accuracy_bar(c, a))
+            acc_canvas.grid(row=0, column=1, sticky="ew", padx=(0, 4))
+            acc_canvas.bind("<Configure>",
+                            lambda e, c=acc_canvas, a=accuracy:
+                                self._draw_accuracy_bar(c, a))
+
+            ctk.CTkLabel(acc_row, text=f"{accuracy:.3f}",
+                         font=ctk.CTkFont(size=9, weight="bold"),
+                         text_color="#6699cc", anchor="e").grid(
+                row=0, column=2, sticky="e")
 
         ctk.CTkFrame(frame, height=4, fg_color="transparent").grid(
             row=3, column=0)
@@ -771,24 +797,45 @@ class RecognitionTab(ctk.CTkFrame):
 
             self.after(0, _upd)
 
-    # ── Capture → Review → Accept ─────────────────────────────────────────────
+    # ── Capture → Detect → Review → Accept ───────────────────────────────────
 
     def _capture_frame(self) -> None:
         frame = self._latest_frame
         if frame is None:
             return
-        # Pause live feed — also close camera so Stop Camera button works correctly
         self._camera.close()
         self._running = False
         self._thread_gen += 1
         self._cam_btn.configure(text="▶  Start Camera")
         self._capture_btn.configure(state="disabled")
-        img = Image.fromarray(frame)
-        self._pending_frame = _center_crop_square(img)
-        self._show_review_image(self._pending_frame)
+        self._status.configure(text="Detecting face…", text_color="#aaa")
+
+        raw = Image.fromarray(frame)
+        self._raw_frame = _center_crop_square(raw)
+        threading.Thread(target=self._detect_and_review,
+                         args=(raw,), daemon=True).start()
+
+    def _detect_and_review(self, raw: Image.Image) -> None:
+        result = self._aligner.align(raw)
+        if result.success:
+            self.after(0, self._show_aligned, result.image)
+        else:
+            self.after(0, self._show_detection_failed, result.error)
+
+    def _show_aligned(self, aligned: Image.Image) -> None:
+        self._pending_frame = aligned
+        self._show_review_image(aligned)
+        self._fail_btns.grid_remove()
         self._review_btns.grid()
         self._status.configure(
-            text="Review — accept to log or retake.", text_color="#ffd166")
+            text="Face detected & aligned — accept or retake.", text_color="#00ff9f")
+
+    def _show_detection_failed(self, error: str) -> None:
+        self._pending_frame = self._raw_frame
+        self._show_review_image(self._raw_frame)
+        self._review_btns.grid_remove()
+        self._fail_btns.grid()
+        self._status.configure(text=f"⚠  {error}", text_color="#ff6b6b")
 
     def _show_review_image(self, img: Image.Image) -> None:
         display = img.copy()
@@ -800,26 +847,14 @@ class RecognitionTab(ctk.CTkFrame):
         self._canvas.create_image(ox, oy, anchor="nw", image=tk_img)
         self._photo_ref = tk_img
 
-    def _accept_frame(self) -> None:
-        img = self._pending_frame
-        if img is None:
-            return
-        identity = self._identity_var.get()
-
-        # Save to data/adversarial/<identity>/
-        adv_dir   = Path(self._data_dir) / "adversarial" / (
-            identity if identity != "—" else "unknown")
-        save_path = Camera.next_image_path(adv_dir)
-        img.save(str(save_path), format="JPEG", quality=95)
-
-        self._review_btns.grid_remove()
-        self._status.configure(text="Running inference…", text_color="#aaa")
-
+    def _run_inference(self, img: Image.Image, save_path: Path,
+                       identity: str) -> None:
+        """Shared inference logic for both accept paths."""
         if not self._gallery_ready or identity == "—":
             self._status.configure(
                 text=f"✓  Saved {save_path.name}  (gallery not ready — scores skipped)",
                 text_color="#ffd166")
-            self._pending_frame = None
+            self.after(50, self._refresh_thumbnails)
             return
 
         def _infer():
@@ -852,11 +887,9 @@ class RecognitionTab(ctk.CTkFrame):
                     "frame_path": str(save_path),
                 })
 
-            # All DB inserts done — now update UI in one batch
             def _update_all():
                 for r in results:
                     self._update_row(r["model"], r["score"])
-                # Update models with no data
                 for model_name in self._engine.model_names:
                     if model_name not in scores_by_model:
                         self._update_row(model_name, None)
@@ -870,12 +903,45 @@ class RecognitionTab(ctk.CTkFrame):
             self._write_log(identity, save_path, results)
             self.after(0, _update_all)
 
-        self._pending_frame = None
         threading.Thread(target=_infer, daemon=True).start()
+
+    def _accept_frame(self) -> None:
+        img = self._pending_frame
+        if img is None:
+            return
+        identity = self._identity_var.get()
+        adv_dir  = Path(self._data_dir) / "adversarial" / (
+            identity if identity != "—" else "unknown")
+        save_path = Camera.next_image_path(adv_dir)
+        img.save(str(save_path), format="JPEG", quality=95)
+        self._review_btns.grid_remove()
+        self._fail_btns.grid_remove()
+        self._status.configure(text="Running inference…", text_color="#aaa")
+        self._pending_frame = None
+        self._raw_frame     = None
+        self._run_inference(img, save_path, identity)
+
+    def _accept_unprocessed(self) -> None:
+        img = self._raw_frame
+        if img is None:
+            return
+        identity = self._identity_var.get()
+        adv_dir  = Path(self._data_dir) / "adversarial" / (
+            identity if identity != "—" else "unknown")
+        save_path = Camera.next_image_path(adv_dir)
+        img.save(str(save_path), format="JPEG", quality=95)
+        self._review_btns.grid_remove()
+        self._fail_btns.grid_remove()
+        self._status.configure(text="Running inference…", text_color="#aaa")
+        self._pending_frame = None
+        self._raw_frame     = None
+        self._run_inference(img, save_path, identity)
 
     def _retake_frame(self) -> None:
         self._pending_frame = None
+        self._raw_frame     = None
         self._review_btns.grid_remove()
+        self._fail_btns.grid_remove()
         self._camera.close()
         self._running = True
         self._thread_gen += 1

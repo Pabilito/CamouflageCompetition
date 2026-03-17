@@ -12,6 +12,7 @@ from PIL import Image, ImageTk
 from core.camera import Camera
 from core.database import Database
 from core.embeddings import EmbeddingEngine
+from core.face_aligner import FaceAligner
 
 _PREVIEW_SIZE = 420
 _THUMB_SIZE   = 72
@@ -27,19 +28,22 @@ def _center_crop_square(img: Image.Image) -> Image.Image:
 
 
 class CaptureTab(ctk.CTkFrame):
-    def __init__(self, parent, engine: EmbeddingEngine, db: Database, data_dir: str):
+    def __init__(self, parent, engine: EmbeddingEngine, db: Database,
+                 data_dir: str, aligner=None):
         super().__init__(parent, fg_color="transparent")
         self._engine        = engine
         self._db            = db
         self._data_dir      = data_dir
         self._camera        = Camera(index=0)
+        self._aligner       = aligner or FaceAligner()
         self._running       = False
         self._thread_gen    = 0
         self._current_user_id: int | None = None
         self._latest_frame  = None
         self._photo_ref     = None
-        self._pending_frame: Image.Image | None = None
-        self._on_image_accepted = None   # set by main.py after construction
+        self._pending_frame: Image.Image | None = None   # aligned or fallback
+        self._raw_frame:     Image.Image | None = None   # original pre-align crop
+        self._on_image_accepted = None
 
         self._build_ui()
         self._refresh_user_list()
@@ -135,22 +139,37 @@ class CaptureTab(ctk.CTkFrame):
             state="disabled", command=self._capture_frame)
         self._capture_btn.pack(side="left", padx=8)
 
-        # Review controls (hidden until a frame is captured)
+        # Normal review controls (shown after successful alignment)
         self._review_frame = ctk.CTkFrame(right, fg_color="transparent")
         self._review_frame.grid(row=4, column=0, pady=4)
         self._review_frame.grid_remove()
 
         ctk.CTkLabel(self._review_frame,
-                     text="Accept this image?",
+                     text="Accept aligned face?",
                      font=ctk.CTkFont(size=12, weight="bold"),
                      text_color="#ffd166").pack(side="left", padx=10)
-
         ctk.CTkButton(self._review_frame, text="✓  Accept", width=110,
                       fg_color="#004d00", hover_color="#007700",
                       command=self._accept_frame).pack(side="left", padx=6)
         ctk.CTkButton(self._review_frame, text="✗  Retake", width=110,
                       fg_color="#5a0000", hover_color="#8b0000",
                       command=self._retake_frame).pack(side="left", padx=6)
+
+        # Detection-failed fallback controls
+        self._fail_frame = ctk.CTkFrame(right, fg_color="transparent")
+        self._fail_frame.grid(row=4, column=0, pady=4)
+        self._fail_frame.grid_remove()
+
+        ctk.CTkLabel(self._fail_frame,
+                     text="⚠  No face detected",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color="#ff6b6b").pack(side="left", padx=8)
+        ctk.CTkButton(self._fail_frame, text="💾  Save Unprocessed", width=160,
+                      fg_color="#5a3a00", hover_color="#8b5a00",
+                      command=self._accept_unprocessed).pack(side="left", padx=4)
+        ctk.CTkButton(self._fail_frame, text="✗  Retake", width=110,
+                      fg_color="#5a0000", hover_color="#8b0000",
+                      command=self._retake_frame).pack(side="left", padx=4)
 
         self._status = ctk.CTkLabel(
             right, text="Start the camera to begin.",
@@ -331,7 +350,7 @@ class CaptureTab(ctk.CTkFrame):
 
             self.after(0, _update)
 
-    # ── Capture → Review → Accept / Retake ───────────────────────────────────
+    # ── Capture → Detect → Review → Accept / Retake ──────────────────────────
 
     def _capture_frame(self) -> None:
         if self._current_user_id is None:
@@ -340,21 +359,45 @@ class CaptureTab(ctk.CTkFrame):
         frame = self._latest_frame
         if frame is None:
             return
-        # Close camera so the button state is consistent — Stop Camera can't
-        # be clicked while reviewing, and restarting works cleanly after.
+        # Stop camera immediately
         self._camera.close()
         self._running = False
         self._thread_gen += 1
         self._cam_btn.configure(text="▶  Start Camera")
         self._capture_btn.configure(state="disabled")
-        img = Image.fromarray(frame)
-        self._pending_frame = _center_crop_square(img)
-        self._show_review_image(self._pending_frame)
+        self._status.configure(text="Detecting face…", text_color="#aaa")
+
+        raw = Image.fromarray(frame)
+        self._raw_frame = _center_crop_square(raw)
+
+        # Run face detection in background so UI stays responsive
+        threading.Thread(target=self._detect_and_review,
+                         args=(raw,), daemon=True).start()
+
+    def _detect_and_review(self, raw: Image.Image) -> None:
+        result = self._aligner.align(raw)
+        if result.success:
+            self.after(0, self._show_aligned, result.image)
+        else:
+            # Show the centre-cropped raw frame with the failure panel
+            self.after(0, self._show_detection_failed, result.error)
+
+    def _show_aligned(self, aligned: Image.Image) -> None:
+        self._pending_frame = aligned
+        self._show_review_image(aligned)
+        self._fail_frame.grid_remove()
         self._review_frame.grid()
-        self._status.configure(text="Review the image — accept or retake.", text_color="#ffd166")
+        self._status.configure(text="Face detected & aligned — accept or retake.",
+                               text_color="#00ff9f")
+
+    def _show_detection_failed(self, error: str) -> None:
+        self._pending_frame = self._raw_frame   # fallback = centre crop
+        self._show_review_image(self._raw_frame)
+        self._review_frame.grid_remove()
+        self._fail_frame.grid()
+        self._status.configure(text=f"⚠  {error}", text_color="#ff6b6b")
 
     def _show_review_image(self, img: Image.Image) -> None:
-        """Render img (square) centred on the canvas."""
         display = img.copy()
         display.thumbnail((_PREVIEW_SIZE, _PREVIEW_SIZE), Image.LANCZOS)
         tk_img = ImageTk.PhotoImage(display)
@@ -362,31 +405,43 @@ class CaptureTab(ctk.CTkFrame):
         oy = (_PREVIEW_SIZE - display.height) // 2
         self._canvas.delete("all")
         self._canvas.create_image(ox, oy, anchor="nw", image=tk_img)
-        self._photo_ref = tk_img   # keep alive
+        self._photo_ref = tk_img
 
-    def _accept_frame(self) -> None:
-        if self._pending_frame is None:
-            return
+    def _save_and_finish(self, img: Image.Image) -> None:
+        """Shared save logic for both accept paths."""
         user_row = self._db.get_user_by_name(self._user_var.get())
         if user_row is None:
             return
         user_dir  = Path(self._data_dir) / "users" / user_row.name
         save_path = Camera.next_image_path(user_dir)
-        self._pending_frame.save(str(save_path), format="JPEG", quality=95)
+        img.save(str(save_path), format="JPEG", quality=95)
         self._db.add_capture(user_row.id, str(save_path))
         count = self._db.capture_count(user_row.id)
         self._count_label.configure(text=f"{count} image(s) saved for '{user_row.name}'")
         self._status.configure(text=f"✓  Saved {save_path.name}", text_color="#00ff9f")
         self._refresh_thumbnails(user_row.id)
         self._pending_frame = None
+        self._raw_frame     = None
         self._review_frame.grid_remove()
-        # Notify recognition tab to add this image to gallery incrementally
+        self._fail_frame.grid_remove()
         if self._on_image_accepted is not None:
             self._on_image_accepted(user_row.name, str(save_path))
 
+    def _accept_frame(self) -> None:
+        """Accept the aligned (or pending) frame."""
+        if self._pending_frame is not None:
+            self._save_and_finish(self._pending_frame)
+
+    def _accept_unprocessed(self) -> None:
+        """Save the raw centre-cropped frame when detection failed."""
+        if self._raw_frame is not None:
+            self._save_and_finish(self._raw_frame)
+
     def _retake_frame(self) -> None:
         self._pending_frame = None
+        self._raw_frame     = None
         self._review_frame.grid_remove()
+        self._fail_frame.grid_remove()
         self._camera.close()
         self._running = True
         self._thread_gen += 1
