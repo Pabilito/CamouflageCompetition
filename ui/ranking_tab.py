@@ -1,11 +1,8 @@
 """
 ui/ranking_tab.py  —  Ranking tab
 
-Default: average similarity across all models, sorted ASC (↓ = lower = better attack).
-Dropdown to filter by individual model.
-Columns scale with window width.
-Each row has a 🗑 button to delete that image's records.
-Thumbnails clickable to enlarge.
+Header row lives inside the scrollable frame so column widths are always
+perfectly aligned regardless of window size.
 """
 
 from pathlib import Path
@@ -20,15 +17,17 @@ from core.embeddings import EmbeddingEngine
 _THUMB      = 56
 _ALL_MODELS = "All models (average)"
 
-# Column indices — shared between header and rows
-# 0: Rank   1: Attacker   2: Score   3: Attack   4: Closest   5: Timestamp   6: Delete
-_COL_RANK      = 0
-_COL_ATTACKER  = 1
-_COL_SCORE     = 2
-_COL_ATTACK    = 3
-_COL_CLOSEST   = 4
-_COL_TIMESTAMP = 5
-_COL_DELETE    = 6
+# All columns share equal weight — each gets 1/7 of the available width
+_COLS = {
+    "rank":      0,
+    "attacker":  1,
+    "score":     2,
+    "attack":    3,
+    "closest":   4,
+    "timestamp": 5,
+    "delete":    6,
+}
+_C = _COLS  # name → grid column index
 
 
 class RankingTab(ctk.CTkFrame):
@@ -49,7 +48,7 @@ class RankingTab(ctk.CTkFrame):
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        self.rowconfigure(1, weight=1)
 
         # ── Toolbar ───────────────────────────────────────────────────────────
         toolbar = ctk.CTkFrame(self, fg_color="transparent")
@@ -82,38 +81,43 @@ class RankingTab(ctk.CTkFrame):
                      font=ctk.CTkFont(size=10), text_color="#555").grid(
             row=0, column=5, padx=(16, 0))
 
-        # ── Table header ──────────────────────────────────────────────────────
-        self._hdr_frame = ctk.CTkFrame(self, fg_color=("#16213e", "#16213e"), corner_radius=6)
-        self._hdr_frame.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 2))
-        # Header columns mirror body columns — attacker expands
-        self._hdr_frame.columnconfigure(_COL_ATTACKER, weight=1)
-        self._build_header(is_average=True)
-
-        # ── Scrollable body ───────────────────────────────────────────────────
+        # ── Scrollable body (header is row 0 inside it) ───────────────────────
         self._body = ctk.CTkScrollableFrame(
             self, fg_color=("#12122a", "#12122a"), corner_radius=6, label_text="")
-        self._body.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 4))
-        # Make attacker column expand so rows scale with window width
-        self._body.columnconfigure(_COL_ATTACKER, weight=1)
+        self._body.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 4))
+
+        # All columns equal weight
+        for i in range(7):
+            self._body.columnconfigure(i, weight=1)
 
         # ── Summary ───────────────────────────────────────────────────────────
         self._summary = ctk.CTkLabel(
             self, text="", font=ctk.CTkFont(size=11), text_color="#888")
-        self._summary.grid(row=3, column=0, sticky="w", padx=14, pady=(0, 8))
+        self._summary.grid(row=2, column=0, sticky="w", padx=14, pady=(0, 8))
 
-    def _build_header(self, is_average: bool) -> None:
-        for w in self._hdr_frame.winfo_children():
-            w.destroy()
-
+    def _draw_header(self, is_average: bool) -> None:
+        """Draw the sticky header as grid row 0 inside _body."""
         score_label = "Avg Similarity ↓" if is_average else "Similarity ↓"
-
-        _header_label(self._hdr_frame, "Rank",        _COL_RANK,      50,  expand=False)
-        _header_label(self._hdr_frame, "Attacker",    _COL_ATTACKER,  None, expand=True)
-        _header_label(self._hdr_frame, score_label,   _COL_SCORE,     110, expand=False)
-        _header_label(self._hdr_frame, "Attack",      _COL_ATTACK,    66,  expand=False)
-        _header_label(self._hdr_frame, "Closest",     _COL_CLOSEST,   66,  expand=False)
-        _header_label(self._hdr_frame, "Timestamp",   _COL_TIMESTAMP, 160, expand=False)
-        _header_label(self._hdr_frame, "",             _COL_DELETE,    36,  expand=False)
+        labels = {
+            "rank":      "Rank",
+            "attacker":  "Attacker",
+            "score":     score_label,
+            "attack":    "Attack",
+            "closest":   "Closest",
+            "timestamp": "Timestamp",
+            "delete":    "",
+        }
+        hdr_bg = "#16213e"
+        for name, text in labels.items():
+            col = _C[name]
+            lbl = ctk.CTkLabel(
+                self._body, text=text,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color="#00d4ff",
+                fg_color=hdr_bg,
+                anchor="center",
+            )
+            lbl.grid(row=0, column=col, padx=2, pady=(4, 4), sticky="ew")
 
     # ── Tab hook ──────────────────────────────────────────────────────────────
 
@@ -129,7 +133,7 @@ class RankingTab(ctk.CTkFrame):
 
         model_filter = self._model_var.get()
         is_average   = (model_filter == _ALL_MODELS)
-        self._build_header(is_average=is_average)
+        self._draw_header(is_average=is_average)
 
         if is_average:
             self._refresh_average()
@@ -141,7 +145,7 @@ class RankingTab(ctk.CTkFrame):
         if not all_rows:
             ctk.CTkLabel(self._body, text="No records yet.",
                          font=ctk.CTkFont(size=12), text_color="#555").grid(
-                row=0, column=0, columnspan=7, pady=30)
+                row=1, column=0, columnspan=7, pady=30)
             self._summary.configure(text="0 records.")
             return
 
@@ -175,7 +179,7 @@ class RankingTab(ctk.CTkFrame):
         if not rows:
             ctk.CTkLabel(self._body, text="No records yet.",
                          font=ctk.CTkFont(size=12), text_color="#555").grid(
-                row=0, column=0, columnspan=7, pady=30)
+                row=1, column=0, columnspan=7, pady=30)
             self._summary.configure(text="0 records.")
             return
         for rank, row in enumerate(rows, start=1):
@@ -186,51 +190,51 @@ class RankingTab(ctk.CTkFrame):
     # ── Row builders ──────────────────────────────────────────────────────────
 
     def _add_avg_row(self, rank: int, entry: dict) -> None:
-        r  = rank - 1
         sc = entry["avg_score"]
-        sc_col = "#00ff9f" if sc < 0.35 else ("#ffd166" if sc < 0.55 else "#ff6b6b")
         self._row_cells(
-            r,
+            grid_row=rank,
             rank=rank,
             attacker=entry["attacker"],
             score=sc,
-            sc_col=sc_col,
             img_path=entry["image_path"],
             closest_path=entry["closest_path"],
             ts=entry["created_at"],
         )
 
     def _add_model_row(self, rank: int, row: AttackRow) -> None:
-        r  = rank - 1
-        sc = row.similarity_score
-        sc_col = "#00ff9f" if sc < 0.35 else ("#ffd166" if sc < 0.55 else "#ff6b6b")
         self._row_cells(
-            r,
+            grid_row=rank,
             rank=rank,
             attacker=row.attacker_name,
-            score=sc,
-            sc_col=sc_col,
+            score=row.similarity_score,
             img_path=row.image_path,
             closest_path=row.matched_image_path,
             ts=row.created_at,
         )
 
-    def _row_cells(self, r: int, rank: int, attacker: str, score: float,
-                   sc_col: str, img_path: str, closest_path: str, ts: str) -> None:
-        def cell(col, text, color="#ccc", expand=False):
-            kw = dict(text=text, text_color=color,
-                      font=ctk.CTkFont(size=11), anchor="center")
-            lbl = ctk.CTkLabel(self._body, **kw)
-            sticky = "ew" if expand else ""
-            lbl.grid(row=r, column=col, padx=4, pady=3, sticky=sticky)
+_MEDAL = {1: "#FFD700", 2: "#C0C0C0", 3: "#CD7F32"}   # gold, silver, bronze
 
-        cell(_COL_RANK,      f"#{rank}",                              color="#888")
-        cell(_COL_ATTACKER,  attacker,                                color="#e0e0e0", expand=True)
-        cell(_COL_SCORE,     f"{score:.4f}",                         color=sc_col)
-        cell(_COL_TIMESTAMP, ts[:19].replace("T", " "),              color="#666")
-        self._add_thumb(img_path,      r, col=_COL_ATTACK,  label="attack frame")
-        self._add_thumb(closest_path,  r, col=_COL_CLOSEST, label="closest match")
-        self._add_delete_btn(img_path, r, col=_COL_DELETE)
+    def _row_cells(self, grid_row: int, rank: int, attacker: str, score: float,
+                   img_path: str, closest_path: str, ts: str) -> None:
+        sc_col  = "#00ff9f" if score < 0.35 else ("#ffd166" if score < 0.55 else "#ff6b6b")
+        medal   = _MEDAL.get(rank)
+        txt_col = medal if medal else "#e0e0e0"
+        bold    = "bold" if medal else "normal"
+
+        def cell(col_name: str, text: str, color: str = "#ccc") -> None:
+            col = _C[col_name]
+            lbl = ctk.CTkLabel(self._body, text=text, text_color=color,
+                               font=ctk.CTkFont(size=11), anchor="center")
+            lbl.grid(row=grid_row, column=col, padx=4, pady=3, sticky="ew")
+
+        cell("rank",      f"#{rank}",                  color=txt_col)
+        cell("attacker",  attacker,                    color=txt_col)
+        cell("score",     f"{score:.4f}",             color=sc_col)
+        cell("timestamp", ts[:19].replace("T", " "),  color="#666")
+
+        self._add_thumb(img_path,      grid_row, col=_C["attack"],  label="attack frame")
+        self._add_thumb(closest_path,  grid_row, col=_C["closest"], label="closest match")
+        self._add_delete_btn(img_path, grid_row, col=_C["delete"])
 
     # ── Cell helpers ──────────────────────────────────────────────────────────
 
@@ -335,17 +339,6 @@ class RankingTab(ctk.CTkFrame):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _header_label(parent, text: str, col: int, width: int | None,
-                  expand: bool = False) -> None:
-    kw = dict(text=text, font=ctk.CTkFont(size=11, weight="bold"),
-              text_color="#00d4ff", anchor="center")
-    if width:
-        kw["width"] = width
-    lbl = ctk.CTkLabel(parent, **kw)
-    sticky = "ew" if expand else ""
-    lbl.grid(row=0, column=col, padx=6, pady=6, sticky=sticky)
-
 
 class _ClearDialog(ctk.CTkToplevel):
     def __init__(self, parent):
