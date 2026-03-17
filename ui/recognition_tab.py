@@ -88,6 +88,7 @@ class RecognitionTab(ctk.CTkFrame):
         self._galleries: dict = {}
         self._gallery_paths: dict = {}
         self._gallery_ready = False
+        self._gallery_mtime: float = 0.0   # mtime of users/ at last load
         self._photo_ref     = None
         self._score_widgets: dict = {}
         self._pending_frame: Image.Image | None = None
@@ -99,6 +100,14 @@ class RecognitionTab(ctk.CTkFrame):
     # ── Tab hook ──────────────────────────────────────────────────────────────
 
     def on_tab_shown(self) -> None:
+        user_dir = Path(self._data_dir) / "users"
+        if self._gallery_ready and user_dir.exists():
+            try:
+                mtime = user_dir.stat().st_mtime
+                if mtime == self._gallery_mtime:
+                    return   # nothing changed, skip reload
+            except OSError:
+                pass
         self._reload_gallery()
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -466,6 +475,7 @@ class RecognitionTab(ctk.CTkFrame):
         self._galleries.clear()
         self._gallery_paths.clear()
         self._gallery_ready = False
+        self._gallery_mtime = 0.0
         self._identity_menu.configure(values=["—"])
         self._identity_var.set("—")
         self._gallery_status.configure(
@@ -528,6 +538,10 @@ class RecognitionTab(ctk.CTkFrame):
 
             all_users = sorted({u for g in self._galleries.values() for u in g})
             self._gallery_ready = True
+            try:
+                self._gallery_mtime = Path(user_dir).stat().st_mtime
+            except OSError:
+                self._gallery_mtime = 0.0
 
             def _done():
                 if all_users:
@@ -698,6 +712,8 @@ class RecognitionTab(ctk.CTkFrame):
                        bd=0, font=("Segoe UI", 10))
         menu.add_command(label="🔍  View full size",
                          command=lambda: self._open_viewer(image_path))
+        menu.add_command(label="🔄  Recompute scores",
+                         command=lambda: self._recompute_scores(image_path))
         menu.add_separator()
         menu.add_command(label="🗑  Delete this image",
                          command=lambda: self._delete_adversarial(image_path))
@@ -705,6 +721,26 @@ class RecognitionTab(ctk.CTkFrame):
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def _recompute_scores(self, image_path: str) -> None:
+        """Delete existing DB records for this image and re-run inference."""
+        identity = self._identity_var.get()
+        if not self._gallery_ready or identity == "—":
+            self._status.configure(
+                text="⚠  Load gallery first before recomputing scores.",
+                text_color="#ff6b6b")
+            return
+        try:
+            img = Image.open(image_path).convert("RGB")
+        except Exception as exc:
+            self._status.configure(text=f"⚠  Cannot open image: {exc}",
+                                   text_color="#ff6b6b")
+            return
+
+        # Wipe existing records so _run_inference writes fresh ones
+        self._db.delete_attacks_by_image(image_path)
+        self._status.configure(text="Recomputing scores…", text_color="#aaa")
+        self._run_inference(img, Path(image_path), identity)
 
     def _delete_adversarial(self, image_path: str) -> None:
         import os
