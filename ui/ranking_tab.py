@@ -67,11 +67,11 @@ class RankingTab(ctk.CTkFrame):
 
         ctk.CTkButton(toolbar, text="🗑  Clear All", width=110,
                       fg_color="#5a0000", hover_color="#8b0000",
-                      command=self._confirm_clear).grid(row=0, column=4, padx=(8, 0))
+                      command=self._confirm_clear).grid(row=0, column=5, padx=(8, 0))
 
-        ctk.CTkLabel(toolbar, text="click thumbnails to enlarge  •  🗑 to delete row",
+        ctk.CTkLabel(toolbar, text="Avg. similarity threshold: 0.2565 • Click thumbnails to enlarge images  •  🗑 to delete row",
                      font=ctk.CTkFont(size=10), text_color="#555").grid(
-            row=0, column=5, padx=(16, 0))
+            row=0, column=4, padx=(16, 0))
 
         # Scrollable body — header is row 0 inside it
         self._body = ctk.CTkScrollableFrame(
@@ -172,7 +172,7 @@ class RankingTab(ctk.CTkFrame):
 
     def _row_cells(self, grid_row: int, rank: int, attacker: str, score: float,
                    img_path: str, closest_path: str, ts: str) -> None:
-        sc_col  = "#00ff9f" if score < 0.35 else ("#ffd166" if score < 0.55 else "#ff6b6b")
+        sc_col  = "#00ff9f" if score < 0.2565 else "#ff6b6b"
         medal   = _MEDAL.get(rank)
         txt_col = medal if medal else "#e0e0e0"
 
