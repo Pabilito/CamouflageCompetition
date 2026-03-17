@@ -46,7 +46,7 @@ class App(ctk.CTk):
                  data_dir: str, aligner: FaceAligner) -> None:
         super().__init__()
 
-        self.title("Face Recognition")
+        self.title("Face Recognition Competition")
         self.geometry("1100x720")
         self.minsize(900, 600)
 
@@ -66,7 +66,7 @@ class App(ctk.CTk):
                               fg_color=("#1a1a2e", "#1a1a2e"))
         header.pack(fill="x", side="top")
         ctk.CTkLabel(
-            header, text="  🔍  RMA Face Camouflage Competition",
+            header, text=" RMA Face Camouflage Competition",
             font=ctk.CTkFont(family="Courier New", size=16, weight="bold"),
             text_color="#00d4ff",
         ).pack(side="left", padx=16, pady=10)
