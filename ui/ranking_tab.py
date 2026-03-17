@@ -1,9 +1,10 @@
 """
 ui/ranking_tab.py  —  Ranking tab
 
-Default: average score across all models, sorted ASC.
+Default: average similarity across all models, sorted ASC (↓ = lower = better attack).
 Dropdown to filter by individual model.
-Each row has a 🗑 delete button to remove that image's records.
+Columns scale with window width.
+Each row has a 🗑 button to delete that image's records.
 Thumbnails clickable to enlarge.
 """
 
@@ -19,15 +20,26 @@ from core.embeddings import EmbeddingEngine
 _THUMB      = 56
 _ALL_MODELS = "All models (average)"
 
+# Column indices — shared between header and rows
+# 0: Rank   1: Attacker   2: Score   3: Attack   4: Closest   5: Timestamp   6: Delete
+_COL_RANK      = 0
+_COL_ATTACKER  = 1
+_COL_SCORE     = 2
+_COL_ATTACK    = 3
+_COL_CLOSEST   = 4
+_COL_TIMESTAMP = 5
+_COL_DELETE    = 6
+
 
 class RankingTab(ctk.CTkFrame):
     def __init__(self, parent, db: Database, data_dir: str,
-                 engine: EmbeddingEngine, capture_tab=None):
+                 engine: EmbeddingEngine, capture_tab=None, recognition_tab=None):
         super().__init__(parent, fg_color="transparent")
-        self._db          = db
-        self._data_dir    = data_dir
-        self._engine      = engine
-        self._capture_tab = capture_tab
+        self._db              = db
+        self._data_dir        = data_dir
+        self._engine          = engine
+        self._capture_tab     = capture_tab
+        self._recognition_tab = recognition_tab
         self._thumb_refs: list = []
 
         self._build_ui()
@@ -73,12 +85,16 @@ class RankingTab(ctk.CTkFrame):
         # ── Table header ──────────────────────────────────────────────────────
         self._hdr_frame = ctk.CTkFrame(self, fg_color=("#16213e", "#16213e"), corner_radius=6)
         self._hdr_frame.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 2))
+        # Header columns mirror body columns — attacker expands
+        self._hdr_frame.columnconfigure(_COL_ATTACKER, weight=1)
         self._build_header(is_average=True)
 
         # ── Scrollable body ───────────────────────────────────────────────────
         self._body = ctk.CTkScrollableFrame(
             self, fg_color=("#12122a", "#12122a"), corner_radius=6, label_text="")
         self._body.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 4))
+        # Make attacker column expand so rows scale with window width
+        self._body.columnconfigure(_COL_ATTACKER, weight=1)
 
         # ── Summary ───────────────────────────────────────────────────────────
         self._summary = ctk.CTkLabel(
@@ -88,22 +104,16 @@ class RankingTab(ctk.CTkFrame):
     def _build_header(self, is_average: bool) -> None:
         for w in self._hdr_frame.winfo_children():
             w.destroy()
-        if is_average:
-            _header_label(self._hdr_frame, "Rank",        0,  50)
-            _header_label(self._hdr_frame, "Attacker",    1, 160)
-            _header_label(self._hdr_frame, "Avg Score ↑", 2, 100)
-            _header_label(self._hdr_frame, "Attack ↗",    3,  66)
-            _header_label(self._hdr_frame, "Closest ↗",   4,  66)
-            _header_label(self._hdr_frame, "Timestamp",   5, 160)
-            _header_label(self._hdr_frame, "",             6,  36)
-        else:
-            _header_label(self._hdr_frame, "Rank",        0,  50)
-            _header_label(self._hdr_frame, "Attacker",    1, 160)
-            _header_label(self._hdr_frame, "Score ↑",     2, 100)
-            _header_label(self._hdr_frame, "Attack ↗",    3,  66)
-            _header_label(self._hdr_frame, "Closest ↗",   4,  66)
-            _header_label(self._hdr_frame, "Timestamp",   5, 160)
-            _header_label(self._hdr_frame, "",             6,  36)
+
+        score_label = "Avg Similarity ↓" if is_average else "Similarity ↓"
+
+        _header_label(self._hdr_frame, "Rank",        _COL_RANK,      50,  expand=False)
+        _header_label(self._hdr_frame, "Attacker",    _COL_ATTACKER,  None, expand=True)
+        _header_label(self._hdr_frame, score_label,   _COL_SCORE,     110, expand=False)
+        _header_label(self._hdr_frame, "Attack",      _COL_ATTACK,    66,  expand=False)
+        _header_label(self._hdr_frame, "Closest",     _COL_CLOSEST,   66,  expand=False)
+        _header_label(self._hdr_frame, "Timestamp",   _COL_TIMESTAMP, 160, expand=False)
+        _header_label(self._hdr_frame, "",             _COL_DELETE,    36,  expand=False)
 
     # ── Tab hook ──────────────────────────────────────────────────────────────
 
@@ -130,7 +140,8 @@ class RankingTab(ctk.CTkFrame):
         all_rows = self._db.get_ranking(model_name=None, limit=10_000)
         if not all_rows:
             ctk.CTkLabel(self._body, text="No records yet.",
-                         font=ctk.CTkFont(size=12), text_color="#555").grid(pady=30)
+                         font=ctk.CTkFont(size=12), text_color="#555").grid(
+                row=0, column=0, columnspan=7, pady=30)
             self._summary.configure(text="0 records.")
             return
 
@@ -142,7 +153,6 @@ class RankingTab(ctk.CTkFrame):
         averaged = []
         for (img_path, attacker), rows in groups.items():
             avg = sum(r.similarity_score for r in rows) / len(rows)
-            # Pick the closest-match path from whichever model row has one
             closest = next((r.matched_image_path for r in rows
                             if r.matched_image_path), "")
             averaged.append({
@@ -158,13 +168,14 @@ class RankingTab(ctk.CTkFrame):
             self._add_avg_row(rank, entry)
 
         self._summary.configure(
-            text=f"{len(averaged)} image(s) — average across all models ASC")
+            text=f"{len(averaged)} image(s) — average similarity across all models ASC")
 
     def _refresh_model(self, model_name: str) -> None:
         rows = self._db.get_ranking(model_name=model_name, limit=200)
         if not rows:
             ctk.CTkLabel(self._body, text="No records yet.",
-                         font=ctk.CTkFont(size=12), text_color="#555").grid(pady=30)
+                         font=ctk.CTkFont(size=12), text_color="#555").grid(
+                row=0, column=0, columnspan=7, pady=30)
             self._summary.configure(text="0 records.")
             return
         for rank, row in enumerate(rows, start=1):
@@ -178,48 +189,55 @@ class RankingTab(ctk.CTkFrame):
         r  = rank - 1
         sc = entry["avg_score"]
         sc_col = "#00ff9f" if sc < 0.35 else ("#ffd166" if sc < 0.55 else "#ff6b6b")
-
-        def cell(col, text, color="#ccc", width=None):
-            kw = dict(text=text, text_color=color,
-                      font=ctk.CTkFont(size=11), anchor="center")
-            if width:
-                kw["width"] = width
-            ctk.CTkLabel(self._body, **kw).grid(row=r, column=col, padx=4, pady=3)
-
-        cell(0, f"#{rank}",           color="#888",    width=50)
-        cell(1, entry["attacker"],    color="#e0e0e0", width=160)
-        cell(2, f"{sc:.4f}",         color=sc_col,    width=100)
-        cell(5, entry["created_at"][:19].replace("T", " "), color="#666", width=160)
-        self._add_thumb(entry["image_path"],   r, col=3, label="attack frame")
-        self._add_thumb(entry["closest_path"], r, col=4, label="closest match")
-        self._add_delete_btn(entry["image_path"], r, col=6)
+        self._row_cells(
+            r,
+            rank=rank,
+            attacker=entry["attacker"],
+            score=sc,
+            sc_col=sc_col,
+            img_path=entry["image_path"],
+            closest_path=entry["closest_path"],
+            ts=entry["created_at"],
+        )
 
     def _add_model_row(self, rank: int, row: AttackRow) -> None:
         r  = rank - 1
         sc = row.similarity_score
         sc_col = "#00ff9f" if sc < 0.35 else ("#ffd166" if sc < 0.55 else "#ff6b6b")
+        self._row_cells(
+            r,
+            rank=rank,
+            attacker=row.attacker_name,
+            score=sc,
+            sc_col=sc_col,
+            img_path=row.image_path,
+            closest_path=row.matched_image_path,
+            ts=row.created_at,
+        )
 
-        def cell(col, text, color="#ccc", width=None):
+    def _row_cells(self, r: int, rank: int, attacker: str, score: float,
+                   sc_col: str, img_path: str, closest_path: str, ts: str) -> None:
+        def cell(col, text, color="#ccc", expand=False):
             kw = dict(text=text, text_color=color,
                       font=ctk.CTkFont(size=11), anchor="center")
-            if width:
-                kw["width"] = width
-            ctk.CTkLabel(self._body, **kw).grid(row=r, column=col, padx=4, pady=3)
+            lbl = ctk.CTkLabel(self._body, **kw)
+            sticky = "ew" if expand else ""
+            lbl.grid(row=r, column=col, padx=4, pady=3, sticky=sticky)
 
-        cell(0, f"#{rank}",          color="#888",    width=50)
-        cell(1, row.attacker_name,   color="#e0e0e0", width=160)
-        cell(2, f"{sc:.4f}",        color=sc_col,    width=100)
-        cell(5, row.created_at[:19].replace("T", " "), color="#666", width=160)
-        self._add_thumb(row.image_path,         r, col=3, label="attack frame")
-        self._add_thumb(row.matched_image_path, r, col=4, label="closest match")
-        self._add_delete_btn(row.image_path, r, col=6)
+        cell(_COL_RANK,      f"#{rank}",                              color="#888")
+        cell(_COL_ATTACKER,  attacker,                                color="#e0e0e0", expand=True)
+        cell(_COL_SCORE,     f"{score:.4f}",                         color=sc_col)
+        cell(_COL_TIMESTAMP, ts[:19].replace("T", " "),              color="#666")
+        self._add_thumb(img_path,      r, col=_COL_ATTACK,  label="attack frame")
+        self._add_thumb(closest_path,  r, col=_COL_CLOSEST, label="closest match")
+        self._add_delete_btn(img_path, r, col=_COL_DELETE)
 
     # ── Cell helpers ──────────────────────────────────────────────────────────
 
     def _add_thumb(self, path: str, grid_row: int, col: int, label: str) -> None:
         if not path:
             ctk.CTkLabel(self._body, text="—", text_color="#555",
-                         font=ctk.CTkFont(size=11), width=_THUMB).grid(
+                         font=ctk.CTkFont(size=11)).grid(
                 row=grid_row, column=col, padx=4, pady=2)
             return
         try:
@@ -232,21 +250,23 @@ class RankingTab(ctk.CTkFrame):
             self._thumb_refs.append(ctk_img)
         except Exception:
             ctk.CTkLabel(self._body, text="?", text_color="#555",
-                         font=ctk.CTkFont(size=11), width=_THUMB).grid(
+                         font=ctk.CTkFont(size=11)).grid(
                 row=grid_row, column=col, padx=4, pady=2)
 
     def _add_delete_btn(self, image_path: str, grid_row: int, col: int) -> None:
-        btn = ctk.CTkButton(
+        ctk.CTkButton(
             self._body, text="🗑", width=32, height=28,
             fg_color="#3a0000", hover_color="#700000",
             font=ctk.CTkFont(size=12),
             command=lambda p=image_path: self._delete_row(p),
-        )
-        btn.grid(row=grid_row, column=col, padx=4, pady=2)
+        ).grid(row=grid_row, column=col, padx=4, pady=2)
 
     def _delete_row(self, image_path: str) -> None:
         self._db.delete_attacks_by_image(image_path)
         self._refresh()
+        if self._recognition_tab is not None:
+            self._recognition_tab._refresh_thumbnails()
+            self._recognition_tab._refresh_best_score()
 
     # ── Image viewer ──────────────────────────────────────────────────────────
 
@@ -285,13 +305,16 @@ class RankingTab(ctk.CTkFrame):
             deleted = self._db.clear_attacks()
             self._refresh()
             self._summary.configure(text=f"✓  Deleted {deleted} attack record(s).")
+            if self._recognition_tab is not None:
+                self._recognition_tab._refresh_thumbnails()
+                self._recognition_tab._refresh_best_score()
 
         elif choice == "all":
             ok = mb.askyesno(
                 "Delete Everything",
                 "Permanently delete:\n"
                 "  • All attack, capture and user DB records\n"
-                "  • All images (users/, comparisons/, attacks/)\n\n"
+                "  • All images (users/, comparisons/, attacks/, adversarial/)\n\n"
                 "Cannot be undone. Continue?",
                 icon="warning")
             if not ok:
@@ -307,15 +330,21 @@ class RankingTab(ctk.CTkFrame):
                      f"{counts['captures']} captures, {counts['users']} users.")
             if self._capture_tab is not None:
                 self._capture_tab.refresh_after_clear()
+            if self._recognition_tab is not None:
+                self._recognition_tab.refresh_after_clear()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _header_label(parent, text: str, col: int, width: int) -> None:
-    ctk.CTkLabel(parent, text=text, width=width,
-                 font=ctk.CTkFont(size=11, weight="bold"),
-                 text_color="#00d4ff", anchor="center").grid(
-        row=0, column=col, padx=6, pady=6)
+def _header_label(parent, text: str, col: int, width: int | None,
+                  expand: bool = False) -> None:
+    kw = dict(text=text, font=ctk.CTkFont(size=11, weight="bold"),
+              text_color="#00d4ff", anchor="center")
+    if width:
+        kw["width"] = width
+    lbl = ctk.CTkLabel(parent, **kw)
+    sticky = "ew" if expand else ""
+    lbl.grid(row=0, column=col, padx=6, pady=6, sticky=sticky)
 
 
 class _ClearDialog(ctk.CTkToplevel):

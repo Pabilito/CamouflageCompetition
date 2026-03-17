@@ -42,6 +42,16 @@ THRESHOLDS_LFW: dict[str, float] = {
     "edgeface_base":            0.2066,
 }
 
+# LFW recognition accuracy (%) for each model, normalised to [0, 1] for the bar
+ACCURACY_LFW: dict[str, float] = {
+    "InceptionResnetCASIA":     90.18284 / 100,
+    "InceptionResnetV1_CASIA":  90.18284 / 100,
+    "IResNet_R18_Glint360K":    96.48238 / 100,
+    "SwinFace":                 92.02094 / 100,
+    "TransFace_S_Glint360K":    97.47524 / 100,
+    "edgeface_base":            97.17714 / 100,
+}
+
 
 def _score_to_bar(score: float) -> float:
     return max(0.0, min(1.0, (score + 1) / 2))
@@ -287,6 +297,7 @@ class RecognitionTab(ctk.CTkFrame):
 
     def _build_model_row(self, parent, model_name: str, row: int) -> None:
         threshold = THRESHOLDS_LFW.get(model_name)
+        accuracy  = ACCURACY_LFW.get(model_name)
         frame = ctk.CTkFrame(parent, corner_radius=8, fg_color=("#16213e", "#16213e"))
         frame.grid(row=row, column=0, sticky="ew", pady=4)
         frame.columnconfigure(0, weight=1)
@@ -315,13 +326,39 @@ class RecognitionTab(ctk.CTkFrame):
                          text_color="#ff4444", anchor="e").grid(
                 row=0, column=3, padx=(8, 0))
 
-        canvas = tk.Canvas(frame, height=_BAR_H + 10, bg="#16213e",
-                           highlightthickness=0, bd=0)
-        canvas.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
-        canvas.bind("<Configure>",
-                    lambda e, c=canvas, t=threshold: self._draw_bar(c, 0.0, "#333", t))
+        # Similarity score bar with threshold tick
+        sim_canvas = tk.Canvas(frame, height=_BAR_H + 10, bg="#16213e",
+                               highlightthickness=0, bd=0)
+        sim_canvas.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 4))
+        sim_canvas.bind("<Configure>",
+                        lambda e, c=sim_canvas, t=threshold:
+                            self._draw_bar(c, 0.0, "#333", t))
 
-        self._score_widgets[model_name] = (score_lbl, verdict_lbl, canvas, threshold)
+        # Recognition accuracy bar (static, drawn once on configure)
+        if accuracy is not None:
+            acc_row = ctk.CTkFrame(frame, fg_color="transparent")
+            acc_row.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 2))
+            acc_row.columnconfigure(1, weight=1)
+            ctk.CTkLabel(acc_row,
+                         text="Recognition accuracy:",
+                         font=ctk.CTkFont(size=9), text_color="#666",
+                         anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 6))
+            ctk.CTkLabel(acc_row,
+                         text=f"{accuracy:.3f}",
+                         font=ctk.CTkFont(size=9, weight="bold"),
+                         text_color="#6699cc", anchor="e").grid(row=0, column=2, sticky="e")
+            acc_canvas = tk.Canvas(acc_row, height=6, bg="#16213e",
+                                   highlightthickness=0, bd=0)
+            acc_canvas.grid(row=0, column=1, sticky="ew", padx=4)
+            acc_canvas.bind(
+                "<Configure>",
+                lambda e, c=acc_canvas, a=accuracy:
+                    self._draw_accuracy_bar(c, a))
+
+        ctk.CTkFrame(frame, height=4, fg_color="transparent").grid(
+            row=3, column=0)
+
+        self._score_widgets[model_name] = (score_lbl, verdict_lbl, sim_canvas, threshold)
 
     # ── Bar drawing ───────────────────────────────────────────────────────────
 
@@ -342,6 +379,18 @@ class RecognitionTab(ctk.CTkFrame):
             canvas.create_polygon(
                 tick_x - 4, h + 1, tick_x + 4, h + 1, tick_x, h + 7,
                 fill="#ff2222", outline="")
+
+    def _draw_accuracy_bar(self, canvas: tk.Canvas, accuracy: float) -> None:
+        """Static filled bar showing model recognition accuracy (0–1)."""
+        canvas.delete("all")
+        w = canvas.winfo_width()
+        if w < 2:
+            return
+        h = 6
+        canvas.create_rectangle(0, 0, w, h, fill="#1a2a3a", outline="")
+        fill_w = int(w * accuracy)
+        if fill_w > 0:
+            canvas.create_rectangle(0, 0, fill_w, h, fill="#4477aa", outline="")
 
     # ── Gallery loading ───────────────────────────────────────────────────────
 
@@ -386,11 +435,42 @@ class RecognitionTab(ctk.CTkFrame):
 
         threading.Thread(target=_embed, daemon=True).start()
 
+    def refresh_after_clear(self) -> None:
+        """Reset all gallery state and UI after a DB/file wipe."""
+        self._galleries.clear()
+        self._gallery_paths.clear()
+        self._gallery_ready = False
+        self._identity_menu.configure(values=["—"])
+        self._identity_var.set("—")
+        self._gallery_status.configure(
+            text="⏳  Gallery not loaded yet — you can still capture images.",
+            text_color="#ffd166")
+        self._adv_count_label.configure(text="")
+        self._lbl_left_best.configure(text="—", text_color="#aaa")
+        self._img_summary_frame.grid_remove()
+        for w in self._thumb_frame.winfo_children():
+            w.destroy()
+        self._thumb_refs.clear()
+        for lbl in (self._lbl_global_best, self._lbl_your_best,
+                    self._lbl_your_place, self._lbl_left_best):
+            lbl.configure(text="—", text_color="#aaa")
+        # Trigger a fresh reload in the background
+        self.after(100, self._reload_gallery)
+
     def _reload_gallery(self) -> None:
         user_dir = Path(self._data_dir) / "users"
         if not user_dir.exists():
+            # No users folder — clear gallery state and show neutral message
+            self._galleries.clear()
+            self._gallery_paths.clear()
+            self._gallery_ready = True  # nothing to load, ready for new captures
+            self._identity_menu.configure(values=["—"])
+            self._identity_var.set("—")
             self._gallery_status.configure(
-                text="⚠  No control images found yet.", text_color="#ff6b6b")
+                text="No control images yet. Add some in the first tab.",
+                text_color="#888")
+            self._refresh_thumbnails()
+            self._refresh_best_score()
             return
 
         self._gallery_ready = False
@@ -735,9 +815,6 @@ class RecognitionTab(ctk.CTkFrame):
         self._review_btns.grid_remove()
         self._status.configure(text="Running inference…", text_color="#aaa")
 
-        # Refresh thumbnail strip immediately so image appears
-        self.after(50, self._refresh_thumbnails)
-
         if not self._gallery_ready or identity == "—":
             self._status.configure(
                 text=f"✓  Saved {save_path.name}  (gallery not ready — scores skipped)",
@@ -747,10 +824,10 @@ class RecognitionTab(ctk.CTkFrame):
 
         def _infer():
             results = []
+            scores_by_model: dict[str, float] = {}
             for model_name in self._engine.model_names:
                 embeddings = self._galleries.get(model_name, {}).get(identity)
                 if not embeddings:
-                    self.after(0, self._update_row, model_name, None)
                     continue
                 query    = self._engine.embed(model_name, np.array(img.convert("RGB")))
                 mean_emb = np.mean(embeddings, axis=0)
@@ -766,6 +843,7 @@ class RecognitionTab(ctk.CTkFrame):
                     identity_name=identity,
                     matched_image_path=closest,
                 )
+                scores_by_model[model_name] = score
                 results.append({
                     "model": model_name, "score": score,
                     "threshold": threshold,
@@ -773,14 +851,24 @@ class RecognitionTab(ctk.CTkFrame):
                     "closest_image": closest,
                     "frame_path": str(save_path),
                 })
-                self.after(0, self._update_row, model_name, score)
+
+            # All DB inserts done — now update UI in one batch
+            def _update_all():
+                for r in results:
+                    self._update_row(r["model"], r["score"])
+                # Update models with no data
+                for model_name in self._engine.model_names:
+                    if model_name not in scores_by_model:
+                        self._update_row(model_name, None)
+                all_scores = [r["score"] for r in results]
+                self._update_summary(all_scores, str(save_path))
+                self._status.configure(
+                    text=f"✓  Saved & logged → {save_path.name}",
+                    text_color="#00ff9f")
+                self._refresh_thumbnails()
 
             self._write_log(identity, save_path, results)
-            all_scores = [r["score"] for r in results]
-            self.after(0, self._update_summary, all_scores, str(save_path))
-            self.after(0, self._status.configure,
-                       {"text": f"✓  Saved & logged → {save_path.name}",
-                        "text_color": "#00ff9f"})
+            self.after(0, _update_all)
 
         self._pending_frame = None
         threading.Thread(target=_infer, daemon=True).start()

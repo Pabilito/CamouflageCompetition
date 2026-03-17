@@ -97,6 +97,7 @@ class App(ctk.CTk):
             data_dir=self._data_dir,
             engine=self._engine,
             capture_tab=self._capture_tab,
+            recognition_tab=self._recognition_tab,
         )
         self._ranking_tab.pack(fill="both", expand=True)
 
