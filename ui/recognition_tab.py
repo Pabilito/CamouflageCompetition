@@ -96,6 +96,8 @@ class RecognitionTab(ctk.CTkFrame):
         self._thumb_refs: list = []
         self._ranking_tab = None   # set by main.py after construction
 
+        self._build_ui()
+
     # ── Tab hook ──────────────────────────────────────────────────────────────
 
     def on_tab_shown(self) -> None:
