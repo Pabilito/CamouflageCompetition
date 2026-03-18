@@ -146,9 +146,9 @@ Right-click thumbnails to view, recompute scores, or delete. The Session Summary
 
 Two sub-tabs:
 
-**Current Standings** - one row per identity showing their best (lowest average) image score across all 5 models, with individual per-model scores (Model 1–5). Top 3 highlighted in gold/silver/bronze.
+- **Current Standings** - one row per identity showing their best (lowest average) image score across all 5 models, with individual per-model scores (Model 1–5). Top 3 highlighted in gold/silver/bronze.
 
-**All Images** - every scored image, filterable by model, with attack and closest-match thumbnails. Individual rows can be deleted.
+- **All Images** - every scored image, filterable by model, with attack and closest-match thumbnails. Individual rows can be deleted.
 
 
 ## Database Schema
