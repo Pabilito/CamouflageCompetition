@@ -21,7 +21,7 @@ project/
 │   ├── recognition_tab.py         # "Adversarial Pictures" tab
 │   └── ranking_tab.py             # "Ranking" tab
 │
-├── Pretrained_Models/             # Weight files (not included in repo)
+├── Pretrained_Models/             # Weight files
 │   ├── iresnet.py                 # IResNet architecture definition
 │   ├── vit_trans.py               # TransFace ViT architecture definition
 │   ├── swin_subnets.py            # SwinFace architecture definition
@@ -103,13 +103,13 @@ If detection fails, the user can choose to save the raw centre-cropped image ins
 
 Each adversarial image is compared against every individual control picture of the target identity. The score per model is the **highest cosine similarity** found across all control images (worst case for the attacker). Scores are in `[-1, 1]` where higher = more similar = harder to fool.
 
-| Model | Decision Threshold (based on LFW) |
+| Model | Source |
 |---|---|
-| TransFace_S_Glint360K | 0.1640 |
-| SwinFace | 0.2174 |
-| edgeface_base | 0.2066 |
-| IResNet_R18_Glint360K | 0.2411 |
-| InceptionResnetCASIA | 0.4535 |
+| TransFace_S_Glint360K | https://github.com/DanJun6737/TransFace |
+| SwinFace | https://github.com/lxq1000/SwinFace |
+| edgeface_base | https://github.com/otroshi/edgeface |
+| IResNet_R18_Glint360K | https://github.com/deepinsight/insightface/tree/master/model_zoo |
+| InceptionResnetCASIA | https://github.com/timesler/facenet-pytorch |
 
 `score ≥ threshold` → recognised (attack failed for this model)  
 `score < threshold` → fooled (attack succeeded for this model)
