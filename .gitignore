@@ -5,6 +5,7 @@ __pycache__/
 #Pretrained_Models/*
 data/*
 db.sqlite
+.vscode/
 
 # C extensions
 *.so
