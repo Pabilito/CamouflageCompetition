@@ -470,11 +470,11 @@ class RecognitionTab(ctk.CTkFrame):
 
             for model_name in self._engine.model_names:
                 emb = self._engine.embed(model_name, face_rgb)
-
+                # Store in DB cache for future gallery loads
+                self._db.set_embedding(image_path, model_name, emb)
                 # Update mean-embedding gallery
                 existing = self._galleries.setdefault(model_name, {})
                 existing.setdefault(user_name, []).append(emb)
-
                 # Update per-path gallery
                 paths = self._gallery_paths.setdefault(model_name, {})
                 paths.setdefault(user_name, []).append((image_path, emb))
@@ -543,31 +543,49 @@ class RecognitionTab(ctk.CTkFrame):
 
         def _load():
             try:
-                for model_name in self._engine.model_names:
-                    self._galleries[model_name] = self._engine.build_gallery(
-                        model_name, user_dir)
+                galleries     = {mn: {} for mn in self._engine.model_names}
+                gallery_paths = {mn: {} for mn in self._engine.model_names}
 
-                gallery_paths = {}
+                user_dirs = [d for d in sorted(Path(user_dir).iterdir())
+                             if d.is_dir()]
+
                 for model_name in self._engine.model_names:
-                    gallery_paths[model_name] = {}
-                    for udir in sorted(Path(user_dir).iterdir()):
-                        if not udir.is_dir():
+                    # One DB query fetches ALL cached embeddings for this model
+                    cache = self._db.get_all_embeddings_for_model(model_name)
+
+                    for udir in user_dirs:
+                        img_paths = (sorted(udir.glob("*.jpg")) +
+                                     sorted(udir.glob("*.png")))
+                        if not img_paths:
                             continue
+                        identity = udir.name
                         pairs = []
-                        for p in sorted(udir.glob("*.jpg")) + sorted(udir.glob("*.png")):
-                            try:
-                                emb = self._engine.embed(
-                                    model_name,
-                                    np.array(Image.open(p).convert("RGB")))
-                                pairs.append((str(p), emb))
-                            except Exception:
-                                pass
-                        if pairs:
-                            gallery_paths[model_name][udir.name] = pairs
+                        embs  = []
 
-                # Assign atomically so no partial state is ever visible
+                        for p in img_paths:
+                            path_str = str(p)
+                            emb = cache.get(path_str)
+                            if emb is None:
+                                # Cache miss — compute and store
+                                try:
+                                    emb = self._engine.embed(
+                                        model_name,
+                                        np.array(Image.open(p).convert("RGB")))
+                                    self._db.set_embedding(path_str, model_name, emb)
+                                    cache[path_str] = emb   # update local cache too
+                                except Exception:
+                                    continue
+                            pairs.append((path_str, emb))
+                            embs.append(emb)
+
+                        if embs:
+                            galleries[model_name][identity]     = embs
+                            gallery_paths[model_name][identity] = pairs
+
+                # Atomic assign
+                self._galleries    = galleries
                 self._gallery_paths = gallery_paths
-                all_users = sorted({u for g in self._galleries.values() for u in g})
+                all_users = sorted({u for g in galleries.values() for u in g})
                 self._gallery_ready   = True
                 self._gallery_loading = False
                 try:
@@ -965,33 +983,58 @@ class RecognitionTab(ctk.CTkFrame):
 
         def _infer():
             results = []
-            scores_by_model: dict[str, float] = {}
+            scores_by_model:  dict[str, float] = {}
+            closest_by_model: dict[str, str]   = {}
+
+            # Accumulate per-control-path scores across all models as we go
+            path_scores: dict[str, list[float]] = {}
+
             for model_name in self._engine.model_names:
-                embeddings = self._galleries.get(model_name, {}).get(identity)
-                if not embeddings:
+                pairs = self._gallery_paths.get(model_name, {}).get(identity, [])
+                if not pairs:
                     continue
-                query    = self._engine.embed(model_name, np.array(img.convert("RGB")))
-                mean_emb = np.mean(embeddings, axis=0)
-                mean_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-8)
-                score    = self._engine.cosine_similarity(query, mean_emb)
-                closest  = self._find_closest_image(model_name, query, identity)
+
+                query = self._engine.embed(model_name, np.array(img.convert("RGB")))
+
+                # Worst-case: score against the closest individual control image
+                best_path, best_score = "", -2.0
+                for path, emb in pairs:
+                    s = self._engine.cosine_similarity(query, emb)
+                    path_scores.setdefault(path, []).append(s)
+                    if s > best_score:
+                        best_score, best_path = s, path
+
                 threshold = THRESHOLDS_LFW.get(model_name)
-                self._db.add_attack(
-                    attacker_name=identity,
-                    model_name=model_name,
-                    similarity_score=score,
-                    image_path=str(save_path),
-                    identity_name=identity,
-                    matched_image_path=closest,
-                )
-                scores_by_model[model_name] = score
+                scores_by_model[model_name]  = best_score
+                closest_by_model[model_name] = best_path
+
                 results.append({
-                    "model": model_name, "score": score,
+                    "model": model_name, "score": best_score,
                     "threshold": threshold,
-                    "match": (score >= threshold) if threshold is not None else None,
-                    "closest_image": closest,
+                    "match": (best_score >= threshold) if threshold is not None else None,
+                    "closest_image": best_path,
                     "frame_path": str(save_path),
                 })
+
+            # Ranking closest = control image with highest average similarity
+            # across all models — computed from scores already accumulated above
+            if path_scores:
+                ranking_closest = max(
+                    path_scores,
+                    key=lambda p: sum(path_scores[p]) / len(path_scores[p]))
+            else:
+                ranking_closest = ""
+
+            # Write DB records — all with the same ranking_closest for consistency
+            for r in results:
+                self._db.add_attack(
+                    attacker_name=identity,
+                    model_name=r["model"],
+                    similarity_score=r["score"],
+                    image_path=str(save_path),
+                    identity_name=identity,
+                    matched_image_path=ranking_closest,
+                )
 
             def _update_all():
                 for r in results:

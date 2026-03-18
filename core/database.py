@@ -57,7 +57,6 @@ class Database:
             con.close()
 
     def _init_schema(self) -> None:
-        # Create tables (new installs get all columns from the start)
         with self._connect() as con:
             con.executescript("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -86,11 +85,16 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_attacks_model
                     ON attacks (model_name, similarity_score ASC);
+
+                CREATE TABLE IF NOT EXISTS embeddings (
+                    image_path  TEXT NOT NULL,
+                    model_name  TEXT NOT NULL,
+                    embedding   BLOB NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    PRIMARY KEY (image_path, model_name)
+                );
             """)
 
-        # Migrations: add new columns to existing databases that predate them.
-        # Each ALTER TABLE runs in its own connection so a "duplicate column"
-        # error from an already-migrated DB doesn't block the others.
         for col in ("identity_name", "matched_image_path"):
             try:
                 with self._connect() as con:
@@ -98,7 +102,50 @@ class Database:
                         f"ALTER TABLE attacks ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"
                     )
             except Exception:
-                pass  # column already exists — safe to ignore
+                pass
+
+    # ── Embedding cache ───────────────────────────────────────────────────────
+
+    def get_embedding(self, image_path: str, model_name: str):
+        """Return cached embedding as numpy array, or None if not cached."""
+        import numpy as np
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT embedding FROM embeddings WHERE image_path=? AND model_name=?",
+                (image_path, model_name),
+            ).fetchone()
+        if row is None:
+            return None
+        return np.frombuffer(row["embedding"], dtype=np.float32).copy()
+
+    def set_embedding(self, image_path: str, model_name: str, embedding) -> None:
+        """Store an embedding (numpy float32 array) in the cache."""
+        blob = embedding.astype("float32").tobytes()
+        now  = _now()
+        with self._connect() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO embeddings "
+                "(image_path, model_name, embedding, created_at) VALUES (?,?,?,?)",
+                (image_path, model_name, blob, now),
+            )
+
+    def get_all_embeddings_for_model(self, model_name: str) -> dict[str, object]:
+        """Return {image_path: embedding_array} for all cached entries of a model."""
+        import numpy as np
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT image_path, embedding FROM embeddings WHERE model_name=?",
+                (model_name,),
+            ).fetchall()
+        return {
+            r["image_path"]: np.frombuffer(r["embedding"], dtype=np.float32).copy()
+            for r in rows
+        }
+
+    def delete_embeddings_for_path(self, image_path: str) -> None:
+        """Remove all cached embeddings for a given image (e.g. after deletion)."""
+        with self._connect() as con:
+            con.execute("DELETE FROM embeddings WHERE image_path=?", (image_path,))
 
     # ── Users ─────────────────────────────────────────────────────────────────
 
@@ -162,6 +209,7 @@ class Database:
         """Remove a single capture record by its file path."""
         with self._connect() as con:
             con.execute("DELETE FROM captures WHERE image_path = ?", (image_path,))
+            con.execute("DELETE FROM embeddings WHERE image_path = ?", (image_path,))
 
     # ── Adversarial attacks ───────────────────────────────────────────────────
 
@@ -183,6 +231,7 @@ class Database:
             atk = con.execute("DELETE FROM attacks").rowcount
             cap = con.execute("DELETE FROM captures").rowcount
             usr = con.execute("DELETE FROM users").rowcount
+            con.execute("DELETE FROM embeddings")
         return {"attacks": atk, "captures": cap, "users": usr}
 
     def add_attack(
