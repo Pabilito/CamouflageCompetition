@@ -61,6 +61,9 @@ class App(ctk.CTk):
         self._build_ui()
 
     def _build_ui(self) -> None:
+        self._ranking_popped = False   # track pop-out state
+        self._ranking_window: ctk.CTkToplevel | None = None
+
         # ── Header ────────────────────────────────────────────────────────────
         header = ctk.CTkFrame(self, height=52, corner_radius=0,
                               fg_color=("#1a1a2e", "#1a1a2e"))
@@ -71,15 +74,22 @@ class App(ctk.CTk):
             text_color="#00d4ff",
         ).pack(side="left", padx=16, pady=10)
 
+        self._popout_btn = ctk.CTkButton(
+            header, text="⎋  Pop out Ranking", width=160,
+            fg_color="#2a2a4a", hover_color="#3a3a6a",
+            command=self._toggle_ranking_popout,
+        )
+        self._popout_btn.pack(side="right", padx=12, pady=10)
+
         # ── Tab view ──────────────────────────────────────────────────────────
-        tabs = ctk.CTkTabview(self, corner_radius=8)
-        tabs.pack(fill="both", expand=True, padx=12, pady=(6, 12))
+        self._tabs = ctk.CTkTabview(self, corner_radius=8)
+        self._tabs.pack(fill="both", expand=True, padx=12, pady=(6, 12))
 
         for name in ("Control Pictures", "Adversarial Pictures", "Ranking"):
-            tabs.add(name)
+            self._tabs.add(name)
 
         self._capture_tab = CaptureTab(
-            tabs.tab("Control Pictures"),
+            self._tabs.tab("Control Pictures"),
             engine=self._engine,
             db=self._db,
             data_dir=self._data_dir,
@@ -88,7 +98,7 @@ class App(ctk.CTk):
         self._capture_tab.pack(fill="both", expand=True)
 
         self._recognition_tab = RecognitionTab(
-            tabs.tab("Adversarial Pictures"),
+            self._tabs.tab("Adversarial Pictures"),
             engine=self._engine,
             db=self._db,
             data_dir=self._data_dir,
@@ -97,7 +107,7 @@ class App(ctk.CTk):
         self._recognition_tab.pack(fill="both", expand=True)
 
         self._ranking_tab = RankingTab(
-            tabs.tab("Ranking"),
+            self._tabs.tab("Ranking"),
             db=self._db,
             data_dir=self._data_dir,
             engine=self._engine,
@@ -108,7 +118,7 @@ class App(ctk.CTk):
 
         # Auto-reload on tab switch; stop camera when leaving a camera tab
         def _on_tab_change():
-            tab = tabs.get()
+            tab = self._tabs.get()
             if tab == "Adversarial Pictures":
                 self._capture_tab.on_tab_hidden()
                 self._recognition_tab.on_tab_shown()
@@ -119,7 +129,7 @@ class App(ctk.CTk):
             elif tab == "Control Pictures":
                 self._recognition_tab.on_tab_hidden()
 
-        tabs.configure(command=_on_tab_change)
+        self._tabs.configure(command=_on_tab_change)
 
         # Pre-load gallery on startup so Adversarial Pictures is ready immediately
         self.after(200, self._recognition_tab.on_tab_shown)
@@ -132,7 +142,82 @@ class App(ctk.CTk):
         # Let recognition tab refresh the ranking after scoring
         self._recognition_tab._ranking_tab = self._ranking_tab
 
+    # ── Ranking pop-out / dock ────────────────────────────────────────────────
+
+    def _toggle_ranking_popout(self) -> None:
+        if self._ranking_popped:
+            self._dock_ranking()
+        else:
+            self._popout_ranking()
+
+    def _popout_ranking(self) -> None:
+        """Detach RankingTab from the tabview into its own Toplevel window."""
+        # Hide the Ranking tab in the main tabview
+        self._tabs.delete("Ranking")
+
+        # Create the standalone window
+        win = ctk.CTkToplevel(self)
+        win.title("Ranking — RMA Face Camouflage Competition")
+        win.geometry("1000x680")
+        win.minsize(700, 400)
+        win.configure(fg_color=("#0d0d1a", "#0d0d1a"))
+        self._ranking_window = win
+
+        # Reparent the RankingTab widget into the new window.
+        # Tkinter doesn't support true widget re-parenting, so we rebuild a
+        # fresh RankingTab inside the new window and destroy the old one.
+        container = ctk.CTkFrame(win, fg_color="transparent")
+        container.pack(fill="both", expand=True)
+        old = self._ranking_tab
+        self._ranking_tab = RankingTab(
+            container,
+            db=self._db,
+            data_dir=self._data_dir,
+            engine=self._engine,
+            capture_tab=self._capture_tab,
+            recognition_tab=self._recognition_tab,
+        )
+        self._ranking_tab.pack(fill="both", expand=True)
+        self._recognition_tab._ranking_tab = self._ranking_tab
+        old.destroy()
+
+        self._ranking_popped = True
+        self._popout_btn.configure(text="⬅  Dock Ranking")
+
+        # If user closes the window manually, auto-dock
+        win.protocol("WM_DELETE_WINDOW", self._dock_ranking)
+
+    def _dock_ranking(self) -> None:
+        """Re-attach RankingTab back into the main tabview."""
+        # Destroy the popped-out window and its RankingTab
+        old = self._ranking_tab
+        if self._ranking_window is not None:
+            self._ranking_window.protocol("WM_DELETE_WINDOW", lambda: None)
+            self._ranking_window.destroy()
+            self._ranking_window = None
+
+        # Re-add the Ranking tab to the main tabview
+        self._tabs.add("Ranking")
+
+        # Build a fresh RankingTab inside the tabview tab
+        self._ranking_tab = RankingTab(
+            self._tabs.tab("Ranking"),
+            db=self._db,
+            data_dir=self._data_dir,
+            engine=self._engine,
+            capture_tab=self._capture_tab,
+            recognition_tab=self._recognition_tab,
+        )
+        self._ranking_tab.pack(fill="both", expand=True)
+        self._recognition_tab._ranking_tab = self._ranking_tab
+        old.destroy()
+
+        self._ranking_popped = False
+        self._popout_btn.configure(text="⎋  Pop out Ranking")
+
     def on_close(self) -> None:
+        if self._ranking_window is not None:
+            self._ranking_window.destroy()
         self.destroy()
 
 
