@@ -96,6 +96,8 @@ class RecognitionTab(ctk.CTkFrame):
         self._raw_frame:     Image.Image | None = None
         self._thumb_refs: list = []
         self._ranking_tab = None   # set by main.py after construction
+        self._current_scores: dict[str, float | None] = {}  # last known score per model
+        self._review_image: Image.Image | None = None       # image shown in review canvas
 
         self._build_ui()
 
@@ -127,6 +129,9 @@ class RecognitionTab(ctk.CTkFrame):
         size = min(event.width, event.height)
         if size > 10:
             self._canvas_size = size
+        # If a review image is being shown (camera not live), redraw it at the new size
+        if not self._running and self._review_image is not None:
+            self._show_review_image(self._review_image)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -389,8 +394,8 @@ class RecognitionTab(ctk.CTkFrame):
                                highlightthickness=0, bd=0)
         sim_canvas.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 4))
         sim_canvas.bind("<Configure>",
-                        lambda e, c=sim_canvas, t=threshold:
-                            self._draw_bar(c, 0.0, "#333", t))
+                        lambda e, c=sim_canvas, n=model_name, t=threshold:
+                            self._redraw_bar_for_model(c, n, t))
 
         # ── Row 2: accuracy bar ────────────────────────────────────────────────
         if accuracy is not None:
@@ -418,6 +423,16 @@ class RecognitionTab(ctk.CTkFrame):
             row=3, column=0)
 
         self._score_widgets[model_name] = (score_lbl, verdict_lbl, sim_canvas, threshold)
+
+    def _redraw_bar_for_model(self, canvas: tk.Canvas, model_name: str,
+                               threshold: float | None) -> None:
+        """Redraw the sim bar using the last known score — called on canvas resize."""
+        score = self._current_scores.get(model_name)
+        if score is None:
+            self._draw_bar(canvas, 0.0, "#333", threshold)
+        else:
+            colour = _score_colour(score, threshold)
+            self._draw_bar(canvas, _score_to_bar(score), colour, threshold)
 
     # ── Bar drawing ───────────────────────────────────────────────────────────
 
@@ -860,6 +875,7 @@ class RecognitionTab(ctk.CTkFrame):
             self._capture_btn.configure(state="normal")
             self._review_btns.grid_remove()
             self._pending_frame = None
+            self._review_image  = None
             self._status.configure(text="Camera running.", text_color="#888")
             threading.Thread(target=self._camera_loop, args=(my_gen,), daemon=True).start()
 
@@ -962,11 +978,22 @@ class RecognitionTab(ctk.CTkFrame):
         self._status.configure(text=f"⚠  {error}", text_color="#ff6b6b")
 
     def _show_review_image(self, img: Image.Image) -> None:
-        display = img.copy()
-        display.thumbnail((self._canvas_size, self._canvas_size), Image.LANCZOS)
-        tk_img = ImageTk.PhotoImage(display)
-        ox = (self._canvas_size - display.width) // 2
-        oy = (self._canvas_size - display.height) // 2
+        self._review_image = img   # remember for canvas resize redraws
+        # Use the canvas's actual rendered size so the image fills it whether
+        # the window is small or large.  winfo_width/height return real pixel
+        # dimensions after the widget has been drawn; fall back to the tracked
+        # _canvas_size if the canvas hasn't been realised yet.
+        cw = self._canvas.winfo_width()
+        ch = self._canvas.winfo_height()
+        if cw < 10 or ch < 10:          # not yet realised
+            cw = ch = self._canvas_size
+        iw, ih = img.size
+        scale = min(cw / iw, ch / ih)   # fit inside canvas, preserving aspect ratio
+        nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+        display = img.resize((nw, nh), Image.LANCZOS)
+        tk_img  = ImageTk.PhotoImage(display)
+        ox = (cw - nw) // 2
+        oy = (ch - nh) // 2
         self._canvas.delete("all")
         self._canvas.create_image(ox, oy, anchor="nw", image=tk_img)
         self._photo_ref = tk_img
@@ -1108,6 +1135,7 @@ class RecognitionTab(ctk.CTkFrame):
 
     def _update_row(self, model_name: str, score: float | None) -> None:
         score_lbl, verdict_lbl, canvas, threshold = self._score_widgets[model_name]
+        self._current_scores[model_name] = score   # persist for canvas resize redraws
         if score is None:
             score_lbl.configure(text="no data", text_color="#555")
             verdict_lbl.configure(text="")

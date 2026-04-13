@@ -44,6 +44,7 @@ class CaptureTab(ctk.CTkFrame):
         self._pending_frame: Image.Image | None = None   # aligned or fallback
         self._raw_frame:     Image.Image | None = None   # original pre-align crop
         self._on_image_accepted = None
+        self._review_image: Image.Image | None = None    # image shown in review canvas
 
         self._build_ui()
         self._refresh_user_list()
@@ -68,6 +69,9 @@ class CaptureTab(ctk.CTkFrame):
         size = min(event.width, event.height)
         if size > 10:
             self._canvas_size = size
+        # If a review image is being shown (camera not live), redraw it at the new size
+        if not self._running and self._review_image is not None:
+            self._show_review_image(self._review_image)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -348,6 +352,7 @@ class CaptureTab(ctk.CTkFrame):
             self._status.configure(text="Camera running.", text_color="#888")
             self._review_frame.grid_remove()
             self._pending_frame = None
+            self._review_image  = None
             threading.Thread(target=self._camera_loop, args=(my_gen,), daemon=True).start()
 
     def _camera_loop(self, gen: int) -> None:
@@ -458,11 +463,22 @@ class CaptureTab(ctk.CTkFrame):
         self._status.configure(text=f"⚠  {error}", text_color="#ff6b6b")
 
     def _show_review_image(self, img: Image.Image) -> None:
-        display = img.copy()
-        display.thumbnail((self._canvas_size, self._canvas_size), Image.LANCZOS)
-        tk_img = ImageTk.PhotoImage(display)
-        ox = (self._canvas_size - display.width) // 2
-        oy = (self._canvas_size - display.height) // 2
+        self._review_image = img   # remember for canvas resize redraws
+        # Use the canvas's actual rendered size so the image fills it whether
+        # the window is small or large.  winfo_width/height return real pixel
+        # dimensions after the widget has been drawn; fall back to the tracked
+        # _canvas_size if the canvas hasn't been realised yet.
+        cw = self._canvas.winfo_width()
+        ch = self._canvas.winfo_height()
+        if cw < 10 or ch < 10:          # not yet realised
+            cw = ch = self._canvas_size
+        iw, ih = img.size
+        scale = min(cw / iw, ch / ih)   # fit inside canvas, preserving aspect ratio
+        nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+        display = img.resize((nw, nh), Image.LANCZOS)
+        tk_img  = ImageTk.PhotoImage(display)
+        ox = (cw - nw) // 2
+        oy = (ch - nh) // 2
         self._canvas.delete("all")
         self._canvas.create_image(ox, oy, anchor="nw", image=tk_img)
         self._photo_ref = tk_img
@@ -482,6 +498,7 @@ class CaptureTab(ctk.CTkFrame):
         self._refresh_thumbnails(user_row.id)
         self._pending_frame = None
         self._raw_frame     = None
+        self._review_image  = None
         self._review_frame.grid_remove()
         self._fail_frame.grid_remove()
         if self._on_image_accepted is not None:
@@ -500,6 +517,7 @@ class CaptureTab(ctk.CTkFrame):
     def _retake_frame(self) -> None:
         self._pending_frame = None
         self._raw_frame     = None
+        self._review_image  = None
         self._review_frame.grid_remove()
         self._fail_frame.grid_remove()
         self._camera.close()
