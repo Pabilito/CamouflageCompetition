@@ -56,6 +56,7 @@ class RankingTab(ctk.CTkFrame):
         self._capture_tab     = capture_tab
         self._recognition_tab = recognition_tab
         self._thumb_refs: list = []
+        self._podium_window: "PodiumWindow | None" = None
 
         self._build_ui()
         self._refresh()
@@ -69,7 +70,7 @@ class RankingTab(ctk.CTkFrame):
         # ── Toolbar ───────────────────────────────────────────────────────────
         toolbar = ctk.CTkFrame(self, fg_color="transparent")
         toolbar.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
-        toolbar.columnconfigure(3, weight=1)
+        toolbar.columnconfigure(4, weight=1)
 
         ctk.CTkLabel(toolbar, text="Adversarial Attack Ranking",
                      font=ctk.CTkFont(size=14, weight="bold"),
@@ -82,11 +83,16 @@ class RankingTab(ctk.CTkFrame):
                       fg_color="#5a0000", hover_color="#8b0000",
                       command=self._confirm_clear).grid(row=0, column=2, padx=(8, 0))
 
+        ctk.CTkButton(toolbar, text="🏆  Podium View", width=130,
+                      fg_color="#1a3a1a", hover_color="#2a5a2a",
+                      command=self._open_podium).grid(row=0, column=3, padx=(8, 0))
+
+
         ctk.CTkLabel(toolbar,
                      text=f"Avg. similarity threshold: {_THRESHOLD}  •  "
                           "click thumbnails to enlarge  •  🗑 to delete row",
                      font=ctk.CTkFont(size=10), text_color="#555").grid(
-            row=0, column=3, padx=(16, 0), sticky="w")
+            row=0, column=4, padx=(16, 0), sticky="w")
 
         # ── Sub-tab view ──────────────────────────────────────────────────────
         self._tabs = ctk.CTkTabview(self, corner_radius=6)
@@ -158,6 +164,7 @@ class RankingTab(ctk.CTkFrame):
             self._refresh_standings()
         else:
             self._refresh_all_images()
+        self._notify_podium()
 
     # ── Current Standings ─────────────────────────────────────────────────────
 
@@ -456,6 +463,63 @@ class RankingTab(ctk.CTkFrame):
 
     # ── Clear ─────────────────────────────────────────────────────────────────
 
+    # ── Podium window ─────────────────────────────────────────────────────────
+
+    def _open_podium(self) -> None:
+        """Open (or focus) the live podium window."""
+        if self._podium_window is not None and self._podium_window.winfo_exists():
+            self._podium_window.lift()
+            self._podium_window.focus_force()
+            return
+        self._podium_window = PodiumWindow(self, db=self._db,
+                                           engine=self._engine)
+
+    def _get_top3_data(self) -> list[dict]:
+        """Return up to 3 dicts: {rank, name, score, adv_path, ctrl_path}."""
+        leaderboard = self._db.get_user_leaderboard()
+        if not leaderboard:
+            return []
+
+        all_rows = self._db.get_ranking(model_name=None, limit=10_000)
+        img_scores: dict[str, dict[str, float]] = {}
+        img_meta:   dict[str, dict]             = {}
+        for r in all_rows:
+            if r.image_path not in img_scores:
+                img_scores[r.image_path] = {}
+                img_meta[r.image_path]   = {
+                    "attacker": r.attacker_name,
+                    "closest":  r.matched_image_path or ""}
+            img_scores[r.image_path][r.model_name] = r.similarity_score
+
+        img_avg: dict[str, float] = {}
+        for path, scores in img_scores.items():
+            if scores:
+                img_avg[path] = sum(scores.values()) / len(scores)
+
+        result = []
+        for rank, entry in enumerate(leaderboard[:3], start=1):
+            identity   = entry["identity_name"]
+            best_avg   = entry["best_avg_score"]
+            candidates = [p for p, m in img_meta.items()
+                          if m["attacker"] == identity]
+            adv_path  = ""
+            ctrl_path = ""
+            if candidates:
+                best_path = min(candidates, key=lambda p: img_avg.get(p, 1.0))
+                adv_path  = best_path
+                ctrl_path = img_meta[best_path]["closest"]
+            result.append({"rank": rank, "name": identity,
+                            "score": best_avg,
+                            "adv_path": adv_path,
+                            "ctrl_path": ctrl_path})
+        return result
+
+    def _notify_podium(self) -> None:
+        """Push fresh top-3 data to the podium window if it is open."""
+        if (self._podium_window is not None
+                and self._podium_window.winfo_exists()):
+            self._podium_window.update_data(self._get_top3_data())
+
     def _confirm_clear(self) -> None:
         import tkinter.messagebox as mb
         import shutil
@@ -491,6 +555,249 @@ class RankingTab(ctk.CTkFrame):
                 self._capture_tab.refresh_after_clear()
             if self._recognition_tab is not None:
                 self._recognition_tab.refresh_after_clear()
+
+
+
+# ── Podium Window ─────────────────────────────────────────────────────────────
+
+_PODIUM_BG    = "#0d0d1a"
+_PODIUM_PANEL = "#12122a"
+_MEDAL_BG     = {1: "#2a2200", 2: "#1e1e1e", 3: "#1a1000"}
+_MEDAL_BORDER = {1: "#FFD700", 2: "#C0C0C0", 3: "#CD7F32"}
+_MEDAL_LABEL  = {1: "🥇  1st Place", 2: "🥈  2nd Place", 3: "🥉  3rd Place"}
+_PODIUM_ORDER = [1, 2, 3]
+
+_IMG_MIN = 40
+_IMG_MAX = 500
+
+# Non-image chrome height per slot (px) — tightened paddings (padx=10 everywhere):
+#   medal label  (pady 8+3,  font 9-15px)  = 30
+#   "Adversarial" caption (pady 2+4)       = 18
+#   "Reference"   caption (pady 2+3)       = 17
+#   name label   (pady 4+1,  font 9-15px)  = 24
+#   score label  (pady 0+10, font 8-12px)  = 26
+#   slot border + top/bottom pad           = 16
+_CHROME_H = 30 + 18 + 17 + 24 + 26 + 16   # 131 px
+_CHROME_W = 20   # left+right inner padding (padx=10 each side)
+
+
+class PodiumWindow(ctk.CTkToplevel):
+    """Standalone resizable window — live top-3 podium."""
+
+    def __init__(self, ranking_tab: "RankingTab", db: Database,
+                 engine: "EmbeddingEngine"):
+        super().__init__(ranking_tab)
+        self._ranking_tab = ranking_tab
+        self._db          = db
+        self._engine      = engine
+        self._data: list[dict] = []
+        self._resize_job       = None
+
+        self.title("🏆  Live Podium — Top 3")
+        self.geometry("960x700")
+        self.minsize(480, 420)
+        self.configure(fg_color=_PODIUM_BG)
+
+        self._build_ui()
+        # Load data after the window has been fully mapped & measured
+        self.after(150, lambda: self.update_data(ranking_tab._get_top3_data()))
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+    # ── Build UI ──────────────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        # Fixed-height header
+        hdr = ctk.CTkFrame(self, fg_color="#1a1a2e", corner_radius=0, height=44)
+        hdr.pack(fill="x", side="top")
+        hdr.pack_propagate(False)
+        ctk.CTkLabel(hdr, text="🏆  LIVE PODIUM",
+                     font=ctk.CTkFont(family="Courier New", size=15, weight="bold"),
+                     text_color="#FFD700").pack(side="left", padx=16, pady=8)
+
+        # Outer frame — we bind <Configure> HERE (on the container, not the slots)
+        # so we measure the available area before telling slots how big to be.
+        self._arena = ctk.CTkFrame(self, fg_color="transparent")
+        self._arena.pack(fill="both", expand=True, padx=12, pady=10)
+        self._arena.bind("<Configure>", self._on_arena_resize)
+
+        for c in range(3):
+            self._arena.columnconfigure(c, weight=1, uniform="pod")
+        self._arena.rowconfigure(0, weight=1)
+
+        self._slots: dict[int, "_PodiumSlot"] = {}
+        for col, rank in enumerate(_PODIUM_ORDER):
+            slot = _PodiumSlot(self._arena, rank=rank)
+            slot.grid(row=0, column=col, sticky="nsew", padx=6, pady=4)
+            self._slots[rank] = slot
+
+    # ── Data update ───────────────────────────────────────────────────────────
+
+    def update_data(self, data: list[dict]) -> None:
+        self._data = data
+        img_size   = self._calc_img_size()
+        by_rank    = {d["rank"]: d for d in data}
+        for rank in (1, 2, 3):
+            self._slots[rank].apply_data(by_rank.get(rank), img_size)
+        pass
+
+    # ── Sizing — driven by the ARENA, not by slot content ────────────────────
+
+    def _calc_img_size(self) -> int:
+        """
+        Compute image size from the arena's actual pixel dimensions.
+        The arena is the container that holds the three slots; its size is set
+        by the window manager and does NOT depend on image content, so there is
+        no feedback loop.
+        """
+        aw = self._arena.winfo_width()
+        ah = self._arena.winfo_height()
+
+        if aw < 30 or ah < 30:   # not yet mapped — use window geometry fallback
+            try:
+                ww = self.winfo_width()
+                wh = self.winfo_height()
+            except Exception:
+                ww, wh = 960, 700
+            aw = max(30, ww - 24)
+            ah = max(30, wh - 44 - 20)  # subtract header + arena padding
+
+        # Width: fit inside one column (3 equal cols with ~12 px gaps)
+        col_w  = (aw - 36) // 3
+        size_w = max(_IMG_MIN, min(_IMG_MAX, col_w - _CHROME_W))
+
+        # Height: subtract all non-image chrome, then divide by 2 (two images stacked)
+        avail_h = max(0, ah - _CHROME_H - 8)   # 8 px arena top/bottom pad
+        size_h  = max(_IMG_MIN, min(_IMG_MAX, avail_h // 2))
+
+        return min(size_w, size_h)
+
+    def _on_arena_resize(self, event) -> None:
+        if self._resize_job is not None:
+            try:
+                self.after_cancel(self._resize_job)
+            except Exception:
+                pass
+        self._resize_job = self.after(80, self._do_resize)
+
+    def _do_resize(self) -> None:
+        self._resize_job = None
+        if self._data:
+            self.update_data(self._data)
+
+
+class _PodiumSlot(ctk.CTkFrame):
+    """
+    One podium column.  Accepts explicit img_size from PodiumWindow so it never
+    drives its own size — breaking the content-→-size feedback loop.
+    """
+
+    def __init__(self, parent, rank: int):
+        super().__init__(parent,
+                         fg_color=_MEDAL_BG.get(rank, _PODIUM_PANEL),
+                         corner_radius=12,
+                         border_width=2,
+                         border_color=_MEDAL_BORDER.get(rank, "#333"))
+        self._img_refs: list = []
+        self.columnconfigure(0, weight=1)
+        # Chrome rows are fixed height; image rows share remaining space equally
+        for r in (0, 2, 4, 5, 6):
+            self.rowconfigure(r, weight=0)
+        self.rowconfigure(1, weight=1)
+        self.rowconfigure(3, weight=1)
+
+        # Medal label — ref kept for adaptive font updates
+        self._medal_lbl = ctk.CTkLabel(self,
+                     text=_MEDAL_LABEL.get(rank, f"#{rank}"),
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=_MEDAL_BORDER.get(rank, "#ccc"),
+                     wraplength=1)
+        self._medal_lbl.grid(row=0, column=0, pady=(8, 3), padx=10, sticky="ew")
+
+        # Adversarial image
+        self._adv_lbl = ctk.CTkLabel(self, text="", fg_color="#0d0d1a",
+                                     corner_radius=6)
+        self._adv_lbl.grid(row=1, column=0, padx=8, pady=(0, 0), sticky="n")
+        self._adv_cap = ctk.CTkLabel(self, text="Adversarial",
+                     font=ctk.CTkFont(size=9), text_color="#666")
+        self._adv_cap.grid(row=2, column=0, pady=(2, 4), padx=10, sticky="ew")
+
+        # Reference image
+        self._ctrl_lbl = ctk.CTkLabel(self, text="", fg_color="#0d0d1a",
+                                      corner_radius=6)
+        self._ctrl_lbl.grid(row=3, column=0, padx=8, pady=(0, 0), sticky="n")
+        self._ref_cap = ctk.CTkLabel(self, text="Reference",
+                     font=ctk.CTkFont(size=9), text_color="#666")
+        self._ref_cap.grid(row=4, column=0, pady=(2, 3), padx=10, sticky="ew")
+
+        # Name — wraplength set dynamically to prevent border overflow
+        self._name_lbl = ctk.CTkLabel(self, text="—",
+                                      font=ctk.CTkFont(size=13, weight="bold"),
+                                      text_color="#e0e0e0",
+                                      wraplength=1)
+        self._name_lbl.grid(row=5, column=0, pady=(4, 1), padx=10, sticky="ew")
+
+        # Score — wraplength set dynamically
+        self._score_lbl = ctk.CTkLabel(self, text="",
+                                       font=ctk.CTkFont(family="Courier New", size=11),
+                                       text_color="#aaa",
+                                       wraplength=1)
+        self._score_lbl.grid(row=6, column=0, pady=(0, 10), padx=10, sticky="ew")
+
+    def apply_data(self, entry: "dict | None", img_size: int) -> None:
+        self._img_refs.clear()
+
+        # ── Derive font sizes from img_size so everything scales with the window
+        # img_size ~40..500; map to readable font range
+        medal_fs = max(9,  min(15, img_size // 10 + 5))
+        cap_fs   = max(7,  min(11, img_size // 14 + 4))
+        name_fs  = max(9,  min(15, img_size // 10 + 4))
+        score_fs = max(8,  min(12, img_size // 12 + 4))
+
+        # wraplength = slot inner width ≈ img_size (images fill the column)
+        wrap = max(40, img_size - 4)
+
+        self._medal_lbl.configure(
+            font=ctk.CTkFont(size=medal_fs, weight="bold"), wraplength=wrap)
+        self._adv_cap.configure(font=ctk.CTkFont(size=cap_fs))
+        self._ref_cap.configure(font=ctk.CTkFont(size=cap_fs))
+        self._name_lbl.configure(
+            font=ctk.CTkFont(size=name_fs, weight="bold"),  wraplength=wrap)
+        self._score_lbl.configure(
+            font=ctk.CTkFont(family="Courier New", size=score_fs), wraplength=wrap)
+
+        if entry:
+            score     = entry["score"]
+            adv_img   = self._load_img(entry.get("adv_path",  ""), img_size)
+            ctrl_img  = self._load_img(entry.get("ctrl_path", ""), img_size)
+            score_col = "#00ff9f" if score < _THRESHOLD else "#ff6b6b"
+            self._name_lbl.configure( text=entry["name"],              text_color="#e0e0e0")
+            self._score_lbl.configure(text=f"Avg Similarity: {score:.4f}", text_color=score_col)
+        else:
+            adv_img = ctrl_img = None
+            self._name_lbl.configure( text="—", text_color="#444")
+            self._score_lbl.configure(text="",  text_color="#444")
+
+        ph = self._placeholder(img_size)
+        fi = adv_img  or ph
+        fc = ctrl_img or ph
+        self._img_refs.extend([fi, fc])
+        self._adv_lbl.configure( image=fi, text="", width=img_size, height=img_size)
+        self._ctrl_lbl.configure(image=fc, text="", width=img_size, height=img_size)
+
+    @staticmethod
+    def _load_img(path: str, size: int) -> "ctk.CTkImage | None":
+        if not path:
+            return None
+        try:
+            img = Image.open(path).convert("RGB").resize((size, size), Image.LANCZOS)
+            return ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _placeholder(size: int) -> ctk.CTkImage:
+        img = Image.new("RGB", (size, size), "#1e1e2e")
+        return ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
 
 
 # ── Clear dialog ──────────────────────────────────────────────────────────────
