@@ -6,6 +6,7 @@ Two sub-tabs:
   • All Images         — every scored image with model filter dropdown
 """
 
+import threading
 from pathlib import Path
 
 import customtkinter as ctk
@@ -18,6 +19,7 @@ from core.embeddings import EmbeddingEngine
 _THUMB      = 56
 _ALL_MODELS = "All models (average)"
 _THRESHOLD  = 0.2565
+_PAGE_SIZE  = 30
 
 # Per-model LFW decision thresholds (match = score ≥ threshold)
 _MODEL_THRESHOLDS: dict[str, float] = {
@@ -57,6 +59,17 @@ class RankingTab(ctk.CTkFrame):
         self._recognition_tab = recognition_tab
         self._thumb_refs: list = []
         self._podium_window: "PodiumWindow | None" = None
+
+        # ── Standings state ───────────────────────────────────────────────────
+        self._st_cache: list[dict] = []    # full sorted leaderboard
+        self._st_page:  int        = 0     # current 0-based page index
+
+        # ── All Images state ──────────────────────────────────────────────────
+        # Cached sorted lists; rebuilt only on explicit refresh or model change.
+        # Switching pages just slices from the cache — no DB query, no image I/O.
+        self._all_cache: list[dict] = []   # current model's full sorted list
+        self._all_cache_model: str  = ""   # which model the cache belongs to
+        self._all_page: int         = 0    # current 0-based page index
 
         self._build_ui()
         self._refresh()
@@ -117,6 +130,37 @@ class RankingTab(ctk.CTkFrame):
             st, text="", font=ctk.CTkFont(size=11), text_color="#888")
         self._standings_summary.grid(row=1, column=0, sticky="w", pady=(2, 4))
 
+        # ── Standings pagination bar ──────────────────────────────────────────
+        st_pag = ctk.CTkFrame(st, fg_color="transparent")
+        st_pag.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        st_pag.columnconfigure(1, weight=1)
+
+        self._st_btn_prev = ctk.CTkButton(
+            st_pag, text="◀  Prev", width=90,
+            command=self._st_page_prev)
+        self._st_btn_prev.grid(row=0, column=0, padx=(0, 8))
+
+        self._st_lbl_page = ctk.CTkLabel(
+            st_pag, text="", font=ctk.CTkFont(size=11), text_color="#888",
+            anchor="center")
+        self._st_lbl_page.grid(row=0, column=1, sticky="ew")
+
+        ctk.CTkLabel(st_pag, text="Go to page:",
+                     font=ctk.CTkFont(size=11),
+                     text_color="#888").grid(row=0, column=2, padx=(0, 4))
+        self._st_entry_page = ctk.CTkEntry(st_pag, width=48,
+                                           font=ctk.CTkFont(size=11),
+                                           justify="center")
+        self._st_entry_page.grid(row=0, column=3, padx=(0, 4))
+        self._st_entry_page.bind("<Return>", lambda e: self._st_page_goto())
+        ctk.CTkButton(st_pag, text="Go", width=40,
+                      command=self._st_page_goto).grid(row=0, column=4, padx=(0, 12))
+
+        self._st_btn_next = ctk.CTkButton(
+            st_pag, text="Next  ▶", width=90,
+            command=self._st_page_next)
+        self._st_btn_next.grid(row=0, column=5, padx=(8, 0))
+
         # ── All Images sub-tab ────────────────────────────────────────────────
         ai = self._tabs.tab("All Images")
         ai.columnconfigure(0, weight=1)
@@ -145,126 +189,218 @@ class RankingTab(ctk.CTkFrame):
             ai, text="", font=ctk.CTkFont(size=11), text_color="#888")
         self._all_summary.grid(row=2, column=0, sticky="w", pady=(2, 4))
 
-    # ── Sub-tab switch ────────────────────────────────────────────────────────
+        # ── Pagination bar ────────────────────────────────────────────────────
+        pag = ctk.CTkFrame(ai, fg_color="transparent")
+        pag.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        pag.columnconfigure(1, weight=1)   # centre label expands
+
+        self._btn_prev = ctk.CTkButton(
+            pag, text="◀  Prev", width=90,
+            command=self._page_prev)
+        self._btn_prev.grid(row=0, column=0, padx=(0, 8))
+
+        self._lbl_page = ctk.CTkLabel(
+            pag, text="", font=ctk.CTkFont(size=11), text_color="#888",
+            anchor="center")
+        self._lbl_page.grid(row=0, column=1, sticky="ew")
+
+        # Go-to-page controls (Entry + Go button)
+        ctk.CTkLabel(pag, text="Go to page:",
+                     font=ctk.CTkFont(size=11),
+                     text_color="#888").grid(row=0, column=2, padx=(0, 4))
+        self._entry_page = ctk.CTkEntry(pag, width=48,
+                                        font=ctk.CTkFont(size=11),
+                                        justify="center")
+        self._entry_page.grid(row=0, column=3, padx=(0, 4))
+        self._entry_page.bind("<Return>", lambda e: self._page_goto())
+        ctk.CTkButton(pag, text="Go", width=40,
+                      command=self._page_goto).grid(row=0, column=4, padx=(0, 12))
+
+        self._btn_next = ctk.CTkButton(
+            pag, text="Next  ▶", width=90,
+            command=self._page_next)
+        self._btn_next.grid(row=0, column=5, padx=(8, 0))
+
+    def _refresh(self) -> None:
+        self._thumb_refs.clear()
+        current = self._tabs.get()
+        if current == "Current Standings":
+            self._st_cache = []          # invalidate so DB is re-queried
+            self._refresh_standings()
+        else:
+            self._all_cache_model = ""   # invalidate so DB is re-queried
+            self._refresh_all_images()
+        self._notify_podium()
 
     def _on_subtab_change(self) -> None:
-        self._refresh()
+        current = self._tabs.get()
+        if current == "Current Standings":
+            if self._st_cache:
+                self._render_standings_page()   # instant — reuse cache
+            else:
+                self._refresh_standings()       # first visit
+        else:
+            if self._all_cache_model == self._model_var.get():
+                self._render_all_page()         # instant — reuse cache
+            else:
+                self._refresh_all_images()
+        self._notify_podium()
 
     # ── Tab hooks ─────────────────────────────────────────────────────────────
 
     def on_tab_shown(self) -> None:
         self._refresh()
 
-    # ── Refresh dispatcher ────────────────────────────────────────────────────
-
-    def _refresh(self) -> None:
-        self._thumb_refs.clear()
-        current = self._tabs.get()
-        if current == "Current Standings":
-            self._refresh_standings()
-        else:
-            self._refresh_all_images()
-        self._notify_podium()
-
     # ── Current Standings ─────────────────────────────────────────────────────
 
     def _refresh_standings(self) -> None:
-        body = self._standings_body
-        for w in body.winfo_children():
-            w.destroy()
+        """Rebuild cache from DB, then render page 0."""
+        leaderboard  = self._db.get_user_leaderboard()
+        model_names  = self._engine.model_names
+        all_rows     = self._db.get_ranking(model_name=None, limit=10_000)
 
-        # Reconfigure columns for the wider standings table:
-        # 0:Rank 1:Attacker 2:BestAvg 3..7:S1-S5 8:Attack 9:Timestamp
-        _N_COLS = 10
-        for i in range(_N_COLS):
-            body.columnconfigure(i, weight=1)
-
-        leaderboard = self._db.get_user_leaderboard()
-        if not leaderboard:
-            ctk.CTkLabel(body, text="No records yet.",
-                         font=ctk.CTkFont(size=12), text_color="#555").grid(
-                row=1, column=0, columnspan=_N_COLS, pady=30)
-            self._standings_summary.configure(text="0 participants.")
-            return
-
-        model_names = self._engine.model_names  # ordered list of 5 models
-
-        # ── Collect all DB rows grouped by image_path ─────────────────────────
-        all_rows = self._db.get_ranking(model_name=None, limit=10_000)
-
-        # image_path → {model_name: score}
+        # image_path → {model_name: score}  /  metadata
         img_scores: dict[str, dict[str, float]] = {}
         img_meta:   dict[str, dict] = {}
         for r in all_rows:
             if r.image_path not in img_scores:
                 img_scores[r.image_path] = {}
                 img_meta[r.image_path]   = {
-                    "attacker": r.attacker_name,
-                    "created_at": r.created_at}
+                    "attacker":    r.attacker_name,
+                    "created_at":  r.created_at}
             img_scores[r.image_path][r.model_name] = r.similarity_score
 
-        # For each image compute avg across available models
-        img_avg: dict[str, float] = {}
-        for path, scores in img_scores.items():
-            if scores:
-                img_avg[path] = sum(scores.values()) / len(scores)
+        img_avg: dict[str, float] = {
+            p: sum(s.values()) / len(s)
+            for p, s in img_scores.items() if s
+        }
 
-        # Per-identity: find the image_path with lowest avg
-        identity_best_img: dict[str, str] = {}   # identity → best image_path
+        # Per-identity best image
+        identity_best_img: dict[str, str] = {}
         for entry in leaderboard:
-            identity = entry["identity_name"]
-            # Find all images for this identity
+            identity   = entry["identity_name"]
             candidates = [p for p, m in img_meta.items()
                           if m["attacker"] == identity]
             if candidates:
-                best = min(candidates, key=lambda p: img_avg.get(p, 1.0))
-                identity_best_img[identity] = best
+                identity_best_img[identity] = min(
+                    candidates, key=lambda p: img_avg.get(p, 1.0))
 
-        # ── Find per-model column minimums for "best in column" highlight ──────
+        # Per-model column minimums
         col_min: dict[str, float] = {}
         for entry in leaderboard:
-            identity = entry["identity_name"]
-            path = identity_best_img.get(identity, "")
+            path = identity_best_img.get(entry["identity_name"], "")
             if not path:
                 continue
             for mn in model_names:
                 s = img_scores.get(path, {}).get(mn)
-                if s is not None:
-                    if mn not in col_min or s < col_min[mn]:
-                        col_min[mn] = s
+                if s is not None and (mn not in col_min or s < col_min[mn]):
+                    col_min[mn] = s
 
-        # ── Draw header ───────────────────────────────────────────────────────
-        HDR_BG   = "#16213e"
-        AVG_BG   = "#0d2a1a"   # dark green tint → ranking basis
-        BEST_BG  = "#1a1a0a"   # dark gold tint  → best in column
+        # Build flat cache list — one dict per participant
+        self._st_cache = [
+            {
+                "identity":   e["identity_name"],
+                "best_avg":   e["best_avg_score"],
+                "path":       identity_best_img.get(e["identity_name"], ""),
+                "scores":     img_scores.get(
+                                  identity_best_img.get(e["identity_name"], ""), {}),
+                "ts":         img_meta.get(
+                                  identity_best_img.get(e["identity_name"], ""),
+                                  {}).get("created_at", ""),
+                "model_names": model_names,
+                "col_min":    col_min,
+            }
+            for e in leaderboard
+        ]
+        self._st_page = 0
+        self._render_standings_page()
 
-        def hdr(col: int, text: str, bg: str = HDR_BG,
-                tooltip: str = "") -> None:
-            lbl = ctk.CTkLabel(body, text=text,
-                               font=ctk.CTkFont(size=11, weight="bold"),
-                               text_color="#00d4ff", fg_color=bg,
-                               anchor="center")
-            lbl.grid(row=0, column=col, padx=2, pady=(4, 4), sticky="ew")
+    # ── Standings pagination helpers ──────────────────────────────────────────
+
+    def _st_page_prev(self) -> None:
+        if self._st_page > 0:
+            self._st_page -= 1
+            self._render_standings_page()
+
+    def _st_page_next(self) -> None:
+        total_pages = max(1, -(-len(self._st_cache) // _PAGE_SIZE))
+        if self._st_page < total_pages - 1:
+            self._st_page += 1
+            self._render_standings_page()
+
+    def _st_page_goto(self) -> None:
+        total_pages = max(1, -(-len(self._st_cache) // _PAGE_SIZE))
+        try:
+            target = int(self._st_entry_page.get().strip()) - 1
+        except ValueError:
+            self._st_entry_page.delete(0, "end")
+            return
+        self._st_page = max(0, min(target, total_pages - 1))
+        self._st_entry_page.delete(0, "end")
+        self._render_standings_page()
+
+    def _render_standings_page(self) -> None:
+        """Render the current page slice from self._st_cache. No DB query."""
+        body    = self._standings_body
+        _N_COLS = 10
+
+        for w in body.winfo_children():
+            w.destroy()
+        self._thumb_refs.clear()
+
+        for i in range(_N_COLS):
+            body.columnconfigure(i, weight=1)
+
+        total = len(self._st_cache)
+        if total == 0:
+            ctk.CTkLabel(body, text="No records yet.",
+                         font=ctk.CTkFont(size=12), text_color="#555").grid(
+                row=1, column=0, columnspan=_N_COLS, pady=30)
+            self._standings_summary.configure(text="0 participants.")
+            self._st_lbl_page.configure(text="")
+            self._st_btn_prev.configure(state="disabled")
+            self._st_btn_next.configure(state="disabled")
+            return
+
+        total_pages = max(1, -(-total // _PAGE_SIZE))
+        self._st_page = max(0, min(self._st_page, total_pages - 1))
+        start     = self._st_page * _PAGE_SIZE
+        end       = min(start + _PAGE_SIZE, total)
+        page_data = self._st_cache[start:end]
+
+        # ── Header ────────────────────────────────────────────────────────────
+        HDR_BG  = "#16213e"
+        AVG_BG  = "#0d2a1a"
+        BEST_BG = "#1a1a0a"
+        model_names = self._st_cache[0]["model_names"] if self._st_cache else []
+
+        def hdr(col: int, text: str, bg: str = HDR_BG) -> None:
+            ctk.CTkLabel(body, text=text,
+                         font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color="#00d4ff", fg_color=bg,
+                         anchor="center").grid(
+                row=0, column=col, padx=2, pady=(4, 4), sticky="ew")
 
         hdr(0, "Rank")
         hdr(1, "Attacker")
-        hdr(2, "Best Avg ↓", bg=AVG_BG)   # ranking basis — green tint
+        hdr(2, "Best Avg ↓", bg=AVG_BG)
         for si, mn in enumerate(model_names):
             hdr(3 + si, f"Model {si+1}")
         hdr(8, "Best Attack")
         hdr(9, "Timestamp")
 
-        # ── Draw rows ─────────────────────────────────────────────────────────
-        for rank, entry in enumerate(leaderboard, start=1):
-            identity = entry["identity_name"]
-            best_avg = entry["best_avg_score"]
-            medal    = _MEDAL.get(rank)
-            txt_col  = medal if medal else "#e0e0e0"
-
-            path     = identity_best_img.get(identity, "")
-            scores   = img_scores.get(path, {})
-            ts       = img_meta.get(path, {}).get("created_at", "")
-            grid_row = rank   # data rows start at 1 (header is row 0)
+        # ── Rows ──────────────────────────────────────────────────────────────
+        for local_idx, entry in enumerate(page_data):
+            global_rank = start + local_idx + 1
+            grid_row    = local_idx + 1
+            identity    = entry["identity"]
+            best_avg    = entry["best_avg"]
+            path        = entry["path"]
+            scores      = entry["scores"]
+            ts          = entry["ts"]
+            col_min     = entry["col_min"]
+            medal       = _MEDAL.get(global_rank)
+            txt_col     = medal if medal else "#e0e0e0"
 
             def cell(col: int, text: str, txt: str = "#ccc",
                      bg: str = "transparent", r: int = grid_row) -> None:
@@ -273,12 +409,10 @@ class RankingTab(ctk.CTkFrame):
                              fg_color=bg).grid(
                     row=r, column=col, padx=2, pady=2, sticky="ew")
 
-            cell(0, f"#{rank}", txt=txt_col)
-            cell(1, identity,   txt=txt_col)
-            # Best Avg — always green-tinted background as ranking basis
+            cell(0, f"#{global_rank}", txt=txt_col)
+            cell(1, identity,          txt=txt_col)
             cell(2, f"{best_avg:.4f}", txt=_sc_col(best_avg), bg=AVG_BG)
 
-            # Model 1–5 per-model scores
             for si, mn in enumerate(model_names):
                 s = scores.get(mn)
                 if s is None:
@@ -286,32 +420,86 @@ class RankingTab(ctk.CTkFrame):
                 else:
                     is_best = (col_min.get(mn) is not None and
                                abs(s - col_min[mn]) < 1e-9)
-                    bg = BEST_BG if is_best else "transparent"
-                    cell(3 + si, f"{s:.4f}", txt=_model_score_col(s, mn), bg=bg)
+                    cell(3 + si, f"{s:.4f}",
+                         txt=_model_score_col(s, mn),
+                         bg=BEST_BG if is_best else "transparent")
 
             self._add_thumb(body, path, grid_row, col=8, label="best attack")
             cell(9, ts[:19].replace("T", " ") if ts else "—", txt="#666")
 
-        total = len(leaderboard)
         self._standings_summary.configure(
             text=f"{total} participant(s) — ranked by best avg score ASC  •  "
                  f"Model 1–{len(model_names)} = per-model similarity  •  "
-                 f"highlighted = ranking basis / column best")
+                 f"showing {start + 1}–{end}")
+        self._st_lbl_page.configure(
+            text=f"Page {self._st_page + 1} / {total_pages}")
+        self._st_btn_prev.configure(
+            state="normal" if self._st_page > 0 else "disabled")
+        self._st_btn_next.configure(
+            state="normal" if self._st_page < total_pages - 1 else "disabled")
 
     # ── All Images ────────────────────────────────────────────────────────────
 
     def _refresh_all_images(self) -> None:
-        body = self._all_body
-        for w in body.winfo_children():
-            w.destroy()
+        """
+        Called when the model dropdown changes OR on an explicit Refresh.
+        Rebuilds the cache for the selected model, resets to page 0, renders.
+        """
+        selected = self._model_var.get()
 
-        is_average = (self._model_var.get() == _ALL_MODELS)
-        self._draw_all_header(body, is_average)
-
-        if is_average:
-            self._populate_average(body)
+        # ── Rebuild cache ─────────────────────────────────────────────────────
+        if selected == _ALL_MODELS:
+            all_rows = self._db.get_ranking(model_name=None, limit=10_000)
+            groups: dict = {}
+            for r in all_rows:
+                groups.setdefault((r.image_path, r.attacker_name), []).append(r)
+            averaged = []
+            for (img_path, attacker), rows in groups.items():
+                avg     = sum(r.similarity_score for r in rows) / len(rows)
+                closest = next((r.matched_image_path for r in rows
+                                if r.matched_image_path), "")
+                averaged.append({"attacker": attacker, "avg_score": avg,
+                                 "image_path": img_path, "closest_path": closest,
+                                 "created_at": rows[0].created_at})
+            averaged.sort(key=lambda x: x["avg_score"])
+            self._all_cache = averaged
         else:
-            self._populate_model(body, self._model_var.get())
+            rows = self._db.get_ranking(model_name=selected, limit=10_000)
+            self._all_cache = [
+                {"attacker": r.attacker_name, "avg_score": r.similarity_score,
+                 "image_path": r.image_path, "closest_path": r.matched_image_path,
+                 "created_at": r.created_at}
+                for r in rows
+            ]
+
+        self._all_cache_model = selected
+        self._all_page = 0
+        self._render_all_page()
+
+    # ── Pagination helpers ────────────────────────────────────────────────────
+
+    def _page_prev(self) -> None:
+        if self._all_page > 0:
+            self._all_page -= 1
+            self._render_all_page()
+
+    def _page_next(self) -> None:
+        total_pages = max(1, -(-len(self._all_cache) // _PAGE_SIZE))  # ceil div
+        if self._all_page < total_pages - 1:
+            self._all_page += 1
+            self._render_all_page()
+
+    def _page_goto(self) -> None:
+        total_pages = max(1, -(-len(self._all_cache) // _PAGE_SIZE))
+        try:
+            target = int(self._entry_page.get().strip()) - 1  # convert to 0-based
+        except ValueError:
+            self._entry_page.delete(0, "end")
+            return
+        target = max(0, min(target, total_pages - 1))
+        self._all_page = target
+        self._entry_page.delete(0, "end")
+        self._render_all_page()
 
     def _draw_all_header(self, body, is_average: bool) -> None:
         score_label = "Avg Similarity ↓" if is_average else "Similarity ↓"
@@ -324,52 +512,61 @@ class RankingTab(ctk.CTkFrame):
                          anchor="center").grid(
                 row=0, column=col, padx=2, pady=(4, 4), sticky="ew")
 
-    def _populate_average(self, body) -> None:
-        all_rows = self._db.get_ranking(model_name=None, limit=10_000)
-        if not all_rows:
+    def _render_all_page(self) -> None:
+        """
+        Destroy existing rows and render only the current page slice.
+        No DB query — works entirely from self._all_cache.
+        """
+        body = self._all_body
+        # Clear old widgets
+        for w in body.winfo_children():
+            w.destroy()
+        self._thumb_refs.clear()
+
+        is_average = (self._all_cache_model == _ALL_MODELS)
+        self._draw_all_header(body, is_average)
+
+        data  = self._all_cache
+        total = len(data)
+
+        if total == 0:
             ctk.CTkLabel(body, text="No records yet.",
                          font=ctk.CTkFont(size=12), text_color="#555").grid(
                 row=1, column=0, columnspan=7, pady=30)
             self._all_summary.configure(text="0 records.")
+            self._lbl_page.configure(text="")
+            self._btn_prev.configure(state="disabled")
+            self._btn_next.configure(state="disabled")
             return
 
-        groups: dict = {}
-        for r in all_rows:
-            groups.setdefault((r.image_path, r.attacker_name), []).append(r)
+        total_pages = max(1, -(-total // _PAGE_SIZE))
+        self._all_page = max(0, min(self._all_page, total_pages - 1))
 
-        averaged = []
-        for (img_path, attacker), rows in groups.items():
-            avg     = sum(r.similarity_score for r in rows) / len(rows)
-            closest = next((r.matched_image_path for r in rows
-                            if r.matched_image_path), "")
-            averaged.append({"attacker": attacker, "avg_score": avg,
-                             "image_path": img_path, "closest_path": closest,
-                             "created_at": rows[0].created_at})
-        averaged.sort(key=lambda x: x["avg_score"])
+        start = self._all_page * _PAGE_SIZE
+        end   = min(start + _PAGE_SIZE, total)
+        page_data = data[start:end]
 
-        for rank, entry in enumerate(averaged, start=1):
-            self._all_row_cells(body, rank, rank, entry["attacker"],
-                                entry["avg_score"], entry["image_path"],
-                                entry["closest_path"], entry["created_at"])
+        # Global rank = position in the full sorted list (1-based)
+        for local_idx, entry in enumerate(page_data):
+            global_rank = start + local_idx + 1
+            grid_row    = local_idx + 1   # header is row 0
+            self._all_row_cells(body, grid_row, global_rank,
+                                entry["attacker"], entry["avg_score"],
+                                entry["image_path"], entry["closest_path"],
+                                entry["created_at"])
 
+        # Update summary and pagination controls
+        label = "average similarity" if is_average else "similarity"
         self._all_summary.configure(
-            text=f"{len(averaged)} image(s) — average similarity ASC")
+            text=f"{total} image(s) — {label} ASC  •  "
+                 f"showing {start + 1}–{end}")
 
-    def _populate_model(self, body, model_name: str) -> None:
-        rows = self._db.get_ranking(model_name=model_name, limit=200)
-        if not rows:
-            ctk.CTkLabel(body, text="No records yet.",
-                         font=ctk.CTkFont(size=12), text_color="#555").grid(
-                row=1, column=0, columnspan=7, pady=30)
-            self._all_summary.configure(text="0 records.")
-            return
-
-        for rank, row in enumerate(rows, start=1):
-            self._all_row_cells(body, rank, rank, row.attacker_name,
-                                row.similarity_score, row.image_path,
-                                row.matched_image_path, row.created_at)
-
-        self._all_summary.configure(text=f"{len(rows)} record(s) — similarity ASC")
+        self._lbl_page.configure(
+            text=f"Page {self._all_page + 1} / {total_pages}")
+        self._btn_prev.configure(
+            state="normal" if self._all_page > 0 else "disabled")
+        self._btn_next.configure(
+            state="normal" if self._all_page < total_pages - 1 else "disabled")
 
     def _all_row_cells(self, body, grid_row: int, rank: int, attacker: str,
                        score: float, img_path: str, closest_path: str,
@@ -400,19 +597,43 @@ class RankingTab(ctk.CTkFrame):
                          font=ctk.CTkFont(size=11)).grid(
                 row=grid_row, column=col, padx=4, pady=2)
             return
-        try:
-            img = Image.open(path).convert("RGB")
-            img.thumbnail((_THUMB, _THUMB))
-            ctk_img = ctk.CTkImage(light_image=img, dark_image=img,
+
+        # Place a lightweight placeholder immediately so the row renders at
+        # the right height without blocking on disk I/O.
+        placeholder = ctk.CTkLabel(body, text="…", text_color="#444",
+                                   font=ctk.CTkFont(size=11),
+                                   width=_THUMB, height=_THUMB)
+        placeholder.grid(row=grid_row, column=col, padx=4, pady=2)
+
+        def _load() -> None:
+            # Only PIL work here (disk I/O + resize) — no Tk/CTk objects
+            try:
+                img = Image.open(path).convert("RGB")
+                img.thumbnail((_THUMB, _THUMB))
+                out = Image.new("RGB", (_THUMB, _THUMB), (30, 30, 42))
+                out.paste(img, ((_THUMB - img.width) // 2,
+                                (_THUMB - img.height) // 2))
+            except Exception:
+                return
+            # Hand the PIL image to the main thread for CTkImage creation
+            self.after(0, lambda: _apply(out))
+
+        def _apply(pil_img) -> None:
+            # All Tk/CTk object creation must happen on the main thread
+            try:
+                if not placeholder.winfo_exists():
+                    return
+            except Exception:
+                return
+            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img,
                                    size=(_THUMB, _THUMB))
-            lbl = ctk.CTkLabel(body, image=ctk_img, text="", cursor="hand2")
-            lbl.grid(row=grid_row, column=col, padx=4, pady=2)
-            lbl.bind("<Button-1>", lambda e, p=path, t=label: self._open_viewer(p, t))
             self._thumb_refs.append(ctk_img)
-        except Exception:
-            ctk.CTkLabel(body, text="?", text_color="#555",
-                         font=ctk.CTkFont(size=11)).grid(
-                row=grid_row, column=col, padx=4, pady=2)
+            placeholder.configure(image=ctk_img, text="",
+                                  cursor="hand2", width=_THUMB, height=_THUMB)
+            placeholder.bind("<Button-1>",
+                             lambda e, p=path, t=label: self._open_viewer(p, t))
+
+        threading.Thread(target=_load, daemon=True).start()
 
     def _add_delete_btn(self, body, image_path: str, grid_row: int,
                         col: int) -> None:
