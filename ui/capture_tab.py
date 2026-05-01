@@ -53,6 +53,7 @@ class CaptureTab(ctk.CTkFrame):
         self._pending_frame:  Image.Image | None = None   # aligned or fallback
         self._raw_frame:      Image.Image | None = None   # centre-cropped fallback
         self._original_frame: Image.Image | None = None   # full untouched original (for HQ companion)
+        self._pending_source: str = "camera"   # "camera" or "upload" — drives retake behaviour
         self._on_image_accepted = None
         self._review_image: Image.Image | None = None    # image shown in review canvas
 
@@ -189,6 +190,10 @@ class CaptureTab(ctk.CTkFrame):
         ctk.CTkButton(self._review_frame, text="✓  Accept", width=110,
                       fg_color="#004d00", hover_color="#007700",
                       command=self._accept_frame).pack(side="left", padx=6)
+        ctk.CTkButton(self._review_frame, text="✎  Realign", width=110,
+                      fg_color="#7a5c00", hover_color="#a87b00",
+                      text_color="#fff8dc",
+                      command=self._open_realign).pack(side="left", padx=6)
         ctk.CTkButton(self._review_frame, text="✗  Retake", width=110,
                       fg_color="#5a0000", hover_color="#8b0000",
                       command=self._retake_frame).pack(side="left", padx=6)
@@ -205,6 +210,10 @@ class CaptureTab(ctk.CTkFrame):
         ctk.CTkButton(self._fail_frame, text="💾  Save Unprocessed", width=160,
                       fg_color="#5a3a00", hover_color="#8b5a00",
                       command=self._accept_unprocessed).pack(side="left", padx=4)
+        ctk.CTkButton(self._fail_frame, text="✎  Realign", width=110,
+                      fg_color="#7a5c00", hover_color="#a87b00",
+                      text_color="#fff8dc",
+                      command=self._open_realign).pack(side="left", padx=4)
         ctk.CTkButton(self._fail_frame, text="✗  Retake", width=110,
                       fg_color="#5a0000", hover_color="#8b0000",
                       command=self._retake_frame).pack(side="left", padx=4)
@@ -385,6 +394,7 @@ class CaptureTab(ctk.CTkFrame):
             self._review_frame.grid_remove()
             self._pending_frame  = None
             self._original_frame = None
+            self._pending_source = "camera"
             self._review_image   = None
             threading.Thread(target=self._camera_loop, args=(my_gen,), daemon=True).start()
 
@@ -446,6 +456,7 @@ class CaptureTab(ctk.CTkFrame):
             self._capture_btn.configure(state="disabled")
         self._original_frame = raw                # full untouched original
         self._raw_frame = _center_crop_square(raw)
+        self._pending_source = "upload"
         self._status.configure(text="Detecting face in uploaded image…", text_color="#aaa")
         threading.Thread(target=self._detect_and_review, args=(raw,), daemon=True).start()
 
@@ -469,6 +480,7 @@ class CaptureTab(ctk.CTkFrame):
         raw = Image.fromarray(frame)
         self._original_frame = raw                # full untouched frame
         self._raw_frame = _center_crop_square(raw)
+        self._pending_source = "camera"
 
         # Run face detection in background so UI stays responsive
         threading.Thread(target=self._detect_and_review,
@@ -557,12 +569,21 @@ class CaptureTab(ctk.CTkFrame):
             self._save_and_finish(self._raw_frame)
 
     def _retake_frame(self) -> None:
+        was_upload = (self._pending_source == "upload")
+
         self._pending_frame  = None
         self._raw_frame      = None
         self._original_frame = None
         self._review_image   = None
         self._review_frame.grid_remove()
         self._fail_frame.grid_remove()
+
+        if was_upload:
+            self._status.configure(text="Idle. Upload an image or start the camera.",
+                                   text_color="#888")
+            self._upload_image()
+            return
+
         self._camera.close()
         self._running = True
         self._thread_gen += 1
@@ -572,6 +593,12 @@ class CaptureTab(ctk.CTkFrame):
         self._capture_btn.configure(state="normal")
         self._status.configure(text="Camera running.", text_color="#888")
         threading.Thread(target=self._camera_loop, args=(my_gen,), daemon=True).start()
+
+    def _open_realign(self) -> None:
+        """Placeholder — manual realignment UI to be wired up."""
+        self._status.configure(
+            text="Manual realignment is not yet wired up.",
+            text_color="#ffd166")
 
 
     # ── Cleanup ───────────────────────────────────────────────────────────────

@@ -104,6 +104,7 @@ class RecognitionTab(ctk.CTkFrame):
         self._pending_frame:  Image.Image | None = None
         self._raw_frame:      Image.Image | None = None
         self._original_frame: Image.Image | None = None   # full untouched original (for HQ companion)
+        self._pending_source: str = "camera"   # "camera" or "upload" — drives retake behaviour
         self._thumb_refs: list = []
         self._ranking_tab = None   # set by main.py after construction
         self._current_scores: dict[str, float | None] = {}  # last known score per model
@@ -245,9 +246,34 @@ class RecognitionTab(ctk.CTkFrame):
             fg_color="#2a2a4a", hover_color="#3a3a6a",
             command=self._upload_image).pack(side="left", padx=4)
 
+        # Detection-threshold slider (session-only).
+        # The displayed value is MTCNN's O-Net (final-stage) confidence
+        # threshold — i.e. detections must score ≥ this value to be returned.
+        # Default 0.63 matches MTCNN's stock 0.7 multiplied by 0.9, slightly
+        # more permissive than upstream defaults so adversarial faces still
+        # detect. Internally we keep the original 6:7 ratio for P-Net.
+        thr_frame = ctk.CTkFrame(cam_col, fg_color="transparent")
+        thr_frame.grid(row=4, column=0, pady=(2, 2), sticky="ew")
+        thr_frame.columnconfigure(1, weight=1)
+        ctk.CTkLabel(thr_frame, text="Detection threshold:",
+                     font=ctk.CTkFont(size=10), text_color="#888").grid(
+            row=0, column=0, padx=(8, 6), sticky="w")
+        self._thr_value = 0.63   # default O-Net threshold
+        # Range 0.35–0.70 with 0.01 granularity → 35 steps.
+        self._thr_slider = ctk.CTkSlider(
+            thr_frame, from_=0.35, to=0.70, number_of_steps=35,
+            command=self._on_threshold_changed)
+        self._thr_slider.set(self._thr_value)
+        self._thr_slider.grid(row=0, column=1, padx=4, sticky="ew")
+        self._thr_value_lbl = ctk.CTkLabel(
+            thr_frame, text=f"{self._thr_value:.2f}",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#00d4ff", width=44)
+        self._thr_value_lbl.grid(row=0, column=2, padx=(2, 8))
+
         # Normal review buttons (shown after successful alignment)
         self._review_btns = ctk.CTkFrame(cam_col, fg_color="transparent")
-        self._review_btns.grid(row=4, column=0, pady=4)
+        self._review_btns.grid(row=5, column=0, pady=4)
         self._review_btns.grid_remove()
         ctk.CTkLabel(self._review_btns, text="Accept aligned face?",
                      font=ctk.CTkFont(size=11, weight="bold"),
@@ -255,13 +281,17 @@ class RecognitionTab(ctk.CTkFrame):
         ctk.CTkButton(self._review_btns, text="✓  Accept & Log", width=130,
                       fg_color="#004d00", hover_color="#007700",
                       command=self._accept_frame).pack(side="left", padx=4)
+        ctk.CTkButton(self._review_btns, text="✎  Realign", width=100,
+                      fg_color="#7a5c00", hover_color="#a87b00",
+                      text_color="#fff8dc",
+                      command=self._open_realign).pack(side="left", padx=4)
         ctk.CTkButton(self._review_btns, text="✗  Retake", width=100,
                       fg_color="#5a0000", hover_color="#8b0000",
                       command=self._retake_frame).pack(side="left", padx=4)
 
         # Detection-failed fallback buttons
         self._fail_btns = ctk.CTkFrame(cam_col, fg_color="transparent")
-        self._fail_btns.grid(row=4, column=0, pady=4)
+        self._fail_btns.grid(row=5, column=0, pady=4)
         self._fail_btns.grid_remove()
         ctk.CTkLabel(self._fail_btns, text="⚠  No face detected",
                      font=ctk.CTkFont(size=11, weight="bold"),
@@ -269,6 +299,10 @@ class RecognitionTab(ctk.CTkFrame):
         ctk.CTkButton(self._fail_btns, text="💾  Save & Log Unprocessed", width=190,
                       fg_color="#5a3a00", hover_color="#8b5a00",
                       command=self._accept_unprocessed).pack(side="left", padx=4)
+        ctk.CTkButton(self._fail_btns, text="✎  Realign", width=100,
+                      fg_color="#7a5c00", hover_color="#a87b00",
+                      text_color="#fff8dc",
+                      command=self._open_realign).pack(side="left", padx=4)
         ctk.CTkButton(self._fail_btns, text="✗  Retake", width=100,
                       fg_color="#5a0000", hover_color="#8b0000",
                       command=self._retake_frame).pack(side="left", padx=4)
@@ -276,12 +310,20 @@ class RecognitionTab(ctk.CTkFrame):
         self._status = ctk.CTkLabel(
             cam_col, text="Start camera to begin.",
             font=ctk.CTkFont(size=11), text_color="#888")
-        self._status.grid(row=5, column=0, pady=(0, 4))
+        self._status.grid(row=6, column=0, pady=(0, 2))
+
+        # Persistent detection-confidence readout (separate from _status,
+        # so it survives status overwrites like "Running inference...").
+        self._confidence_lbl = ctk.CTkLabel(
+            cam_col, text="",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#888")
+        self._confidence_lbl.grid(row=7, column=0, pady=(0, 4))
 
         # ── Image Summary (shown after accept) ────────────────────────────────
         self._img_summary_frame = ctk.CTkFrame(
             cam_col, corner_radius=8, fg_color=("#0d1b2a", "#0d1b2a"))
-        self._img_summary_frame.grid(row=6, column=0, sticky="ew", pady=(4, 6))
+        self._img_summary_frame.grid(row=8, column=0, sticky="ew", pady=(4, 6))
         self._img_summary_frame.columnconfigure(1, weight=1)
         self._img_summary_frame.grid_remove()
 
@@ -937,7 +979,9 @@ class RecognitionTab(ctk.CTkFrame):
             self._review_btns.grid_remove()
             self._pending_frame  = None
             self._original_frame = None
+            self._pending_source = "camera"
             self._review_image   = None
+            self._set_confidence_label(None)
             self._status.configure(text="Camera running.", text_color="#888")
             threading.Thread(target=self._camera_loop, args=(my_gen,), daemon=True).start()
 
@@ -997,6 +1041,7 @@ class RecognitionTab(ctk.CTkFrame):
             self._capture_btn.configure(state="disabled")
         self._original_frame = raw                # full untouched original
         self._raw_frame = _center_crop_square(raw)
+        self._pending_source = "upload"
         self._status.configure(text="Detecting face in uploaded image…", text_color="#aaa")
         threading.Thread(target=self._detect_and_review, args=(raw,), daemon=True).start()
 
@@ -1016,23 +1061,30 @@ class RecognitionTab(ctk.CTkFrame):
         raw = Image.fromarray(frame)
         self._original_frame = raw                # full untouched frame
         self._raw_frame = _center_crop_square(raw)
+        self._pending_source = "camera"
         threading.Thread(target=self._detect_and_review,
                          args=(raw,), daemon=True).start()
 
     def _detect_and_review(self, raw: Image.Image) -> None:
-        result = self._aligner.align(raw)
+        result = self._aligner.align(
+            raw,
+            thresholds=self._current_thresholds(),
+            select_largest=True,
+        )
         if result.success:
-            self.after(0, self._show_aligned, result.image)
+            self.after(0, self._show_aligned, result.image, result.confidence)
         else:
             self.after(0, self._show_detection_failed, result.error)
 
-    def _show_aligned(self, aligned: Image.Image) -> None:
+    def _show_aligned(self, aligned: Image.Image,
+                      confidence: float | None = None) -> None:
         self._pending_frame = aligned
         self._show_review_image(aligned)
         self._fail_btns.grid_remove()
         self._review_btns.grid()
         self._status.configure(
             text="Face detected & aligned — accept or retake.", text_color="#00ff9f")
+        self._set_confidence_label(confidence)
 
     def _show_detection_failed(self, error: str) -> None:
         self._pending_frame = self._raw_frame
@@ -1040,6 +1092,56 @@ class RecognitionTab(ctk.CTkFrame):
         self._review_btns.grid_remove()
         self._fail_btns.grid()
         self._status.configure(text=f"⚠  {error}", text_color="#ff6b6b")
+        self._set_confidence_label(None, failed=True)
+
+    # ── Detection threshold slider ────────────────────────────────────────────
+
+    def _current_thresholds(self) -> list[float]:
+        """Map the slider's value (= O-Net threshold) to MTCNN's three-stage
+        thresholds, preserving the original 6:7 ratio from the upstream
+        defaults of [0.6, 0.7, 0.7]."""
+        s = self._thr_value
+        return [s * (6.0 / 7.0), s, s]
+
+    def _on_threshold_changed(self, value) -> None:
+        # Slider callback: snap to 0.01 granularity, update label, store for
+        # the next align() call. Detection on the current frame is not
+        # re-run — the user must click Capture / Upload / Realign.
+        self._thr_value = round(float(value), 2)
+        self._thr_value_lbl.configure(text=f"{self._thr_value:.2f}")
+
+    def _set_confidence_label(self, confidence: float | None,
+                              failed: bool = False) -> None:
+        if confidence is None:
+            if failed:
+                self._confidence_lbl.configure(
+                    text=f"Detection confidence: —  (no face at threshold ≥ {self._thr_value:.2f})",
+                    text_color="#ff6b6b")
+            else:
+                self._confidence_lbl.configure(text="", text_color="#888")
+            return
+        # The displayed confidence is on the same [0, 1] scale as the slider
+        # value. By construction it's always ≥ slider value (MTCNN's O-Net
+        # gate). Colour by headroom above that gate.
+        headroom = confidence - self._thr_value
+        if headroom >= 0.20:
+            col = "#00ff9f"
+        elif headroom >= 0.05:
+            col = "#ffd166"
+        elif headroom >= 0.0:
+            col = "#ff9f43"
+        else:
+            col = "#ff6b6b"   # shouldn't happen, defensive
+        self._confidence_lbl.configure(
+            text=f"Detection confidence: {confidence:.3f}  "
+                 f"(threshold ≥ {self._thr_value:.2f})",
+            text_color=col)
+
+    def _open_realign(self) -> None:
+        """Placeholder — manual realignment UI to be wired up."""
+        self._status.configure(
+            text="Manual realignment is not yet wired up.",
+            text_color="#ffd166")
 
     def _show_review_image(self, img: Image.Image) -> None:
         self._review_image = img   # remember for canvas resize redraws
@@ -1206,11 +1308,28 @@ class RecognitionTab(ctk.CTkFrame):
         self._run_inference(scoring_img, save_path, identity)
 
     def _retake_frame(self) -> None:
+        # Remember whether the discarded frame came from the camera or from
+        # an uploaded file — the retake action should match the original
+        # source.
+        was_upload = (self._pending_source == "upload")
+
         self._pending_frame  = None
         self._raw_frame      = None
         self._original_frame = None
         self._review_btns.grid_remove()
         self._fail_btns.grid_remove()
+        self._set_confidence_label(None)
+
+        if was_upload:
+            # Re-open the file picker; don't touch the camera state. If the
+            # user cancels the dialog, _upload_image returns silently — set
+            # an idle status so the UI doesn't look stuck mid-action.
+            self._status.configure(text="Idle. Upload an image or start the camera.",
+                                   text_color="#888")
+            self._upload_image()
+            return
+
+        # Camera path: restart the live feed.
         self._camera.close()
         self._running = True
         self._thread_gen += 1
