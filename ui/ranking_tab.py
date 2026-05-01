@@ -48,6 +48,41 @@ def _sc_col(score: float) -> str:
     return "#00ff9f" if score < _THRESHOLD else "#ff6b6b"
 
 
+def _scroll_to_top(scrollable_frame) -> None:
+    """Scroll a CTkScrollableFrame to its top.
+
+    The frame wraps a tk.Canvas exposed as ._parent_canvas. The canvas needs
+    its scrollregion settled (after fresh widgets were grid-packed inside)
+    before yview_moveto behaves correctly, so we force an idle pass first.
+    """
+    try:
+        canvas = scrollable_frame._parent_canvas
+        canvas.update_idletasks()
+        canvas.yview_moveto(0.0)
+    except Exception:
+        pass
+
+
+def _capture_scroll(scrollable_frame) -> float | None:
+    """Read current top fraction of a CTkScrollableFrame, or None on failure."""
+    try:
+        return scrollable_frame._parent_canvas.yview()[0]
+    except Exception:
+        return None
+
+
+def _restore_scroll(scrollable_frame, top: float | None) -> None:
+    """Restore scroll to a previously captured top fraction."""
+    if top is None:
+        return
+    try:
+        canvas = scrollable_frame._parent_canvas
+        canvas.update_idletasks()
+        canvas.yview_moveto(top)
+    except Exception:
+        pass
+
+
 class RankingTab(ctk.CTkFrame):
     def __init__(self, parent, db: Database, data_dir: str,
                  engine: EmbeddingEngine, capture_tab=None, recognition_tab=None):
@@ -321,12 +356,14 @@ class RankingTab(ctk.CTkFrame):
         if self._st_page > 0:
             self._st_page -= 1
             self._render_standings_page()
+            _scroll_to_top(self._standings_body)
 
     def _st_page_next(self) -> None:
         total_pages = max(1, -(-len(self._st_cache) // _PAGE_SIZE))
         if self._st_page < total_pages - 1:
             self._st_page += 1
             self._render_standings_page()
+            _scroll_to_top(self._standings_body)
 
     def _st_page_goto(self) -> None:
         total_pages = max(1, -(-len(self._st_cache) // _PAGE_SIZE))
@@ -338,6 +375,7 @@ class RankingTab(ctk.CTkFrame):
         self._st_page = max(0, min(target, total_pages - 1))
         self._st_entry_page.delete(0, "end")
         self._render_standings_page()
+        _scroll_to_top(self._standings_body)
 
     def _render_standings_page(self) -> None:
         """Render the current page slice from self._st_cache. No DB query."""
@@ -482,12 +520,14 @@ class RankingTab(ctk.CTkFrame):
         if self._all_page > 0:
             self._all_page -= 1
             self._render_all_page()
+            _scroll_to_top(self._all_body)
 
     def _page_next(self) -> None:
         total_pages = max(1, -(-len(self._all_cache) // _PAGE_SIZE))  # ceil div
         if self._all_page < total_pages - 1:
             self._all_page += 1
             self._render_all_page()
+            _scroll_to_top(self._all_body)
 
     def _page_goto(self) -> None:
         total_pages = max(1, -(-len(self._all_cache) // _PAGE_SIZE))
@@ -500,6 +540,7 @@ class RankingTab(ctk.CTkFrame):
         self._all_page = target
         self._entry_page.delete(0, "end")
         self._render_all_page()
+        _scroll_to_top(self._all_body)
 
     def _draw_all_header(self, body, is_average: bool) -> None:
         score_label = "Avg Similarity ↓" if is_average else "Similarity ↓"
@@ -615,8 +656,15 @@ class RankingTab(ctk.CTkFrame):
                                 (_THUMB - img.height) // 2))
             except Exception:
                 return
-            # Hand the PIL image to the main thread for CTkImage creation
-            self.after(0, lambda: _apply(out))
+            # Hand the PIL image to the main thread for CTkImage creation.
+            # If the widget (or the whole app) was destroyed while we were
+            # loading, .after() will raise — drop the result silently.
+            try:
+                if not self.winfo_exists():
+                    return
+                self.after(0, lambda: _apply(out))
+            except (RuntimeError, tk.TclError):
+                return
 
         def _apply(pil_img) -> None:
             # All Tk/CTk object creation must happen on the main thread
@@ -645,8 +693,39 @@ class RankingTab(ctk.CTkFrame):
         ).grid(row=grid_row, column=col, padx=4, pady=2)
 
     def _delete_row(self, image_path: str) -> None:
+        # Remember current page indices and scroll position so the refresh
+        # doesn't snap us back to page 1 / top of body.
+        # _render_*_page() already clamps the page to the new total, so if
+        # the deletion shrank the page count we'll fall back to the new
+        # last page automatically — in which case we scroll to the top of
+        # that new page rather than restoring the old scroll fraction.
+        saved_st_page    = self._st_page
+        saved_all_page   = self._all_page
+        saved_st_scroll  = _capture_scroll(self._standings_body)
+        saved_all_scroll = _capture_scroll(self._all_body)
+
         self._db.delete_attacks_by_image(image_path)
         self._refresh()
+
+        self._st_page  = saved_st_page
+        self._all_page = saved_all_page
+
+        # Re-render the visible sub-tab at the restored page, then either
+        # scroll to top (if the clamp had to drop us to an earlier page) or
+        # restore the previous scroll fraction (still on the same page).
+        if self._tabs.get() == "Current Standings":
+            self._render_standings_page()
+            if self._st_page == saved_st_page:
+                _restore_scroll(self._standings_body, saved_st_scroll)
+            else:
+                _scroll_to_top(self._standings_body)
+        else:
+            self._render_all_page()
+            if self._all_page == saved_all_page:
+                _restore_scroll(self._all_body, saved_all_scroll)
+            else:
+                _scroll_to_top(self._all_body)
+
         if self._recognition_tab is not None:
             self._recognition_tab._refresh_thumbnails()
             self._recognition_tab._refresh_best_score()

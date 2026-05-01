@@ -118,7 +118,13 @@ class EmbeddingEngine:
             if not user_dir.is_dir():
                 continue
             embeddings = []
-            for img_path in sorted(user_dir.glob("*.jpg")) + sorted(user_dir.glob("*.png")):
+            candidates = sorted(user_dir.glob("*.jpg")) + sorted(user_dir.glob("*.png"))
+            # Skip high-quality companion files (e.g. img_007_hq.png). They
+            # are not separate control images — they're an untouched copy of
+            # the same frame stored alongside the 112×112 JPEG, and including
+            # them would double-count and pollute the mean embedding.
+            candidates = [p for p in candidates if not p.stem.endswith("_hq")]
+            for img_path in candidates:
                 try:
                     face_rgb = np.array(Image.open(img_path).convert("RGB"))
                     embeddings.append(self.embed(model_name, face_rgb))

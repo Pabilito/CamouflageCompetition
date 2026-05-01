@@ -73,6 +73,15 @@ def _center_crop_square(img: Image.Image) -> Image.Image:
     return img.crop((left, top, left + side, top + side))
 
 
+def _hq_path(image_path: str | Path) -> Path:
+    """Return the companion high-quality PNG path for a given saved image path.
+
+    Example: data/adversarial/alice/img_007.jpg → data/adversarial/alice/img_007_hq.png
+    """
+    p = Path(image_path)
+    return p.with_name(p.stem + "_hq.png")
+
+
 class RecognitionTab(ctk.CTkFrame):
     def __init__(self, parent, engine: EmbeddingEngine, db: Database,
                  data_dir: str, aligner=None):
@@ -92,8 +101,9 @@ class RecognitionTab(ctk.CTkFrame):
         self._gallery_loading = False   # guard against concurrent loads
         self._photo_ref     = None
         self._score_widgets: dict = {}
-        self._pending_frame: Image.Image | None = None
-        self._raw_frame:     Image.Image | None = None
+        self._pending_frame:  Image.Image | None = None
+        self._raw_frame:      Image.Image | None = None
+        self._original_frame: Image.Image | None = None   # full untouched original (for HQ companion)
         self._thumb_refs: list = []
         self._ranking_tab = None   # set by main.py after construction
         self._current_scores: dict[str, float | None] = {}  # last known score per model
@@ -476,6 +486,9 @@ class RecognitionTab(ctk.CTkFrame):
         """
         if not self._gallery_ready:
             return  # full load still in progress; it will pick this image up
+        # Defensive: never treat the HQ companion as a separate control image.
+        if Path(image_path).stem.endswith("_hq"):
+            return
 
         def _embed():
             try:
@@ -568,9 +581,21 @@ class RecognitionTab(ctk.CTkFrame):
                     # One DB query fetches ALL cached embeddings for this model
                     cache = self._db.get_all_embeddings_for_model(model_name)
 
+                    # Purge any stale embeddings for *_hq.png companion files
+                    # (e.g. from earlier app versions that mistakenly embedded
+                    # the HQ companions). Cheap one-shot cleanup.
+                    for cached_path in list(cache.keys()):
+                        if Path(cached_path).stem.endswith("_hq"):
+                            self._db.delete_embeddings_for_path(cached_path)
+                            del cache[cached_path]
+
                     for udir in user_dirs:
                         img_paths = (sorted(udir.glob("*.jpg")) +
                                      sorted(udir.glob("*.png")))
+                        # Skip *_hq.png companion files — they are an untouched
+                        # copy of the same frame, not a separate control image.
+                        img_paths = [p for p in img_paths
+                                     if not p.stem.endswith("_hq")]
                         if not img_paths:
                             continue
                         identity = udir.name
@@ -717,7 +742,18 @@ class RecognitionTab(ctk.CTkFrame):
 
     # ── Adversarial thumbnail strip ───────────────────────────────────────────
 
-    def _refresh_thumbnails(self) -> None:
+    def _refresh_thumbnails(self, preserve_scroll: bool = False) -> None:
+        # Capture current scroll position before destroying children, so we
+        # can put it back after rebuild. CTkScrollableFrame exposes its inner
+        # tk.Canvas as ._parent_canvas; yview() returns (top, bottom) as
+        # fractions of the total scrollable height.
+        saved_top = None
+        if preserve_scroll:
+            try:
+                saved_top = self._thumb_frame._parent_canvas.yview()[0]
+            except Exception:
+                saved_top = None
+
         for w in self._thumb_frame.winfo_children():
             w.destroy()
         self._thumb_refs.clear()
@@ -739,6 +775,8 @@ class RecognitionTab(ctk.CTkFrame):
         }
 
         images = sorted(adv_dir.glob("*.jpg")) + sorted(adv_dir.glob("*.png"))
+        # Hide *_hq.png companions — they are not separate adversarial images.
+        images = [p for p in images if not p.stem.endswith("_hq")]
         for i, p in enumerate(images):
             try:
                 img = Image.open(p).convert("RGB")
@@ -776,12 +814,28 @@ class RecognitionTab(ctk.CTkFrame):
         self._adv_count_label.configure(
             text=f"{count} image(s) saved for '{identity}'")
 
+        # Restore scroll position. The canvas needs to settle its new
+        # scrollregion after the rebuild before yview_moveto will work,
+        # so force an idle pass first.
+        if saved_top is not None:
+            try:
+                canvas = self._thumb_frame._parent_canvas
+                canvas.update_idletasks()
+                canvas.yview_moveto(saved_top)
+            except Exception:
+                pass
+
     def _thumb_context_menu(self, event, image_path: str) -> None:
         menu = tk.Menu(self, tearoff=0, bg="#1e1e2e", fg="white",
                        activebackground="#333", activeforeground="white",
                        bd=0, font=("Segoe UI", 10))
         menu.add_command(label="🔍  View full size",
                          command=lambda: self._open_viewer(image_path))
+        hq = _hq_path(image_path)
+        hq_state = "normal" if hq.exists() else "disabled"
+        menu.add_command(label="🖼  View original (high quality)",
+                         state=hq_state,
+                         command=lambda: self._open_viewer(str(hq)))
         menu.add_command(label="🔄  Recompute scores",
                          command=lambda: self._recompute_scores(image_path))
         menu.add_separator()
@@ -821,7 +875,14 @@ class RecognitionTab(ctk.CTkFrame):
             os.remove(image_path)
         except OSError:
             pass
-        self._refresh_thumbnails()
+        # Also remove the HQ companion if present.
+        hq = _hq_path(image_path)
+        if hq.exists():
+            try:
+                hq.unlink()
+            except OSError:
+                pass
+        self._refresh_thumbnails(preserve_scroll=True)
         self._refresh_best_score()
 
     def _open_viewer(self, path: str) -> None:
@@ -874,8 +935,9 @@ class RecognitionTab(ctk.CTkFrame):
             self._cam_btn.configure(text="⏹  Stop Camera")
             self._capture_btn.configure(state="normal")
             self._review_btns.grid_remove()
-            self._pending_frame = None
-            self._review_image  = None
+            self._pending_frame  = None
+            self._original_frame = None
+            self._review_image   = None
             self._status.configure(text="Camera running.", text_color="#888")
             threading.Thread(target=self._camera_loop, args=(my_gen,), daemon=True).start()
 
@@ -933,6 +995,7 @@ class RecognitionTab(ctk.CTkFrame):
             self._thread_gen += 1
             self._cam_btn.configure(text="▶  Start Camera")
             self._capture_btn.configure(state="disabled")
+        self._original_frame = raw                # full untouched original
         self._raw_frame = _center_crop_square(raw)
         self._status.configure(text="Detecting face in uploaded image…", text_color="#aaa")
         threading.Thread(target=self._detect_and_review, args=(raw,), daemon=True).start()
@@ -951,6 +1014,7 @@ class RecognitionTab(ctk.CTkFrame):
         self._status.configure(text="Detecting face…", text_color="#aaa")
 
         raw = Image.fromarray(frame)
+        self._original_frame = raw                # full untouched frame
         self._raw_frame = _center_crop_square(raw)
         threading.Thread(target=self._detect_and_review,
                          args=(raw,), daemon=True).start()
@@ -1005,7 +1069,7 @@ class RecognitionTab(ctk.CTkFrame):
             self._status.configure(
                 text=f"✓  Saved {save_path.name}  (gallery not ready — scores skipped)",
                 text_color="#ffd166")
-            self.after(50, self._refresh_thumbnails)
+            self.after(50, lambda: self._refresh_thumbnails(preserve_scroll=True))
             return
 
         def _infer():
@@ -1074,7 +1138,7 @@ class RecognitionTab(ctk.CTkFrame):
                 self._status.configure(
                     text=f"✓  Saved & logged → {save_path.name}",
                     text_color="#00ff9f")
-                self._refresh_thumbnails()
+                self._refresh_thumbnails(preserve_scroll=True)
                 if self._ranking_tab is not None:
                     self._ranking_tab._refresh()
 
@@ -1082,6 +1146,15 @@ class RecognitionTab(ctk.CTkFrame):
             self.after(0, _update_all)
 
         threading.Thread(target=_infer, daemon=True).start()
+
+    def _save_hq_companion(self, save_path: Path) -> None:
+        """Write the full untouched original next to save_path as a PNG, if available."""
+        if self._original_frame is None:
+            return
+        try:
+            self._original_frame.save(str(_hq_path(save_path)), format="PNG")
+        except Exception as exc:
+            print(f"[WARN] Could not save HQ companion: {exc}")
 
     def _accept_frame(self) -> None:
         img = self._pending_frame
@@ -1092,12 +1165,22 @@ class RecognitionTab(ctk.CTkFrame):
             identity if identity != "—" else "unknown")
         save_path = Camera.next_image_path(adv_dir)
         img.save(str(save_path), format="JPEG", quality=95)
+        self._save_hq_companion(save_path)
+        # Re-load the saved JPEG so the embedding is computed from the exact
+        # bytes that live on disk — otherwise a later "Recompute scores" would
+        # read those bytes and produce slightly different scores due to JPEG
+        # round-trip noise.
+        try:
+            scoring_img = Image.open(save_path).convert("RGB")
+        except Exception:
+            scoring_img = img   # fall back to in-memory if reload fails
         self._review_btns.grid_remove()
         self._fail_btns.grid_remove()
         self._status.configure(text="Running inference…", text_color="#aaa")
-        self._pending_frame = None
-        self._raw_frame     = None
-        self._run_inference(img, save_path, identity)
+        self._pending_frame  = None
+        self._raw_frame      = None
+        self._original_frame = None
+        self._run_inference(scoring_img, save_path, identity)
 
     def _accept_unprocessed(self) -> None:
         img = self._raw_frame
@@ -1108,16 +1191,24 @@ class RecognitionTab(ctk.CTkFrame):
             identity if identity != "—" else "unknown")
         save_path = Camera.next_image_path(adv_dir)
         img.save(str(save_path), format="JPEG", quality=95)
+        self._save_hq_companion(save_path)
+        # Re-load the saved JPEG (see _accept_frame for rationale).
+        try:
+            scoring_img = Image.open(save_path).convert("RGB")
+        except Exception:
+            scoring_img = img
         self._review_btns.grid_remove()
         self._fail_btns.grid_remove()
         self._status.configure(text="Running inference…", text_color="#aaa")
-        self._pending_frame = None
-        self._raw_frame     = None
-        self._run_inference(img, save_path, identity)
+        self._pending_frame  = None
+        self._raw_frame      = None
+        self._original_frame = None
+        self._run_inference(scoring_img, save_path, identity)
 
     def _retake_frame(self) -> None:
-        self._pending_frame = None
-        self._raw_frame     = None
+        self._pending_frame  = None
+        self._raw_frame      = None
+        self._original_frame = None
         self._review_btns.grid_remove()
         self._fail_btns.grid_remove()
         self._camera.close()

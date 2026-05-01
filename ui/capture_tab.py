@@ -27,6 +27,15 @@ def _center_crop_square(img: Image.Image) -> Image.Image:
     return img.crop((left, top, left + side, top + side))
 
 
+def _hq_path(image_path: str | Path) -> Path:
+    """Return the companion high-quality PNG path for a given saved image path.
+
+    Example: data/users/alice/img_007.jpg → data/users/alice/img_007_hq.png
+    """
+    p = Path(image_path)
+    return p.with_name(p.stem + "_hq.png")
+
+
 class CaptureTab(ctk.CTkFrame):
     def __init__(self, parent, engine: EmbeddingEngine, db: Database,
                  data_dir: str, aligner=None):
@@ -41,8 +50,9 @@ class CaptureTab(ctk.CTkFrame):
         self._current_user_id: int | None = None
         self._latest_frame  = None
         self._photo_ref     = None
-        self._pending_frame: Image.Image | None = None   # aligned or fallback
-        self._raw_frame:     Image.Image | None = None   # original pre-align crop
+        self._pending_frame:  Image.Image | None = None   # aligned or fallback
+        self._raw_frame:      Image.Image | None = None   # centre-cropped fallback
+        self._original_frame: Image.Image | None = None   # full untouched original (for HQ companion)
         self._on_image_accepted = None
         self._review_image: Image.Image | None = None    # image shown in review canvas
 
@@ -243,7 +253,17 @@ class CaptureTab(ctk.CTkFrame):
     def _delete_user(self) -> None:
         if self._current_user_id is None:
             return
+        # Resolve the user's folder before we drop the DB row, so we can
+        # also remove their saved control images (and HQ companions) from disk.
+        import shutil
+        name = self._user_var.get()
+        user_dir = Path(self._data_dir) / "users" / name
         self._db.delete_user(self._current_user_id)
+        if user_dir.exists():
+            try:
+                shutil.rmtree(user_dir)
+            except OSError as exc:
+                print(f"[WARN] Could not remove {user_dir}: {exc}")
         self._current_user_id = None
         self._refresh_user_list()
         self._clear_thumbnails()
@@ -278,6 +298,11 @@ class CaptureTab(ctk.CTkFrame):
                        bd=0, font=("Segoe UI", 10))
         menu.add_command(label="🔍  View full size",
                          command=lambda: self._open_viewer(image_path))
+        hq = _hq_path(image_path)
+        hq_state = "normal" if hq.exists() else "disabled"
+        menu.add_command(label="🖼  View original (high quality)",
+                         state=hq_state,
+                         command=lambda: self._open_viewer(str(hq)))
         menu.add_separator()
         menu.add_command(label="🗑  Delete this image",
                          command=lambda: self._delete_capture(image_path, user_id))
@@ -293,6 +318,13 @@ class CaptureTab(ctk.CTkFrame):
             os.remove(image_path)
         except OSError:
             pass
+        # Also remove the HQ companion if present.
+        hq = _hq_path(image_path)
+        if hq.exists():
+            try:
+                hq.unlink()
+            except OSError:
+                pass
         self._refresh_thumbnails(user_id)
         count = self._db.capture_count(user_id)
         self._count_label.configure(
@@ -351,8 +383,9 @@ class CaptureTab(ctk.CTkFrame):
             self._capture_btn.configure(state="normal")
             self._status.configure(text="Camera running.", text_color="#888")
             self._review_frame.grid_remove()
-            self._pending_frame = None
-            self._review_image  = None
+            self._pending_frame  = None
+            self._original_frame = None
+            self._review_image   = None
             threading.Thread(target=self._camera_loop, args=(my_gen,), daemon=True).start()
 
     def _camera_loop(self, gen: int) -> None:
@@ -411,6 +444,7 @@ class CaptureTab(ctk.CTkFrame):
             self._thread_gen += 1
             self._cam_btn.configure(text="▶  Start Camera")
             self._capture_btn.configure(state="disabled")
+        self._original_frame = raw                # full untouched original
         self._raw_frame = _center_crop_square(raw)
         self._status.configure(text="Detecting face in uploaded image…", text_color="#aaa")
         threading.Thread(target=self._detect_and_review, args=(raw,), daemon=True).start()
@@ -433,6 +467,7 @@ class CaptureTab(ctk.CTkFrame):
         self._status.configure(text="Detecting face…", text_color="#aaa")
 
         raw = Image.fromarray(frame)
+        self._original_frame = raw                # full untouched frame
         self._raw_frame = _center_crop_square(raw)
 
         # Run face detection in background so UI stays responsive
@@ -491,14 +526,21 @@ class CaptureTab(ctk.CTkFrame):
         user_dir  = Path(self._data_dir) / "users" / user_row.name
         save_path = Camera.next_image_path(user_dir)
         img.save(str(save_path), format="JPEG", quality=95)
+        # Save the full untouched original as a lossless PNG companion.
+        if self._original_frame is not None:
+            try:
+                self._original_frame.save(str(_hq_path(save_path)), format="PNG")
+            except Exception as exc:
+                print(f"[WARN] Could not save HQ companion: {exc}")
         self._db.add_capture(user_row.id, str(save_path))
         count = self._db.capture_count(user_row.id)
         self._count_label.configure(text=f"{count} image(s) saved for '{user_row.name}'")
         self._status.configure(text=f"✓  Saved {save_path.name}", text_color="#00ff9f")
         self._refresh_thumbnails(user_row.id)
-        self._pending_frame = None
-        self._raw_frame     = None
-        self._review_image  = None
+        self._pending_frame  = None
+        self._raw_frame      = None
+        self._original_frame = None
+        self._review_image   = None
         self._review_frame.grid_remove()
         self._fail_frame.grid_remove()
         if self._on_image_accepted is not None:
@@ -515,9 +557,10 @@ class CaptureTab(ctk.CTkFrame):
             self._save_and_finish(self._raw_frame)
 
     def _retake_frame(self) -> None:
-        self._pending_frame = None
-        self._raw_frame     = None
-        self._review_image  = None
+        self._pending_frame  = None
+        self._raw_frame      = None
+        self._original_frame = None
+        self._review_image   = None
         self._review_frame.grid_remove()
         self._fail_frame.grid_remove()
         self._camera.close()
