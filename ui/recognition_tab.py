@@ -360,14 +360,17 @@ class RecognitionTab(ctk.CTkFrame):
         self._classify_frame.grid(row=6, column=0, pady=4, sticky="ew")
         self._classify_frame.grid_remove()
 
+        # Use a single centered column for classify_frame contents
+        self._classify_frame.columnconfigure(0, weight=1)
+
         ctk.CTkLabel(self._classify_frame, text="Classify this image:",
                      font=ctk.CTkFont(size=11, weight="bold"),
                      text_color="#ffd166").grid(
-            row=0, column=0, columnspan=7, padx=10, pady=(8, 4), sticky="w")
+            row=0, column=0, padx=10, pady=(8, 4))
 
         # Pattern buttons: ∅ (none) and 1–5
         pat_row = ctk.CTkFrame(self._classify_frame, fg_color="transparent")
-        pat_row.grid(row=1, column=0, columnspan=7, padx=10, pady=2, sticky="ew")
+        pat_row.grid(row=1, column=0, padx=10, pady=2)
         ctk.CTkLabel(pat_row, text="Pattern:",
                      font=ctk.CTkFont(size=10), text_color="#888").pack(
             side="left", padx=(0, 6))
@@ -382,7 +385,7 @@ class RecognitionTab(ctk.CTkFrame):
 
         # Pose checkboxes: frontal, profile (yaw), pitch
         pose_row = ctk.CTkFrame(self._classify_frame, fg_color="transparent")
-        pose_row.grid(row=2, column=0, columnspan=7, padx=10, pady=2, sticky="ew")
+        pose_row.grid(row=2, column=0, padx=10, pady=2)
         ctk.CTkLabel(pose_row, text="Pose:",
                      font=ctk.CTkFont(size=10), text_color="#888").pack(
             side="left", padx=(0, 6))
@@ -403,7 +406,7 @@ class RecognitionTab(ctk.CTkFrame):
         ctk.CTkButton(self._classify_frame, text="✓  Confirm & Score", width=200,
                       fg_color="#004d00", hover_color="#007700",
                       command=self._confirm_classification).grid(
-            row=3, column=0, columnspan=7, padx=10, pady=(6, 8))
+            row=3, column=0, padx=10, pady=(6, 8))
 
         self._status = ctk.CTkLabel(
             cam_col, text="Start camera to begin.",

@@ -683,7 +683,7 @@ class RankingTab(ctk.CTkFrame):
                 row=grid_row, column=col, padx=4, pady=2)
             return
 
-        # Container frame: thumbnail image + optional tag badge below
+        # Container frame: thumbnail image + optional tag badge to the right
         container = ctk.CTkFrame(body, fg_color="transparent")
         container.grid(row=grid_row, column=col, padx=4, pady=2)
 
@@ -692,7 +692,7 @@ class RankingTab(ctk.CTkFrame):
         placeholder = ctk.CTkLabel(container, text="…", text_color="#444",
                                    font=ctk.CTkFont(size=11),
                                    width=_THUMB, height=_THUMB)
-        placeholder.pack()
+        placeholder.pack(side="left")
 
         # Tag badge (drawn immediately — no I/O needed)
         if tags:
@@ -701,7 +701,7 @@ class RankingTab(ctk.CTkFrame):
             badge_col = _PATTERN_COLOURS.get(pid, "#555")
             ctk.CTkLabel(container, text=badge,
                          font=ctk.CTkFont(size=7),
-                         text_color=badge_col).pack()
+                         text_color=badge_col).pack(side="left", padx=(3, 0))
 
         def _load() -> None:
             # Only PIL work here (disk I/O + resize) — no Tk/CTk objects
