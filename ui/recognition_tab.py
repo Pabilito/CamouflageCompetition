@@ -44,7 +44,7 @@ THRESHOLDS_LFW: dict[str, float] = {
     "edgeface_base":            0.2066,
 }
 
-# LFW recognition accuracy (%) for each model, normalised to [0, 1] for the bar
+# Cross-benchmark (LFW, CPLFW, CFPFP, CALFW, AgeDB30) recognition accuracy (%) for each model, normalised to [0, 1] for the bar
 ACCURACY_LFW: dict[str, float] = {
     "InceptionResnetCASIA":     90.18284 / 100,
     "InceptionResnetV1_CASIA":  90.18284 / 100,
