@@ -39,12 +39,14 @@ def _hq_path(image_path: str | Path) -> Path:
 
 class CaptureTab(ctk.CTkFrame):
     def __init__(self, parent, engine: EmbeddingEngine, db: Database,
-                 data_dir: str, aligner=None):
+                 data_dir: str, aligner=None, camera_source=None):
         super().__init__(parent, fg_color="transparent")
         self._engine        = engine
         self._db            = db
         self._data_dir      = data_dir
-        self._camera        = Camera(index=0)
+        self._camera_source = camera_source     # may be None for legacy callers
+        self._camera        = Camera(
+            index=camera_source.current_index if camera_source else 0)
         self._aligner       = aligner or FaceAligner()
         self._running       = False
         self._thread_gen    = 0
@@ -60,6 +62,11 @@ class CaptureTab(ctk.CTkFrame):
 
         self._build_ui()
         self._refresh_user_list()
+
+        # Subscribe to camera-source changes so picking a device in the
+        # other tab also updates this tab's dropdown and live camera.
+        if self._camera_source is not None:
+            self._camera_source.subscribe(self._on_camera_source_changed)
 
     def refresh_after_clear(self) -> None:
         """Called externally (e.g. after DB wipe) to re-sync the user list."""
@@ -159,9 +166,15 @@ class CaptureTab(ctk.CTkFrame):
         self._canvas.grid(row=2, column=0, padx=14, pady=(4, 4), sticky="nsew")
         self._canvas.bind("<Configure>", self._on_canvas_resize)
 
+        # ── Camera-source selector (device dropdown + refresh) ───────────────
+        # Lets the user switch between the laptop's built-in webcam and any
+        # other DirectShow source — notably "Phone Link" virtual cameras
+        # exposed by Android phones running the Phone Link app.
+        self._build_camera_source_row(right, row=3)
+
         # Live controls
         self._live_btns = ctk.CTkFrame(right, fg_color="transparent")
-        self._live_btns.grid(row=3, column=0, pady=6)
+        self._live_btns.grid(row=4, column=0, pady=6)
 
         self._cam_btn = ctk.CTkButton(
             self._live_btns, text="▶  Start Camera", width=160,
@@ -181,7 +194,7 @@ class CaptureTab(ctk.CTkFrame):
 
         # Normal review controls (shown after successful alignment)
         self._review_frame = ctk.CTkFrame(right, fg_color="transparent")
-        self._review_frame.grid(row=4, column=0, pady=4)
+        self._review_frame.grid(row=5, column=0, pady=4)
         self._review_frame.grid_remove()
 
         ctk.CTkLabel(self._review_frame,
@@ -201,7 +214,7 @@ class CaptureTab(ctk.CTkFrame):
 
         # Detection-failed fallback controls
         self._fail_frame = ctk.CTkFrame(right, fg_color="transparent")
-        self._fail_frame.grid(row=4, column=0, pady=4)
+        self._fail_frame.grid(row=5, column=0, pady=4)
         self._fail_frame.grid_remove()
 
         ctk.CTkLabel(self._fail_frame,
@@ -222,7 +235,7 @@ class CaptureTab(ctk.CTkFrame):
         self._status = ctk.CTkLabel(
             right, text="Start the camera to begin.",
             font=ctk.CTkFont(size=11), text_color="#888")
-        self._status.grid(row=5, column=0, pady=(0, 12))
+        self._status.grid(row=6, column=0, pady=(0, 12))
 
     # ── User management ───────────────────────────────────────────────────────
 
@@ -628,6 +641,94 @@ class CaptureTab(ctk.CTkFrame):
         self._status.configure(
             text="Manually aligned — accept or retake.", text_color="#00ff9f")
 
+    # ── Camera-source selector ────────────────────────────────────────────────
+
+    def _build_camera_source_row(self, parent, *, row: int) -> None:
+        """Compact row above the live buttons: device dropdown + refresh.
+        Disabled if no camera_source was supplied (legacy mode)."""
+        bar = ctk.CTkFrame(parent, fg_color="transparent")
+        bar.grid(row=row, column=0, padx=14, pady=(2, 0), sticky="ew")
+        bar.columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            bar, text="Source:",
+            font=ctk.CTkFont(size=11), text_color="#888").grid(
+            row=0, column=0, padx=(0, 6), sticky="w")
+
+        if self._camera_source is None:
+            # Legacy mode: show an inert "Camera 0" label rather than a
+            # dropdown, so the layout still looks right.
+            ctk.CTkLabel(bar, text="Camera 0 (default)",
+                         font=ctk.CTkFont(size=11),
+                         text_color="#aaa").grid(row=0, column=1, sticky="w")
+            return
+
+        names = self._camera_source.names
+        self._device_var = ctk.StringVar(value=self._camera_source.current_name)
+        self._device_menu = ctk.CTkOptionMenu(
+            bar, variable=self._device_var, values=names,
+            command=self._on_device_picked, width=260)
+        self._device_menu.grid(row=0, column=1, padx=(0, 6), sticky="ew")
+
+        ctk.CTkButton(
+            bar, text="🔄", width=32,
+            fg_color="#2a2a4a", hover_color="#3a3a6a",
+            command=self._on_devices_refresh).grid(row=0, column=2, sticky="e")
+
+    def _on_device_picked(self, name: str) -> None:
+        """User picked a different camera in the dropdown. Update the shared
+        source — that fires the listener (incl. our own) which actually
+        rebinds the Camera and restarts the live feed if it was running."""
+        if self._camera_source is None:
+            return
+        self._camera_source.set_by_name(name)
+
+    def _on_devices_refresh(self) -> None:
+        """Re-enumerate the device list (e.g. after plugging in Phone Link).
+        ``re_enumerate`` notifies listeners with the (possibly unchanged)
+        current device, and we use that to refresh both dropdowns."""
+        if self._camera_source is None:
+            return
+        self._camera_source.re_enumerate()
+        # set_by_name only fires when the value changes, but we want the
+        # dropdown options to refresh too — do that here directly.
+        self._device_menu.configure(values=self._camera_source.names)
+        self._device_var.set(self._camera_source.current_name)
+        self._status.configure(
+            text=f"Re-enumerated cameras: "
+                 f"{len(self._camera_source.devices)} device(s) found.",
+            text_color="#00d4ff")
+
+    def _on_camera_source_changed(self, device) -> None:
+        """Listener: the shared selection changed (here or in the other
+        tab). Stop the live feed, point our Camera at the new index, and
+        restart if it had been running."""
+        was_running = self._running
+        if was_running:
+            self._camera.close()
+            self._running = False
+            self._thread_gen += 1
+            self._cam_btn.configure(text="▶  Start Camera")
+            self._capture_btn.configure(state="disabled")
+        self._camera.set_index(device.index)
+        # Update the dropdown selection in case the change came from elsewhere.
+        if hasattr(self, "_device_var"):
+            self._device_var.set(device.name)
+        if was_running:
+            # Resume on the new device.
+            self._camera.open()
+            self._running = True
+            self._thread_gen += 1
+            my_gen = self._thread_gen
+            self._cam_btn.configure(text="⏹  Stop Camera")
+            self._capture_btn.configure(state="normal")
+            self._status.configure(
+                text=f"Switched to: {device.name}", text_color="#00d4ff")
+            threading.Thread(target=self._camera_loop,
+                             args=(my_gen,), daemon=True).start()
+        else:
+            self._status.configure(
+                text=f"Camera source: {device.name}", text_color="#888")
+
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
@@ -635,4 +736,6 @@ class CaptureTab(ctk.CTkFrame):
         self._running = False
         self._thread_gen += 1
         self._camera.close()
+        if self._camera_source is not None:
+            self._camera_source.unsubscribe(self._on_camera_source_changed)
         super().destroy()

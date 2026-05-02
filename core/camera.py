@@ -44,7 +44,17 @@ class Camera:
     def open(self) -> None:
         if self._cap is not None and self._cap.isOpened():
             return
-        self._cap = cv2.VideoCapture(self._index)
+        # Use the platform's preferred backend (DirectShow on Windows). This
+        # matters because pygrabber enumerates DirectShow devices, so the
+        # numeric index we get from the dropdown is a DirectShow index — and
+        # the default backend (Media Foundation on Win11) sometimes assigns
+        # different indices to virtual cameras like Phone Link.
+        from core.camera_source import preferred_backend
+        backend = preferred_backend()
+        if backend:
+            self._cap = cv2.VideoCapture(self._index, backend)
+        else:
+            self._cap = cv2.VideoCapture(self._index)
         if not self._cap.isOpened():
             raise RuntimeError(
                 f"Could not open camera at index {self._index}. "
@@ -55,6 +65,19 @@ class Camera:
         if self._cap is not None:
             self._cap.release()
             self._cap = None
+
+    def set_index(self, index: int) -> None:
+        """Change the camera index. If the camera was open, close it; the
+        next ``open()`` will use the new index. Callers that need the new
+        device live should call ``open()`` afterwards themselves."""
+        if index == self._index:
+            return
+        was_open = self.is_open
+        self.close()
+        self._index = index
+        # We don't auto-reopen — the UI tabs need to drive that, because they
+        # also need to update labels and start their reader thread.
+        _ = was_open
 
     @property
     def is_open(self) -> bool:

@@ -85,12 +85,14 @@ def _hq_path(image_path: str | Path) -> Path:
 
 class RecognitionTab(ctk.CTkFrame):
     def __init__(self, parent, engine: EmbeddingEngine, db: Database,
-                 data_dir: str, aligner=None):
+                 data_dir: str, aligner=None, camera_source=None):
         super().__init__(parent, fg_color="transparent")
         self._engine        = engine
         self._db            = db
         self._data_dir      = data_dir
-        self._camera        = Camera(index=0)
+        self._camera_source = camera_source
+        self._camera        = Camera(
+            index=camera_source.current_index if camera_source else 0)
         self._aligner       = aligner or FaceAligner()
         self._running       = False
         self._thread_gen    = 0
@@ -112,6 +114,9 @@ class RecognitionTab(ctk.CTkFrame):
         self._review_image: Image.Image | None = None       # image shown in review canvas
 
         self._build_ui()
+
+        if self._camera_source is not None:
+            self._camera_source.subscribe(self._on_camera_source_changed)
 
     # ── Tab hooks ─────────────────────────────────────────────────────────────
 
@@ -232,8 +237,11 @@ class RecognitionTab(ctk.CTkFrame):
         self._canvas.grid(row=2, column=0, pady=(4, 4), sticky="nsew")
         self._canvas.bind("<Configure>", self._on_canvas_resize)
 
+        # ── Camera-source selector (device dropdown + refresh) ───────────────
+        self._build_camera_source_row(cam_col, row=3)
+
         cam_btns = ctk.CTkFrame(cam_col, fg_color="transparent")
-        cam_btns.grid(row=3, column=0, pady=4)
+        cam_btns.grid(row=4, column=0, pady=4)
         self._cam_btn = ctk.CTkButton(
             cam_btns, text="▶  Start Camera", width=155, command=self._toggle_camera)
         self._cam_btn.pack(side="left", padx=4)
@@ -254,7 +262,7 @@ class RecognitionTab(ctk.CTkFrame):
         # more permissive than upstream defaults so adversarial faces still
         # detect. Internally we keep the original 6:7 ratio for P-Net.
         thr_frame = ctk.CTkFrame(cam_col, fg_color="transparent")
-        thr_frame.grid(row=4, column=0, pady=(2, 2), sticky="ew")
+        thr_frame.grid(row=5, column=0, pady=(2, 2), sticky="ew")
         thr_frame.columnconfigure(1, weight=1)
         ctk.CTkLabel(thr_frame, text="Detection threshold:",
                      font=ctk.CTkFont(size=10), text_color="#888").grid(
@@ -274,7 +282,7 @@ class RecognitionTab(ctk.CTkFrame):
 
         # Normal review buttons (shown after successful alignment)
         self._review_btns = ctk.CTkFrame(cam_col, fg_color="transparent")
-        self._review_btns.grid(row=5, column=0, pady=4)
+        self._review_btns.grid(row=6, column=0, pady=4)
         self._review_btns.grid_remove()
         ctk.CTkLabel(self._review_btns, text="Accept aligned face?",
                      font=ctk.CTkFont(size=11, weight="bold"),
@@ -292,7 +300,7 @@ class RecognitionTab(ctk.CTkFrame):
 
         # Detection-failed fallback buttons
         self._fail_btns = ctk.CTkFrame(cam_col, fg_color="transparent")
-        self._fail_btns.grid(row=5, column=0, pady=4)
+        self._fail_btns.grid(row=6, column=0, pady=4)
         self._fail_btns.grid_remove()
         ctk.CTkLabel(self._fail_btns, text="⚠  No face detected",
                      font=ctk.CTkFont(size=11, weight="bold"),
@@ -311,7 +319,7 @@ class RecognitionTab(ctk.CTkFrame):
         self._status = ctk.CTkLabel(
             cam_col, text="Start camera to begin.",
             font=ctk.CTkFont(size=11), text_color="#888")
-        self._status.grid(row=6, column=0, pady=(0, 2))
+        self._status.grid(row=7, column=0, pady=(0, 2))
 
         # Persistent detection-confidence readout (separate from _status,
         # so it survives status overwrites like "Running inference...").
@@ -319,12 +327,12 @@ class RecognitionTab(ctk.CTkFrame):
             cam_col, text="",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color="#888")
-        self._confidence_lbl.grid(row=7, column=0, pady=(0, 4))
+        self._confidence_lbl.grid(row=8, column=0, pady=(0, 4))
 
         # ── Image Summary (shown after accept) ────────────────────────────────
         self._img_summary_frame = ctk.CTkFrame(
             cam_col, corner_radius=8, fg_color=("#0d1b2a", "#0d1b2a"))
-        self._img_summary_frame.grid(row=8, column=0, sticky="ew", pady=(4, 6))
+        self._img_summary_frame.grid(row=9, column=0, sticky="ew", pady=(4, 6))
         self._img_summary_frame.columnconfigure(1, weight=1)
         self._img_summary_frame.grid_remove()
 
@@ -1424,8 +1432,85 @@ class RecognitionTab(ctk.CTkFrame):
         self.after(0, self._save_note.configure,
                    {"text": f"📄 log → {log_file.name}"})
 
+    # ── Camera-source selector ────────────────────────────────────────────────
+
+    def _build_camera_source_row(self, parent, *, row: int) -> None:
+        """Compact row above the live buttons: device dropdown + refresh.
+        Disabled if no camera_source was supplied (legacy mode)."""
+        bar = ctk.CTkFrame(parent, fg_color="transparent")
+        bar.grid(row=row, column=0, padx=8, pady=(2, 0), sticky="ew")
+        bar.columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            bar, text="Source:",
+            font=ctk.CTkFont(size=11), text_color="#888").grid(
+            row=0, column=0, padx=(0, 6), sticky="w")
+
+        if self._camera_source is None:
+            ctk.CTkLabel(bar, text="Camera 0 (default)",
+                         font=ctk.CTkFont(size=11),
+                         text_color="#aaa").grid(row=0, column=1, sticky="w")
+            return
+
+        names = self._camera_source.names
+        self._device_var = ctk.StringVar(value=self._camera_source.current_name)
+        self._device_menu = ctk.CTkOptionMenu(
+            bar, variable=self._device_var, values=names,
+            command=self._on_device_picked, width=240)
+        self._device_menu.grid(row=0, column=1, padx=(0, 6), sticky="ew")
+
+        ctk.CTkButton(
+            bar, text="🔄", width=32,
+            fg_color="#2a2a4a", hover_color="#3a3a6a",
+            command=self._on_devices_refresh).grid(row=0, column=2, sticky="e")
+
+    def _on_device_picked(self, name: str) -> None:
+        if self._camera_source is None:
+            return
+        self._camera_source.set_by_name(name)
+
+    def _on_devices_refresh(self) -> None:
+        if self._camera_source is None:
+            return
+        self._camera_source.re_enumerate()
+        self._device_menu.configure(values=self._camera_source.names)
+        self._device_var.set(self._camera_source.current_name)
+        self._status.configure(
+            text=f"Re-enumerated cameras: "
+                 f"{len(self._camera_source.devices)} device(s) found.",
+            text_color="#00d4ff")
+
+    def _on_camera_source_changed(self, device) -> None:
+        """Listener for shared selection changes. Stops & restarts the live
+        feed if it was running, and updates this tab's dropdown selection."""
+        was_running = self._running
+        if was_running:
+            self._camera.close()
+            self._running = False
+            self._thread_gen += 1
+            self._cam_btn.configure(text="▶  Start Camera")
+            self._capture_btn.configure(state="disabled")
+        self._camera.set_index(device.index)
+        if hasattr(self, "_device_var"):
+            self._device_var.set(device.name)
+        if was_running:
+            self._camera.open()
+            self._running = True
+            self._thread_gen += 1
+            my_gen = self._thread_gen
+            self._cam_btn.configure(text="⏹  Stop Camera")
+            self._capture_btn.configure(state="normal")
+            self._status.configure(
+                text=f"Switched to: {device.name}", text_color="#00d4ff")
+            threading.Thread(target=self._camera_loop,
+                             args=(my_gen,), daemon=True).start()
+        else:
+            self._status.configure(
+                text=f"Camera source: {device.name}", text_color="#888")
+
     def destroy(self) -> None:
         self._running = False
         self._thread_gen += 1
         self._camera.close()
+        if self._camera_source is not None:
+            self._camera_source.unsubscribe(self._on_camera_source_changed)
         super().destroy()

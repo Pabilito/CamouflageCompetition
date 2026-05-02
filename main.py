@@ -21,6 +21,7 @@ from load_model import load_app_models
 from core.database import Database
 from core.embeddings import EmbeddingEngine
 from core.face_aligner import FaceAligner
+from core.camera_source import CameraSource
 from ui.capture_tab import CaptureTab
 from ui.recognition_tab import RecognitionTab
 from ui.ranking_tab import RankingTab
@@ -43,7 +44,8 @@ def _parse_args() -> argparse.Namespace:
 
 class App(ctk.CTk):
     def __init__(self, engine: EmbeddingEngine, db: Database,
-                 data_dir: str, aligner: FaceAligner) -> None:
+                 data_dir: str, aligner: FaceAligner,
+                 camera_source: CameraSource) -> None:
         super().__init__()
 
         self.title("Face Recognition Competition")
@@ -53,10 +55,11 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
-        self._engine   = engine
-        self._db       = db
-        self._data_dir = data_dir
-        self._aligner  = aligner
+        self._engine        = engine
+        self._db            = db
+        self._data_dir      = data_dir
+        self._aligner       = aligner
+        self._camera_source = camera_source
 
         self._build_ui()
 
@@ -94,6 +97,7 @@ class App(ctk.CTk):
             db=self._db,
             data_dir=self._data_dir,
             aligner=self._aligner,
+            camera_source=self._camera_source,
         )
         self._capture_tab.pack(fill="both", expand=True)
 
@@ -103,6 +107,7 @@ class App(ctk.CTk):
             db=self._db,
             data_dir=self._data_dir,
             aligner=self._aligner,
+            camera_source=self._camera_source,
         )
         self._recognition_tab.pack(fill="both", expand=True)
 
@@ -248,8 +253,23 @@ def main() -> None:
     aligner._get_mtcnn()   # force-load now so first capture has no delay
     print("[INFO] Face aligner ready.")
 
-    app = App(engine=engine, db=db, data_dir=args.data_dir, aligner=aligner)
-    app.protocol("WM_DELETE_WINDOW", app.on_close)
+    print("[INFO] Enumerating camera devices...")
+    from pathlib import Path
+    camera_source = CameraSource()
+    cam_config = Path(args.data_dir) / "camera.json"
+    camera_source.load_from(cam_config)
+    print(f"[INFO] Cameras: {len(camera_source.devices)} found  "
+          f"(active: {camera_source.current_name!r})")
+
+    app = App(engine=engine, db=db, data_dir=args.data_dir,
+              aligner=aligner, camera_source=camera_source)
+
+    def _on_close():
+        # Persist current selection so next launch defaults to this device.
+        camera_source.save_to(cam_config)
+        app.on_close()
+
+    app.protocol("WM_DELETE_WINDOW", _on_close)
     app.mainloop()
 
 
