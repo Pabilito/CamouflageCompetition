@@ -13,6 +13,7 @@ from core.camera import Camera
 from core.database import Database
 from core.embeddings import EmbeddingEngine
 from core.face_aligner import FaceAligner
+from ui.manual_align import open_manual_aligner
 
 _PREVIEW_SIZE = 420
 _THUMB_SIZE   = 72
@@ -595,10 +596,37 @@ class CaptureTab(ctk.CTkFrame):
         threading.Thread(target=self._camera_loop, args=(my_gen,), daemon=True).start()
 
     def _open_realign(self) -> None:
-        """Placeholder — manual realignment UI to be wired up."""
+        """Launch the manual alignment dialog on the original full-resolution
+        frame. On success the result is dropped straight into the normal
+        review/accept flow."""
+        if self._original_frame is None:
+            self._status.configure(
+                text="⚠  No image to realign. Capture or upload first.",
+                text_color="#ff6b6b")
+            return
         self._status.configure(
-            text="Manual realignment is not yet wired up.",
+            text="Manual alignment — place the 5 landmarks.",
             text_color="#ffd166")
+        open_manual_aligner(
+            self.winfo_toplevel(), self._original_frame, self._on_manual_done)
+
+    def _on_manual_done(self, aligned: Image.Image | None) -> None:
+        if aligned is None:
+            # User cancelled — restore prior status hint without changing the
+            # pending frame, so they can still Accept the (poor) auto-align
+            # or Retake.
+            self._status.configure(
+                text="Manual alignment cancelled.", text_color="#888")
+            return
+        # Treat the manual result the same as a successful auto-align: it
+        # becomes the pending frame, the review panel is shown, the failure
+        # panel (if visible) is hidden.
+        self._pending_frame = aligned
+        self._show_review_image(aligned)
+        self._fail_frame.grid_remove()
+        self._review_frame.grid()
+        self._status.configure(
+            text="Manually aligned — accept or retake.", text_color="#00ff9f")
 
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
