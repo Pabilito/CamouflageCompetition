@@ -60,6 +60,12 @@ class CaptureTab(ctk.CTkFrame):
         self._on_image_accepted = None
         self._review_image: Image.Image | None = None    # image shown in review canvas
 
+        # Live face-detection overlay state.  A background thread runs MTCNN
+        # on the latest frame every ~150 ms and stores the results here; the
+        # camera-loop draw callback reads them to paint red bounding boxes.
+        self._live_boxes: list[tuple[tuple[int,int,int,int], float]] = []
+        self._detect_lock = threading.Lock()
+
         self._build_ui()
         self._refresh_user_list()
 
@@ -410,7 +416,23 @@ class CaptureTab(ctk.CTkFrame):
             self._original_frame = None
             self._pending_source = "camera"
             self._review_image   = None
+            with self._detect_lock:
+                self._live_boxes = []
             threading.Thread(target=self._camera_loop, args=(my_gen,), daemon=True).start()
+            threading.Thread(target=self._detection_loop, args=(my_gen,), daemon=True).start()
+
+    def _detection_loop(self, gen: int) -> None:
+        """Background thread: run MTCNN on the latest frame every ~150 ms and
+        store the detected bounding boxes for the camera-loop draw callback."""
+        import time
+        while self._running and gen == self._thread_gen:
+            frame = self._latest_frame
+            if frame is not None:
+                pil = Image.fromarray(frame)
+                boxes = self._aligner.detect_boxes(pil)
+                with self._detect_lock:
+                    self._live_boxes = boxes
+            time.sleep(0.15)
 
     def _camera_loop(self, gen: int) -> None:
         while self._running and gen == self._thread_gen:
@@ -429,7 +451,11 @@ class CaptureTab(ctk.CTkFrame):
             cy = (disp_h - crop_side) // 2
             tk_img = ImageTk.PhotoImage(img_disp)
 
-            def _update(tk=tk_img, dw=disp_w, dh=disp_h, cx=cx, cy=cy, cs=crop_side):
+            with self._detect_lock:
+                boxes_snapshot = list(self._live_boxes)
+
+            def _update(tk=tk_img, dw=disp_w, dh=disp_h, cx=cx, cy=cy,
+                        cs=crop_side, sc=scale, boxes=boxes_snapshot):
                 if gen != self._thread_gen:
                     return
                 ox = (self._canvas_size - dw) // 2
@@ -439,6 +465,19 @@ class CaptureTab(ctk.CTkFrame):
                 self._canvas.create_rectangle(
                     ox + cx, oy + cy, ox + cx + cs, oy + cy + cs,
                     outline=_CROP_COLOUR, width=2)
+                # Draw live face-detection bounding boxes
+                for (bx1, by1, bx2, by2), conf in boxes:
+                    dx1 = ox + int(bx1 * sc)
+                    dy1 = oy + int(by1 * sc)
+                    dx2 = ox + int(bx2 * sc)
+                    dy2 = oy + int(by2 * sc)
+                    col = "#00ff9f" if conf >= 0.9 else "#ffd166" if conf >= 0.7 else "#ff6b6b"
+                    self._canvas.create_rectangle(
+                        dx1, dy1, dx2, dy2, outline=col, width=2)
+                    self._canvas.create_text(
+                        dx1 + 3, dy1 - 2, anchor="sw",
+                        text=f"{conf:.2f}", fill=col,
+                        font=("Courier New", 9, "bold"))
                 self._photo_ref = tk
 
             self.after(0, _update)
@@ -606,7 +645,10 @@ class CaptureTab(ctk.CTkFrame):
         self._cam_btn.configure(text="⏹  Stop Camera")
         self._capture_btn.configure(state="normal")
         self._status.configure(text="Camera running.", text_color="#888")
+        with self._detect_lock:
+            self._live_boxes = []
         threading.Thread(target=self._camera_loop, args=(my_gen,), daemon=True).start()
+        threading.Thread(target=self._detection_loop, args=(my_gen,), daemon=True).start()
 
     def _open_realign(self) -> None:
         """Launch the manual alignment dialog on the original full-resolution
@@ -723,7 +765,11 @@ class CaptureTab(ctk.CTkFrame):
             self._capture_btn.configure(state="normal")
             self._status.configure(
                 text=f"Switched to: {device.name}", text_color="#00d4ff")
+            with self._detect_lock:
+                self._live_boxes = []
             threading.Thread(target=self._camera_loop,
+                             args=(my_gen,), daemon=True).start()
+            threading.Thread(target=self._detection_loop,
                              args=(my_gen,), daemon=True).start()
         else:
             self._status.configure(

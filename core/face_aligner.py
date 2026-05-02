@@ -80,6 +80,38 @@ class FaceAligner:
             )
         return self._mtcnn
 
+    def detect_boxes(
+        self,
+        image: Image.Image,
+        thresholds: list[float] | None = None,
+    ) -> list[tuple[tuple[int, int, int, int], float]]:
+        """
+        Lightweight detection-only call for live preview overlays.
+
+        Returns a list of (bbox, confidence) tuples for every face found.
+        Each bbox is (x1, y1, x2, y2) in image pixel coordinates.
+        Returns an empty list if nothing is detected or on error.
+        """
+        try:
+            mtcnn = self._get_mtcnn()
+            mtcnn.thresholds = list(thresholds) if thresholds is not None \
+                               else list(_DEFAULT_THRESHOLDS)
+            boxes, probs, _ = mtcnn.detect(image, landmarks=True)
+            if boxes is None or probs is None:
+                return []
+            results = []
+            for i in range(len(boxes)):
+                if boxes[i] is None or probs[i] is None:
+                    continue
+                b = boxes[i]
+                results.append((
+                    (int(b[0]), int(b[1]), int(b[2]), int(b[3])),
+                    float(probs[i]),
+                ))
+            return results
+        except Exception:
+            return []
+
     def align(
         self,
         image: Image.Image,

@@ -149,6 +149,10 @@ The **ranking metric** is the average across all 5 models of the worst-case scor
 
 The Adversarial Pictures tab includes an adjustable **detection threshold** slider (range 0.35–0.70, default 0.63). This controls MTCNN's O-Net confidence gate — lowering it makes face detection more permissive, which can help when adversarial camouflage causes weak detections. The detection confidence of each accepted face is displayed below the camera preview.
 
+### Live Face Detection Overlay
+
+While the camera is running in either tab, a background thread runs MTCNN face detection on the latest frame approximately every 150 ms. Detected faces are drawn as colour-coded bounding boxes on the live preview, with the detection confidence displayed above each box. The box colour indicates confidence level: green (≥ 0.9), yellow (≥ 0.7), or red (< 0.7). In the Adversarial Pictures tab, the live detection respects the current detection threshold slider setting. This overlay helps users frame their face correctly before capturing and gives immediate visual feedback on whether adversarial camouflage is affecting detectability.
+
 ### Embedding Cache
 
 Embeddings for control pictures are stored in the `embeddings` table of the SQLite database. On subsequent gallery loads, embeddings are fetched in bulk rather than recomputed, making gallery loading nearly instant after the first run.
