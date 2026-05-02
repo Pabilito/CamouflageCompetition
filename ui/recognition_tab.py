@@ -83,6 +83,34 @@ def _hq_path(image_path: str | Path) -> Path:
     return p.with_name(p.stem + "_hq.png")
 
 
+# ── Tag badge formatting ─────────────────────────────────────────────────────
+
+_PATTERN_LABELS = {0: "∅", 1: "1", 2: "2", 3: "3", 4: "4", 5: "5"}
+_PATTERN_COLOURS = {
+    0: "#555",    # unclassified — dim grey
+    1: "#e06c75", 2: "#e5c07b", 3: "#61afef",
+    4: "#c678dd", 5: "#56b6c2",
+}
+
+
+def _tag_badge_text(tags: dict) -> str:
+    """Compact badge string: 'P2 F·Y' or '∅' or 'P1 P' etc."""
+    pid = tags.get("pattern_id", 0)
+    parts = []
+    if pid > 0:
+        parts.append(f"P{pid}")
+    pose = []
+    if tags.get("is_frontal"):
+        pose.append("F")
+    if tags.get("is_profile"):
+        pose.append("Y")
+    if tags.get("is_pitch"):
+        pose.append("P")
+    if pose:
+        parts.append("·".join(pose))
+    return " ".join(parts) if parts else "∅"
+
+
 class RecognitionTab(ctk.CTkFrame):
     def __init__(self, parent, engine: EmbeddingEngine, db: Database,
                  data_dir: str, aligner=None, camera_source=None):
@@ -112,6 +140,12 @@ class RecognitionTab(ctk.CTkFrame):
         self._ranking_tab = None   # set by main.py after construction
         self._current_scores: dict[str, float | None] = {}  # last known score per model
         self._review_image: Image.Image | None = None       # image shown in review canvas
+
+        # Pending classification state — set by _accept_frame / _accept_unprocessed,
+        # consumed by _confirm_classification after the user picks tags.
+        self._pending_save_img:  Image.Image | None = None
+        self._pending_save_path: Path | None = None
+        self._pending_save_identity: str = ""
 
         # Live face-detection overlay state.
         self._live_boxes: list[tuple[tuple[int,int,int,int], float]] = []
@@ -319,6 +353,57 @@ class RecognitionTab(ctk.CTkFrame):
         ctk.CTkButton(self._fail_btns, text="✗  Retake", width=100,
                       fg_color="#5a0000", hover_color="#8b0000",
                       command=self._retake_frame).pack(side="left", padx=4)
+
+        # ── Classification panel (shown after accept, before inference) ───────
+        self._classify_frame = ctk.CTkFrame(cam_col, fg_color=("#16213e", "#16213e"),
+                                            corner_radius=8)
+        self._classify_frame.grid(row=6, column=0, pady=4, sticky="ew")
+        self._classify_frame.grid_remove()
+
+        ctk.CTkLabel(self._classify_frame, text="Classify this image:",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="#ffd166").grid(
+            row=0, column=0, columnspan=7, padx=10, pady=(8, 4), sticky="w")
+
+        # Pattern buttons: ∅ (none) and 1–5
+        pat_row = ctk.CTkFrame(self._classify_frame, fg_color="transparent")
+        pat_row.grid(row=1, column=0, columnspan=7, padx=10, pady=2, sticky="ew")
+        ctk.CTkLabel(pat_row, text="Pattern:",
+                     font=ctk.CTkFont(size=10), text_color="#888").pack(
+            side="left", padx=(0, 6))
+        self._pattern_var = tk.IntVar(value=0)
+        _PAT_LABELS = ["∅", "1", "2", "3", "4", "5"]
+        for val, label in enumerate(_PAT_LABELS):
+            ctk.CTkRadioButton(
+                pat_row, text=label, variable=self._pattern_var, value=val,
+                font=ctk.CTkFont(size=11), width=40,
+                radiobutton_width=16, radiobutton_height=16,
+            ).pack(side="left", padx=3)
+
+        # Pose checkboxes: frontal, profile (yaw), pitch
+        pose_row = ctk.CTkFrame(self._classify_frame, fg_color="transparent")
+        pose_row.grid(row=2, column=0, columnspan=7, padx=10, pady=2, sticky="ew")
+        ctk.CTkLabel(pose_row, text="Pose:",
+                     font=ctk.CTkFont(size=10), text_color="#888").pack(
+            side="left", padx=(0, 6))
+        self._frontal_var = tk.IntVar(value=0)
+        self._profile_var = tk.IntVar(value=0)
+        self._pitch_var   = tk.IntVar(value=0)
+        ctk.CTkCheckBox(pose_row, text="Frontal", variable=self._frontal_var,
+                        font=ctk.CTkFont(size=10), width=80,
+                        checkbox_width=18, checkbox_height=18).pack(side="left", padx=4)
+        ctk.CTkCheckBox(pose_row, text="Profile (yaw)", variable=self._profile_var,
+                        font=ctk.CTkFont(size=10), width=110,
+                        checkbox_width=18, checkbox_height=18).pack(side="left", padx=4)
+        ctk.CTkCheckBox(pose_row, text="Pitch", variable=self._pitch_var,
+                        font=ctk.CTkFont(size=10), width=70,
+                        checkbox_width=18, checkbox_height=18).pack(side="left", padx=4)
+
+        # Confirm button
+        ctk.CTkButton(self._classify_frame, text="✓  Confirm & Score", width=200,
+                      fg_color="#004d00", hover_color="#007700",
+                      command=self._confirm_classification).grid(
+            row=3, column=0, columnspan=7, padx=10, pady=(6, 8))
 
         self._status = ctk.CTkLabel(
             cam_col, text="Start camera to begin.",
@@ -828,6 +913,8 @@ class RecognitionTab(ctk.CTkFrame):
         score_map: dict[str, float] = {
             e["image_path"]: e["avg_score"] for e in all_ranking
         }
+        # Build a path → tags lookup (one query for all images)
+        all_tags = self._db.get_all_attack_tags()
 
         images = sorted(adv_dir.glob("*.jpg")) + sorted(adv_dir.glob("*.png"))
         # Hide *_hq.png companions — they are not separate adversarial images.
@@ -839,7 +926,7 @@ class RecognitionTab(ctk.CTkFrame):
                 ctk_img = ctk.CTkImage(light_image=img, dark_image=img,
                                        size=(_THUMB_SIZE, _THUMB_SIZE))
 
-                # Wrapper frame holds thumbnail + score label
+                # Wrapper frame holds thumbnail + score + tag badge
                 cell = ctk.CTkFrame(self._thumb_frame, fg_color="transparent")
                 cell.grid(row=i // 3, column=i % 3, padx=3, pady=3)
 
@@ -857,9 +944,21 @@ class RecognitionTab(ctk.CTkFrame):
                 else:
                     score_col  = "#555"
                     score_text = "—"
-                ctk.CTkLabel(cell, text=score_text,
+
+                # Bottom row: score on the left, tag badge on the right
+                bottom = ctk.CTkFrame(cell, fg_color="transparent")
+                bottom.pack(fill="x", pady=(1, 0))
+                ctk.CTkLabel(bottom, text=score_text,
                              font=ctk.CTkFont(size=9, weight="bold"),
-                             text_color=score_col).pack(pady=(1, 0))
+                             text_color=score_col).pack(side="left")
+
+                img_tags = all_tags.get(str(p), {})
+                pid = img_tags.get("pattern_id", 0)
+                badge = _tag_badge_text(img_tags)
+                badge_col = _PATTERN_COLOURS.get(pid, "#555")
+                ctk.CTkLabel(bottom, text=badge,
+                             font=ctk.CTkFont(size=8),
+                             text_color=badge_col).pack(side="right")
 
                 self._thumb_refs.append(ctk_img)
             except Exception:
@@ -893,6 +992,8 @@ class RecognitionTab(ctk.CTkFrame):
                          command=lambda: self._open_viewer(str(hq)))
         menu.add_command(label="🔄  Recompute scores",
                          command=lambda: self._recompute_scores(image_path))
+        menu.add_command(label="🏷  Edit tags…",
+                         command=lambda: self._edit_tags_dialog(image_path))
         menu.add_separator()
         menu.add_command(label="🗑  Delete this image",
                          command=lambda: self._delete_adversarial(image_path))
@@ -900,6 +1001,73 @@ class RecognitionTab(ctk.CTkFrame):
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def _edit_tags_dialog(self, image_path: str) -> None:
+        """Open a small modal dialog to edit pattern + pose tags for an image."""
+        current = self._db.get_attack_tags(image_path)
+
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Edit Tags")
+        dlg.geometry("340x220")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.configure(fg_color="#1a1a2e")
+
+        ctk.CTkLabel(dlg, text="Pattern:",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="#00d4ff").grid(
+            row=0, column=0, padx=12, pady=(14, 4), sticky="w")
+
+        pat_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        pat_row.grid(row=1, column=0, padx=12, pady=2, sticky="ew")
+        pat_var = tk.IntVar(value=current.get("pattern_id", 0))
+        for val, label in enumerate(["∅", "1", "2", "3", "4", "5"]):
+            ctk.CTkRadioButton(
+                pat_row, text=label, variable=pat_var, value=val,
+                font=ctk.CTkFont(size=11), width=40,
+                radiobutton_width=16, radiobutton_height=16,
+            ).pack(side="left", padx=3)
+
+        ctk.CTkLabel(dlg, text="Pose:",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="#00d4ff").grid(
+            row=2, column=0, padx=12, pady=(8, 4), sticky="w")
+
+        pose_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        pose_row.grid(row=3, column=0, padx=12, pady=2, sticky="ew")
+        fr_var = tk.IntVar(value=current.get("is_frontal", 0))
+        pr_var = tk.IntVar(value=current.get("is_profile", 0))
+        pt_var = tk.IntVar(value=current.get("is_pitch", 0))
+        ctk.CTkCheckBox(pose_row, text="Frontal", variable=fr_var,
+                        font=ctk.CTkFont(size=10), width=80,
+                        checkbox_width=18, checkbox_height=18).pack(side="left", padx=4)
+        ctk.CTkCheckBox(pose_row, text="Profile (yaw)", variable=pr_var,
+                        font=ctk.CTkFont(size=10), width=110,
+                        checkbox_width=18, checkbox_height=18).pack(side="left", padx=4)
+        ctk.CTkCheckBox(pose_row, text="Pitch", variable=pt_var,
+                        font=ctk.CTkFont(size=10), width=70,
+                        checkbox_width=18, checkbox_height=18).pack(side="left", padx=4)
+
+        def _save():
+            self._db.update_attack_tags(
+                image_path,
+                pattern_id=pat_var.get(),
+                is_frontal=fr_var.get(),
+                is_profile=pr_var.get(),
+                is_pitch=pt_var.get(),
+            )
+            dlg.destroy()
+            self._refresh_thumbnails(preserve_scroll=True)
+
+        btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        btn_row.grid(row=4, column=0, padx=12, pady=(12, 8), sticky="ew")
+        ctk.CTkButton(btn_row, text="✓  Save", width=100,
+                      fg_color="#004d00", hover_color="#007700",
+                      command=_save).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(btn_row, text="Cancel", width=80,
+                      fg_color="transparent", border_width=1,
+                      command=dlg.destroy).pack(side="left")
+        dlg.wait_window()
 
     def _recompute_scores(self, image_path: str) -> None:
         """Delete existing DB records for this image and re-run inference."""
@@ -990,6 +1158,7 @@ class RecognitionTab(ctk.CTkFrame):
             self._cam_btn.configure(text="⏹  Stop Camera")
             self._capture_btn.configure(state="normal")
             self._review_btns.grid_remove()
+            self._classify_frame.grid_remove()
             self._pending_frame  = None
             self._original_frame = None
             self._pending_source = "camera"
@@ -1238,8 +1407,11 @@ class RecognitionTab(ctk.CTkFrame):
         self._photo_ref = tk_img
 
     def _run_inference(self, img: Image.Image, save_path: Path,
-                       identity: str) -> None:
+                       identity: str,
+                       tags: dict | None = None) -> None:
         """Shared inference logic for both accept paths."""
+        tags = tags or {"pattern_id": 0, "is_frontal": 0,
+                        "is_profile": 0, "is_pitch": 0}
         if not self._gallery_ready or identity == "—":
             self._status.configure(
                 text=f"✓  Saved {save_path.name}  (gallery not ready — scores skipped)",
@@ -1300,6 +1472,10 @@ class RecognitionTab(ctk.CTkFrame):
                     image_path=str(save_path),
                     identity_name=identity,
                     matched_image_path=ranking_closest,
+                    pattern_id=tags["pattern_id"],
+                    is_frontal=tags["is_frontal"],
+                    is_profile=tags["is_profile"],
+                    is_pitch=tags["is_pitch"],
                 )
 
             def _update_all():
@@ -1317,7 +1493,7 @@ class RecognitionTab(ctk.CTkFrame):
                 if self._ranking_tab is not None:
                     self._ranking_tab._refresh()
 
-            self._write_log(identity, save_path, results)
+            self._write_log(identity, save_path, results, tags)
             self.after(0, _update_all)
 
         threading.Thread(target=_infer, daemon=True).start()
@@ -1351,11 +1527,14 @@ class RecognitionTab(ctk.CTkFrame):
             scoring_img = img   # fall back to in-memory if reload fails
         self._review_btns.grid_remove()
         self._fail_btns.grid_remove()
-        self._status.configure(text="Running inference…", text_color="#aaa")
         self._pending_frame  = None
         self._raw_frame      = None
         self._original_frame = None
-        self._run_inference(scoring_img, save_path, identity)
+        # Stash for _confirm_classification
+        self._pending_save_img      = scoring_img
+        self._pending_save_path     = save_path
+        self._pending_save_identity = identity
+        self._show_classification_panel()
 
     def _accept_unprocessed(self) -> None:
         img = self._raw_frame
@@ -1374,11 +1553,44 @@ class RecognitionTab(ctk.CTkFrame):
             scoring_img = img
         self._review_btns.grid_remove()
         self._fail_btns.grid_remove()
-        self._status.configure(text="Running inference…", text_color="#aaa")
         self._pending_frame  = None
         self._raw_frame      = None
         self._original_frame = None
-        self._run_inference(scoring_img, save_path, identity)
+        self._pending_save_img      = scoring_img
+        self._pending_save_path     = save_path
+        self._pending_save_identity = identity
+        self._show_classification_panel()
+
+    def _show_classification_panel(self) -> None:
+        """Show the pattern/pose classification panel. Resets all controls."""
+        self._pattern_var.set(0)
+        self._frontal_var.set(0)
+        self._profile_var.set(0)
+        self._pitch_var.set(0)
+        self._classify_frame.grid()
+        self._status.configure(
+            text="Classify this image, then confirm to run scoring.",
+            text_color="#ffd166")
+
+    def _confirm_classification(self) -> None:
+        """User confirmed classification — run inference with the chosen tags."""
+        img      = self._pending_save_img
+        path     = self._pending_save_path
+        identity = self._pending_save_identity
+        if img is None or path is None:
+            return
+        tags = {
+            "pattern_id": self._pattern_var.get(),
+            "is_frontal": self._frontal_var.get(),
+            "is_profile": self._profile_var.get(),
+            "is_pitch":   self._pitch_var.get(),
+        }
+        self._classify_frame.grid_remove()
+        self._status.configure(text="Running inference…", text_color="#aaa")
+        self._pending_save_img      = None
+        self._pending_save_path     = None
+        self._pending_save_identity = ""
+        self._run_inference(img, path, identity, tags=tags)
 
     def _retake_frame(self) -> None:
         # Remember whether the discarded frame came from the camera or from
@@ -1389,8 +1601,12 @@ class RecognitionTab(ctk.CTkFrame):
         self._pending_frame  = None
         self._raw_frame      = None
         self._original_frame = None
+        self._pending_save_img      = None
+        self._pending_save_path     = None
+        self._pending_save_identity = ""
         self._review_btns.grid_remove()
         self._fail_btns.grid_remove()
+        self._classify_frame.grid_remove()
         self._set_confidence_label(None)
 
         if was_upload:
@@ -1448,7 +1664,10 @@ class RecognitionTab(ctk.CTkFrame):
         return best_path
 
     def _write_log(self, identity: str, frame_path: Path,
-                   results: list[dict]) -> None:
+                   results: list[dict],
+                   tags: dict | None = None) -> None:
+        tags = tags or {"pattern_id": 0, "is_frontal": 0,
+                        "is_profile": 0, "is_pitch": 0}
         log_dir  = Path(self._data_dir) / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / f"{identity}.csv"
@@ -1457,7 +1676,8 @@ class RecognitionTab(ctk.CTkFrame):
         with open(log_file, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=[
                 "timestamp", "identity", "frame_path",
-                "model", "score", "threshold", "match", "closest_image"])
+                "model", "score", "threshold", "match", "closest_image",
+                "pattern_id", "is_frontal", "is_profile", "is_pitch"])
             if write_header:
                 writer.writeheader()
             for r in results:
@@ -1470,6 +1690,10 @@ class RecognitionTab(ctk.CTkFrame):
                     "threshold":     r["threshold"] if r["threshold"] is not None else "",
                     "match":         r["match"] if r["match"] is not None else "",
                     "closest_image": r["closest_image"],
+                    "pattern_id":    tags["pattern_id"],
+                    "is_frontal":    tags["is_frontal"],
+                    "is_profile":    tags["is_profile"],
+                    "is_pitch":      tags["is_pitch"],
                 })
         self.after(0, self._save_note.configure,
                    {"text": f"📄 log → {log_file.name}"})

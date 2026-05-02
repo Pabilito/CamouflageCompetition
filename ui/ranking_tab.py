@@ -21,6 +21,30 @@ _ALL_MODELS = "All models (average)"
 _THRESHOLD  = 0.2565
 _PAGE_SIZE  = 30
 
+# Pattern badge colours (must match recognition_tab)
+_PATTERN_COLOURS = {
+    0: "#555", 1: "#e06c75", 2: "#e5c07b", 3: "#61afef",
+    4: "#c678dd", 5: "#56b6c2",
+}
+
+
+def _tag_badge_text(tags: dict) -> str:
+    """Compact badge: 'P2 F·Y' or '∅'."""
+    pid = tags.get("pattern_id", 0)
+    parts = []
+    if pid > 0:
+        parts.append(f"P{pid}")
+    pose = []
+    if tags.get("is_frontal"):
+        pose.append("F")
+    if tags.get("is_profile"):
+        pose.append("Y")
+    if tags.get("is_pitch"):
+        pose.append("P")
+    if pose:
+        parts.append("·".join(pose))
+    return " ".join(parts) if parts else "∅"
+
 # Per-model LFW decision thresholds (match = score ≥ threshold)
 _MODEL_THRESHOLDS: dict[str, float] = {
     "IResNet_R18_Glint360K":    0.2411,
@@ -302,7 +326,12 @@ class RankingTab(ctk.CTkFrame):
                 img_scores[r.image_path] = {}
                 img_meta[r.image_path]   = {
                     "attacker":    r.attacker_name,
-                    "created_at":  r.created_at}
+                    "created_at":  r.created_at,
+                    "tags": {"pattern_id": r.pattern_id,
+                             "is_frontal": r.is_frontal,
+                             "is_profile": r.is_profile,
+                             "is_pitch":   r.is_pitch},
+                }
             img_scores[r.image_path][r.model_name] = r.similarity_score
 
         img_avg: dict[str, float] = {
@@ -342,6 +371,9 @@ class RankingTab(ctk.CTkFrame):
                 "ts":         img_meta.get(
                                   identity_best_img.get(e["identity_name"], ""),
                                   {}).get("created_at", ""),
+                "tags":       img_meta.get(
+                                  identity_best_img.get(e["identity_name"], ""),
+                                  {}).get("tags", {}),
                 "model_names": model_names,
                 "col_min":    col_min,
             }
@@ -462,7 +494,8 @@ class RankingTab(ctk.CTkFrame):
                          txt=_model_score_col(s, mn),
                          bg=BEST_BG if is_best else "transparent")
 
-            self._add_thumb(body, path, grid_row, col=8, label="best attack")
+            self._add_thumb(body, path, grid_row, col=8, label="best attack",
+                            tags=entry.get("tags"))
             cell(9, ts[:19].replace("T", " ") if ts else "—", txt="#666")
 
         self._standings_summary.configure(
@@ -496,9 +529,14 @@ class RankingTab(ctk.CTkFrame):
                 avg     = sum(r.similarity_score for r in rows) / len(rows)
                 closest = next((r.matched_image_path for r in rows
                                 if r.matched_image_path), "")
+                first   = rows[0]
                 averaged.append({"attacker": attacker, "avg_score": avg,
                                  "image_path": img_path, "closest_path": closest,
-                                 "created_at": rows[0].created_at})
+                                 "created_at": first.created_at,
+                                 "tags": {"pattern_id": first.pattern_id,
+                                          "is_frontal": first.is_frontal,
+                                          "is_profile": first.is_profile,
+                                          "is_pitch":   first.is_pitch}})
             averaged.sort(key=lambda x: x["avg_score"])
             self._all_cache = averaged
         else:
@@ -506,7 +544,11 @@ class RankingTab(ctk.CTkFrame):
             self._all_cache = [
                 {"attacker": r.attacker_name, "avg_score": r.similarity_score,
                  "image_path": r.image_path, "closest_path": r.matched_image_path,
-                 "created_at": r.created_at}
+                 "created_at": r.created_at,
+                 "tags": {"pattern_id": r.pattern_id,
+                          "is_frontal": r.is_frontal,
+                          "is_profile": r.is_profile,
+                          "is_pitch":   r.is_pitch}}
                 for r in rows
             ]
 
@@ -594,7 +636,8 @@ class RankingTab(ctk.CTkFrame):
             self._all_row_cells(body, grid_row, global_rank,
                                 entry["attacker"], entry["avg_score"],
                                 entry["image_path"], entry["closest_path"],
-                                entry["created_at"])
+                                entry["created_at"],
+                                tags=entry.get("tags"))
 
         # Update summary and pagination controls
         label = "average similarity" if is_average else "similarity"
@@ -611,7 +654,7 @@ class RankingTab(ctk.CTkFrame):
 
     def _all_row_cells(self, body, grid_row: int, rank: int, attacker: str,
                        score: float, img_path: str, closest_path: str,
-                       ts: str) -> None:
+                       ts: str, tags: dict | None = None) -> None:
         medal   = _MEDAL.get(rank)
         txt_col = medal if medal else "#e0e0e0"
 
@@ -625,26 +668,40 @@ class RankingTab(ctk.CTkFrame):
         cell("score",     f"{score:.4f}",            color=_sc_col(score))
         cell("timestamp", ts[:19].replace("T", " "), color="#666")
 
-        self._add_thumb(body, img_path,      grid_row, _C_ALL["attack"],  "attack frame")
+        self._add_thumb(body, img_path,      grid_row, _C_ALL["attack"],  "attack frame",
+                        tags=tags)
         self._add_thumb(body, closest_path,  grid_row, _C_ALL["closest"], "closest match")
         self._add_delete_btn(body, img_path, grid_row, _C_ALL["delete"])
 
     # ── Cell helpers ──────────────────────────────────────────────────────────
 
     def _add_thumb(self, body, path: str, grid_row: int, col: int,
-                   label: str) -> None:
+                   label: str, tags: dict | None = None) -> None:
         if not path:
             ctk.CTkLabel(body, text="—", text_color="#555",
                          font=ctk.CTkFont(size=11)).grid(
                 row=grid_row, column=col, padx=4, pady=2)
             return
 
+        # Container frame: thumbnail image + optional tag badge below
+        container = ctk.CTkFrame(body, fg_color="transparent")
+        container.grid(row=grid_row, column=col, padx=4, pady=2)
+
         # Place a lightweight placeholder immediately so the row renders at
         # the right height without blocking on disk I/O.
-        placeholder = ctk.CTkLabel(body, text="…", text_color="#444",
+        placeholder = ctk.CTkLabel(container, text="…", text_color="#444",
                                    font=ctk.CTkFont(size=11),
                                    width=_THUMB, height=_THUMB)
-        placeholder.grid(row=grid_row, column=col, padx=4, pady=2)
+        placeholder.pack()
+
+        # Tag badge (drawn immediately — no I/O needed)
+        if tags:
+            pid = tags.get("pattern_id", 0)
+            badge = _tag_badge_text(tags)
+            badge_col = _PATTERN_COLOURS.get(pid, "#555")
+            ctk.CTkLabel(container, text=badge,
+                         font=ctk.CTkFont(size=7),
+                         text_color=badge_col).pack()
 
         def _load() -> None:
             # Only PIL work here (disk I/O + resize) — no Tk/CTk objects

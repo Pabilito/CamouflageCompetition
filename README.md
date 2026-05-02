@@ -175,11 +175,18 @@ Supports both webcam capture and file upload. If face detection fails, the user 
 
 ### Adversarial Pictures
 
-Capture or upload adversarial attack images and score them against a selected identity. After accepting an image:
+Capture or upload adversarial attack images and score them against a selected identity. After accepting an image, a **classification panel** appears where the user assigns:
+
+- **Pattern number** (∅ for unclassified, or 1–5) to group images by adversarial strategy
+- **Pose flags** (checkboxes): Frontal, Profile (horizontal yaw), Pitch (vertical tilt)
+
+After confirming the classification, the image is:
 - Saved to `data/adversarial/<name>/img_NNN.jpg` with a lossless HQ companion
 - Scored against all control images of the selected identity across all 5 models
-- Results written to `data/logs/<name>.csv` and to the `attacks` DB table
+- Results (including tags) written to `data/logs/<name>.csv` and to the `attacks` DB table
 - Ranking tab refreshed automatically
+
+Existing images default to pattern ∅ with no pose flags. Tags can be edited at any time via the right-click context menu ("Edit tags…") on any adversarial thumbnail.
 
 The tab displays:
 - **Similarity score bars** per model with LFW thresholds and match/no-match verdicts
@@ -187,9 +194,9 @@ The tab displays:
 - **Detection confidence** readout after each face detection
 - **Image Summary** panel showing the image's average score and rank among all images
 - **Session Summary** panel showing the global best score, your best score, and your current leaderboard position
-- **Thumbnail strip** with score badges below each adversarial image
+- **Thumbnail strip** with score badges on the left and colour-coded tag badges on the right (e.g. "P2 F·Y" = pattern 2, frontal + yaw)
 
-Right-click thumbnails to view full size, view the HQ original, recompute scores, or delete.
+Right-click thumbnails to view full size, view the HQ original, recompute scores, edit tags, or delete.
 
 ### Ranking
 
@@ -197,9 +204,9 @@ The ranking tab can be **popped out** into its own standalone window via the "Po
 
 Two sub-tabs:
 
-- **Current Standings** — one row per identity showing their best (lowest average) image score, with individual per-model similarity scores. The lowest score in each model column is highlighted. Top 3 highlighted in gold/silver/bronze. Paginated (30 rows per page) with go-to-page navigation.
+- **Current Standings** — one row per identity showing their best (lowest average) image score, with individual per-model similarity scores. The lowest score in each model column is highlighted. Top 3 highlighted in gold/silver/bronze. Attack thumbnails show tag badges. Paginated (30 rows per page) with go-to-page navigation.
 
-- **All Images** — every scored image, filterable by model or showing the cross-model average. Displays attack and closest-match thumbnails (loaded asynchronously). Individual rows can be deleted. Paginated with go-to-page navigation.
+- **All Images** — every scored image, filterable by model or showing the cross-model average. Displays attack and closest-match thumbnails (loaded asynchronously) with tag badges on attack images. Individual rows can be deleted. Paginated with go-to-page navigation.
 
 #### Podium View
 
@@ -218,5 +225,5 @@ The "Clear All" button opens a dialog with two options:
 |---|---|
 | `users` | Registered identity names |
 | `captures` | Control picture paths linked to users |
-| `attacks` | Per-model similarity scores for each adversarial image |
+| `attacks` | Per-model similarity scores for each adversarial image, plus classification tags (pattern_id, is_frontal, is_profile, is_pitch) |
 | `embeddings` | Cached face embeddings (image_path × model_name → float32 BLOB) |

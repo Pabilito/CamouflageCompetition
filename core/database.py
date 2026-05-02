@@ -34,6 +34,10 @@ class AttackRow:
     identity_name:       str
     matched_image_path:  str
     created_at:          str
+    pattern_id:          int = 0
+    is_frontal:          int = 0
+    is_profile:          int = 0
+    is_pitch:            int = 0
 
 
 class Database:
@@ -100,6 +104,17 @@ class Database:
                 with self._connect() as con:
                     con.execute(
                         f"ALTER TABLE attacks ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"
+                    )
+            except Exception:
+                pass
+
+        # Tag columns: pattern_id (0 = unclassified, 1–5 = pattern number),
+        # three boolean pose flags (0/1).
+        for col in ("pattern_id", "is_frontal", "is_profile", "is_pitch"):
+            try:
+                with self._connect() as con:
+                    con.execute(
+                        f"ALTER TABLE attacks ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"
                     )
             except Exception:
                 pass
@@ -242,16 +257,22 @@ class Database:
         image_path: str,
         identity_name: str = "",
         matched_image_path: str = "",
+        pattern_id: int = 0,
+        is_frontal: int = 0,
+        is_profile: int = 0,
+        is_pitch:   int = 0,
     ) -> int:
         now = _now()
         with self._connect() as con:
             cur = con.execute(
                 "INSERT INTO attacks "
                 "(attacker_name, model_name, similarity_score, image_path, "
-                " identity_name, matched_image_path, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                " identity_name, matched_image_path, "
+                " pattern_id, is_frontal, is_profile, is_pitch, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (attacker_name, model_name, similarity_score, image_path,
-                 identity_name, matched_image_path, now),
+                 identity_name, matched_image_path,
+                 pattern_id, is_frontal, is_profile, is_pitch, now),
             )
             return cur.lastrowid
 
@@ -261,7 +282,8 @@ class Database:
         limit: int = 50,
     ) -> list[AttackRow]:
         cols = ("id, attacker_name, model_name, similarity_score, "
-                "image_path, identity_name, matched_image_path, created_at")
+                "image_path, identity_name, matched_image_path, created_at, "
+                "pattern_id, is_frontal, is_profile, is_pitch")
         with self._connect() as con:
             if model_name:
                 rows = con.execute(
@@ -282,7 +304,8 @@ class Database:
             rows = con.execute(
                 "SELECT id, attacker_name, model_name, "
                 "MIN(similarity_score) AS similarity_score, "
-                "image_path, identity_name, matched_image_path, created_at "
+                "image_path, identity_name, matched_image_path, created_at, "
+                "pattern_id, is_frontal, is_profile, is_pitch "
                 "FROM attacks WHERE model_name = ? "
                 "GROUP BY attacker_name "
                 "ORDER BY similarity_score ASC",
@@ -340,6 +363,55 @@ class Database:
                 "ORDER BY best_avg_score ASC",
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Attack tags (pattern + pose) ──────────────────────────────────────────
+
+    def get_attack_tags(self, image_path: str) -> dict:
+        """Return {pattern_id, is_frontal, is_profile, is_pitch} for an image.
+        Reads from the first attack row for that image (all rows share the same
+        tags). Returns zeros if no record exists."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT pattern_id, is_frontal, is_profile, is_pitch "
+                "FROM attacks WHERE image_path = ? LIMIT 1",
+                (image_path,),
+            ).fetchone()
+        if row is None:
+            return {"pattern_id": 0, "is_frontal": 0,
+                    "is_profile": 0, "is_pitch": 0}
+        return dict(row)
+
+    def update_attack_tags(
+        self,
+        image_path: str,
+        pattern_id: int,
+        is_frontal: int,
+        is_profile: int,
+        is_pitch:   int,
+    ) -> int:
+        """Set tags on ALL attack rows for a given image. Returns rows updated."""
+        with self._connect() as con:
+            cur = con.execute(
+                "UPDATE attacks SET pattern_id=?, is_frontal=?, "
+                "is_profile=?, is_pitch=? WHERE image_path=?",
+                (pattern_id, is_frontal, is_profile, is_pitch, image_path),
+            )
+            return cur.rowcount
+
+    def get_all_attack_tags(self) -> dict[str, dict]:
+        """Return {image_path: {pattern_id, is_frontal, is_profile, is_pitch}}
+        for every distinct image that has attack records. One DB query."""
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT DISTINCT image_path, pattern_id, is_frontal, "
+                "is_profile, is_pitch FROM attacks"
+            ).fetchall()
+        result: dict[str, dict] = {}
+        for r in rows:
+            d = dict(r)
+            path = d.pop("image_path")
+            result[path] = d
+        return result
 
 
 def _now() -> str:
