@@ -446,9 +446,10 @@ class RecognitionTab(ctk.CTkFrame):
         self._lbl_img_name      = _img_stat("Attacker:",          1)
         self._lbl_avg_score     = _img_stat("Avg score:",         2)
         self._lbl_rank          = _img_stat("Image rank:",        3)
+        self._lbl_gallery_rank  = _img_stat("Gallery search:",    4)
 
         ctk.CTkFrame(self._img_summary_frame, height=4, fg_color="transparent").grid(
-            row=4, column=0, columnspan=2)
+            row=5, column=0, columnspan=2)
 
         # ── Scores column ──────────────────────────────────────────────────────
         scores_col = ctk.CTkScrollableFrame(
@@ -822,6 +823,7 @@ class RecognitionTab(ctk.CTkFrame):
         if identity == "—":
             self._lbl_avg_score.configure(text="—", text_color="#aaa")
             self._lbl_rank.configure(text="—", text_color="#aaa")
+            self._lbl_gallery_rank.configure(text="—", text_color="#aaa")
             self._img_summary_frame.grid_remove()
             return
 
@@ -855,7 +857,8 @@ class RecognitionTab(ctk.CTkFrame):
             self._lbl_your_place.configure(
                 text=f"#{your_place} / {total_users}", text_color=place_col)
 
-    def _update_summary(self, scores: list[float], save_path: str) -> None:
+    def _update_summary(self, scores: list[float], save_path: str,
+                        gallery_search: dict | None = None) -> None:
         """Called after inference: populate and show the image summary box."""
         if not scores:
             return
@@ -877,6 +880,26 @@ class RecognitionTab(ctk.CTkFrame):
             rank_col = "#00ff9f" if rank <= max(1, total // 4) else (
                 "#ffd166" if rank <= total // 2 else "#ff6b6b")
             self._lbl_rank.configure(text=f"#{rank} / {total}", text_color=rank_col)
+
+        # Gallery search: where does the target identity rank among all identities?
+        if gallery_search and gallery_search["target_rank"] is not None:
+            grank = gallery_search["target_rank"]
+            gtotal = gallery_search["total"]
+            top1   = gallery_search["top1_name"]
+
+            if grank == 1:
+                # Target is top-1 — the attack image is most similar to the
+                # correct identity (recognition would succeed).
+                gs_col = "#ff6b6b"
+                gs_text = f"#{grank} / {gtotal}  (top match)"
+            else:
+                # Target is NOT top-1 — some other identity is more similar,
+                # meaning recognition is confused (good for the attacker).
+                gs_col = "#00ff9f"
+                gs_text = f"#{grank} / {gtotal}  (top: {top1})"
+            self._lbl_gallery_rank.configure(text=gs_text, text_color=gs_col)
+        else:
+            self._lbl_gallery_rank.configure(text="—", text_color="#aaa")
 
         self._img_summary_frame.grid()   # make visible
 
@@ -1426,6 +1449,7 @@ class RecognitionTab(ctk.CTkFrame):
             results = []
             scores_by_model:  dict[str, float] = {}
             closest_by_model: dict[str, str]   = {}
+            query_embeddings: dict[str, np.ndarray] = {}  # model → query embedding
 
             # Accumulate per-control-path scores across all models as we go
             path_scores: dict[str, list[float]] = {}
@@ -1436,6 +1460,7 @@ class RecognitionTab(ctk.CTkFrame):
                     continue
 
                 query = self._engine.embed(model_name, np.array(img.convert("RGB")))
+                query_embeddings[model_name] = query
 
                 # Worst-case: score against the closest individual control image
                 best_path, best_score = "", -2.0
@@ -1456,6 +1481,47 @@ class RecognitionTab(ctk.CTkFrame):
                     "closest_image": best_path,
                     "frame_path": str(save_path),
                 })
+
+            # ── Gallery search: rank the target identity among ALL identities ──
+            # For each model, compute the best similarity to each identity's
+            # gallery.  Average across models, then sort descending (highest
+            # similarity first) to get a ranked identification list.
+            gallery_search_result: dict | None = None
+            if query_embeddings:
+                identity_avg: dict[str, list[float]] = {}  # name → per-model best scores
+                for model_name, query in query_embeddings.items():
+                    all_identities = self._gallery_paths.get(model_name, {})
+                    for id_name, pairs in all_identities.items():
+                        best = max(
+                            (self._engine.cosine_similarity(query, emb)
+                             for _, emb in pairs),
+                            default=-2.0,
+                        )
+                        identity_avg.setdefault(id_name, []).append(best)
+
+                # Build ranked list: (identity, cross-model average best similarity)
+                ranked = sorted(
+                    ((name, sum(scores) / len(scores))
+                     for name, scores in identity_avg.items()),
+                    key=lambda x: x[1],
+                    reverse=True,   # highest similarity first
+                )
+                total_ids = len(ranked)
+                target_pos = next(
+                    (i + 1 for i, (name, _) in enumerate(ranked)
+                     if name == identity),
+                    None,
+                )
+                # Top-1 match info (the identity the image is most similar to)
+                top1_name  = ranked[0][0] if ranked else ""
+                top1_score = ranked[0][1] if ranked else 0.0
+
+                gallery_search_result = {
+                    "target_rank": target_pos,
+                    "total":       total_ids,
+                    "top1_name":   top1_name,
+                    "top1_score":  top1_score,
+                }
 
             # Ranking closest = control image with highest average similarity
             # across all models — computed from scores already accumulated above
@@ -1488,7 +1554,8 @@ class RecognitionTab(ctk.CTkFrame):
                     if model_name not in scores_by_model:
                         self._update_row(model_name, None)
                 all_scores = [r["score"] for r in results]
-                self._update_summary(all_scores, str(save_path))
+                self._update_summary(all_scores, str(save_path),
+                                     gallery_search=gallery_search_result)
                 self._status.configure(
                     text=f"✓  Saved & logged → {save_path.name}",
                     text_color="#00ff9f")
