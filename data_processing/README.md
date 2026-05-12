@@ -1,6 +1,6 @@
 # Data Processing Scripts
 
-Offline analysis scripts for the RMA Face Camouflage Competition. All paths resolve relative to the project root automatically, so scripts can be run from any working directory.
+Offline analysis scripts. All paths resolve relative to the project root automatically, so scripts can be run from any working directory.
 
 ```bash
 # From project root

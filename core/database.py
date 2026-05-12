@@ -18,10 +18,11 @@ class UserRow:
 
 @dataclass
 class CaptureRow:
-    id:         int
-    user_id:    int
-    image_path: str
-    created_at: str
+    id:          int
+    user_id:     int
+    image_path:  str
+    created_at:  str
+    camera_name: str = "unknown"
 
 
 @dataclass
@@ -38,6 +39,7 @@ class AttackRow:
     is_frontal:          int = 0
     is_profile:          int = 0
     is_pitch:            int = 0
+    camera_name:         str = "unknown"
 
 
 class Database:
@@ -119,6 +121,17 @@ class Database:
             except Exception:
                 pass
 
+        # Camera name: which device captured the image.  Defaults to 'unknown'
+        # so that rows created before this migration remain valid.
+        for table in ("captures", "attacks"):
+            try:
+                with self._connect() as con:
+                    con.execute(
+                        f"ALTER TABLE {table} ADD COLUMN camera_name TEXT NOT NULL DEFAULT 'unknown'"
+                    )
+            except Exception:
+                pass
+
     # ── Embedding cache ───────────────────────────────────────────────────────
 
     def get_embedding(self, image_path: str, model_name: str):
@@ -196,19 +209,21 @@ class Database:
 
     # ── Captures ──────────────────────────────────────────────────────────────
 
-    def add_capture(self, user_id: int, image_path: str) -> int:
+    def add_capture(self, user_id: int, image_path: str,
+                    camera_name: str = "unknown") -> int:
         now = _now()
         with self._connect() as con:
             cur = con.execute(
-                "INSERT INTO captures (user_id, image_path, created_at) VALUES (?, ?, ?)",
-                (user_id, image_path, now),
+                "INSERT INTO captures (user_id, image_path, camera_name, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (user_id, image_path, camera_name, now),
             )
             return cur.lastrowid
 
     def list_captures(self, user_id: int) -> list[CaptureRow]:
         with self._connect() as con:
             rows = con.execute(
-                "SELECT id, user_id, image_path, created_at "
+                "SELECT id, user_id, image_path, created_at, camera_name "
                 "FROM captures WHERE user_id = ? ORDER BY created_at",
                 (user_id,),
             ).fetchall()
@@ -261,6 +276,7 @@ class Database:
         is_frontal: int = 0,
         is_profile: int = 0,
         is_pitch:   int = 0,
+        camera_name: str = "unknown",
     ) -> int:
         now = _now()
         with self._connect() as con:
@@ -268,11 +284,11 @@ class Database:
                 "INSERT INTO attacks "
                 "(attacker_name, model_name, similarity_score, image_path, "
                 " identity_name, matched_image_path, "
-                " pattern_id, is_frontal, is_profile, is_pitch, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " pattern_id, is_frontal, is_profile, is_pitch, camera_name, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (attacker_name, model_name, similarity_score, image_path,
                  identity_name, matched_image_path,
-                 pattern_id, is_frontal, is_profile, is_pitch, now),
+                 pattern_id, is_frontal, is_profile, is_pitch, camera_name, now),
             )
             return cur.lastrowid
 
@@ -283,7 +299,7 @@ class Database:
     ) -> list[AttackRow]:
         cols = ("id, attacker_name, model_name, similarity_score, "
                 "image_path, identity_name, matched_image_path, created_at, "
-                "pattern_id, is_frontal, is_profile, is_pitch")
+                "pattern_id, is_frontal, is_profile, is_pitch, camera_name")
         with self._connect() as con:
             if model_name:
                 rows = con.execute(
@@ -305,7 +321,7 @@ class Database:
                 "SELECT id, attacker_name, model_name, "
                 "MIN(similarity_score) AS similarity_score, "
                 "image_path, identity_name, matched_image_path, created_at, "
-                "pattern_id, is_frontal, is_profile, is_pitch "
+                "pattern_id, is_frontal, is_profile, is_pitch, camera_name "
                 "FROM attacks WHERE model_name = ? "
                 "GROUP BY attacker_name "
                 "ORDER BY similarity_score ASC",

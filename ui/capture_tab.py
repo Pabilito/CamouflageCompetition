@@ -597,7 +597,8 @@ class CaptureTab(ctk.CTkFrame):
                 self._original_frame.save(str(_hq_path(save_path)), format="PNG")
             except Exception as exc:
                 print(f"[WARN] Could not save HQ companion: {exc}")
-        self._db.add_capture(user_row.id, str(save_path))
+        cam_name = self._current_camera_name()
+        self._db.add_capture(user_row.id, str(save_path), camera_name=cam_name)
         count = self._db.capture_count(user_row.id)
         self._count_label.configure(text=f"{count} image(s) saved for '{user_row.name}'")
         self._status.configure(text=f"✓  Saved {save_path.name}", text_color="#00ff9f")
@@ -684,6 +685,14 @@ class CaptureTab(ctk.CTkFrame):
             text="Manually aligned — accept or retake.", text_color="#00ff9f")
 
     # ── Camera-source selector ────────────────────────────────────────────────
+
+    def _current_camera_name(self) -> str:
+        """Return the active camera device name, or 'unknown' / 'upload'."""
+        if self._pending_source == "upload":
+            return "upload"
+        if self._camera_source is not None:
+            return self._camera_source.current_name
+        return "unknown"
 
     def _build_camera_source_row(self, parent, *, row: int) -> None:
         """Compact row above the live buttons: device dropdown + refresh.

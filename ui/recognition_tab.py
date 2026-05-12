@@ -1434,7 +1434,8 @@ class RecognitionTab(ctk.CTkFrame):
 
     def _run_inference(self, img: Image.Image, save_path: Path,
                        identity: str,
-                       tags: dict | None = None) -> None:
+                       tags: dict | None = None,
+                       camera_name: str = "unknown") -> None:
         """Shared inference logic for both accept paths."""
         tags = tags or {"pattern_id": 0, "is_frontal": 0,
                         "is_profile": 0, "is_pitch": 0}
@@ -1545,6 +1546,7 @@ class RecognitionTab(ctk.CTkFrame):
                     is_frontal=tags["is_frontal"],
                     is_profile=tags["is_profile"],
                     is_pitch=tags["is_pitch"],
+                    camera_name=camera_name,
                 )
 
             def _update_all():
@@ -1660,7 +1662,8 @@ class RecognitionTab(ctk.CTkFrame):
         self._pending_save_img      = None
         self._pending_save_path     = None
         self._pending_save_identity = ""
-        self._run_inference(img, path, identity, tags=tags)
+        cam_name = self._current_camera_name()
+        self._run_inference(img, path, identity, tags=tags, camera_name=cam_name)
 
     def _retake_frame(self) -> None:
         # Remember whether the discarded frame came from the camera or from
@@ -1769,6 +1772,14 @@ class RecognitionTab(ctk.CTkFrame):
                    {"text": f"📄 log → {log_file.name}"})
 
     # ── Camera-source selector ────────────────────────────────────────────────
+
+    def _current_camera_name(self) -> str:
+        """Return the active camera device name, or 'unknown' / 'upload'."""
+        if self._pending_source == "upload":
+            return "upload"
+        if self._camera_source is not None:
+            return self._camera_source.current_name
+        return "unknown"
 
     def _build_camera_source_row(self, parent, *, row: int) -> None:
         """Compact row above the live buttons: device dropdown + refresh.
