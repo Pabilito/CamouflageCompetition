@@ -207,11 +207,17 @@ Right-click thumbnails to view full size, view the HQ original, recompute scores
 
 The ranking tab can be **popped out** into its own standalone window via the "Pop out Ranking" button in the header, and docked back at any time.
 
-Two sub-tabs:
+Three sub-tabs:
 
 - **Current Standings** — one row per identity showing their best (lowest average) image score, with individual per-model similarity scores. The lowest score in each model column is highlighted. Top 3 highlighted in gold/silver/bronze. Attack thumbnails show tag badges. Paginated (30 rows per page) with go-to-page navigation.
 
 - **All Images** — every scored image, filterable by model or showing the cross-model average. Displays attack and closest-match thumbnails (loaded asynchronously) with tag badges on attack images. Individual rows can be deleted. Paginated with go-to-page navigation.
+
+- **Gallery Search** — per-identity summary of gallery search positions. Each row shows the identity name, per-image gallery-search position badges (colour-coded: red = position 1, yellow = 2–5, green = 6+), the best and average positions across all their adversarial images, and thumbnails of the best-ranked attack and its closest reference image. Ranked by best position ascending (lower = harder to distinguish from the gallery). Paginated with go-to-page navigation.
+
+#### Thumbnail Previews
+
+Clicking any thumbnail in any sub-tab opens a full-screen viewer. The viewer automatically displays the lossless high-quality companion image (`img_NNN_hq.png`) when it exists alongside the saved crop, so you always see the original unprocessed frame rather than the 112×112 aligned crop.
 
 #### Podium View
 

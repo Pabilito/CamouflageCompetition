@@ -388,12 +388,9 @@ class RankingTab(ctk.CTkFrame):
                 self._st_cache = []
                 self._refresh_standings()       # first visit or stale
         elif current == "Gallery Search":
-            if self._gs_cache and not self._db_dirty:
-                self._render_gs_page()
-            else:
-                self._db_dirty = False
-                self._gs_cache = []
-                self._refresh_gallery_search()
+            self._db_dirty = False
+            self._gs_cache = []
+            self._refresh_gallery_search()
         else:
             if (self._all_cache_model == self._model_var.get()
                     and self._all_cache and not self._db_dirty):
@@ -936,7 +933,7 @@ class RankingTab(ctk.CTkFrame):
         # 0=Rank  1=Identity  2=Positions  3=Best  4=Avg  5=BestAttack  6=Reference
         _GS_COLS = 7
         for i in range(_GS_COLS):
-            body.columnconfigure(i, weight=1 if i == 2 else 0)
+            body.columnconfigure(i, weight=1)
 
         data  = self._gs_cache
         total = len(data)
@@ -986,14 +983,29 @@ class RankingTab(ctk.CTkFrame):
                          font=self._font_11, anchor="center").grid(
                 row=grid_row, column=1, padx=4, pady=3, sticky="ew")
 
-            # Positions — compact colour-coded badges in a flow frame
+            # Positions — show 5 best (lowest) and 5 worst (highest); ellipsis if more
             pos_frame = ctk.CTkFrame(body, fg_color="transparent")
-            pos_frame.grid(row=grid_row, column=2, padx=4, pady=3, sticky="w")
-            for pi, pos in enumerate(entry["positions"]):
-                ctk.CTkLabel(pos_frame, text=str(pos),
-                             font=self._font_11,
-                             text_color=self._gs_pos_colour(pos),
-                             width=28, anchor="center").pack(side="left", padx=1)
+            pos_frame.grid(row=grid_row, column=2, padx=4, pady=3)
+            all_pos   = sorted(entry["positions"])          # ascending = best first
+            n         = len(all_pos)
+            _N        = 5
+            if n <= _N * 2:
+                display = [(p, False) for p in all_pos]    # show all, no ellipsis
+            else:
+                best  = [(p, False) for p in all_pos[:_N]]
+                worst = [(p, False) for p in all_pos[n - _N:]]
+                display = best + [(None, True)] + worst     # None = ellipsis sentinel
+            for item, is_ellipsis in display:
+                if is_ellipsis:
+                    ctk.CTkLabel(pos_frame, text="···",
+                                 font=self._font_11,
+                                 text_color="#555",
+                                 width=18, anchor="center").pack(side="left", padx=1)
+                else:
+                    ctk.CTkLabel(pos_frame, text=str(item),
+                                 font=self._font_11,
+                                 text_color=self._gs_pos_colour(item),
+                                 width=28, anchor="center").pack(side="left", padx=1)
 
             # Best
             best_pos = entry["best_pos"]
@@ -1156,12 +1168,17 @@ class RankingTab(ctk.CTkFrame):
     # ── Image viewer ──────────────────────────────────────────────────────────
 
     def _open_viewer(self, path: str, title: str) -> None:
+        # Prefer the lossless HQ companion (e.g. img_007_hq.png) when it exists,
+        # so the viewer always shows the full-resolution original rather than the
+        # 112×112 aligned crop.
+        hq = _hq_path(path)
+        display_path = hq if Path(hq).exists() else path
         try:
-            img = Image.open(path).convert("RGB")
+            img = Image.open(display_path).convert("RGB")
         except Exception:
             return
         popup = tk.Toplevel(self)
-        popup.title(f"{title}  —  {Path(path).name}")
+        popup.title(f"{title}  —  {Path(display_path).name}")
         popup.configure(bg="#0d0d1a")
         sw, sh = popup.winfo_screenwidth(), popup.winfo_screenheight()
         max_w, max_h = int(sw * 0.8), int(sh * 0.8)
@@ -1176,7 +1193,7 @@ class RankingTab(ctk.CTkFrame):
         lbl = tk.Label(popup, image=tk_img, bg="#0d0d1a")
         lbl.image = tk_img
         lbl.pack(padx=10, pady=10)
-        tk.Label(popup, text=path, fg="#555", bg="#0d0d1a",
+        tk.Label(popup, text=display_path, fg="#555", bg="#0d0d1a",
                  font=("Courier New", 9), wraplength=int(sw * 0.8)).pack(pady=(0, 6))
         popup.bind("<Escape>", lambda e: popup.destroy())
         lbl.bind("<Button-1>", lambda e: popup.destroy())
