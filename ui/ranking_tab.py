@@ -848,9 +848,9 @@ class RankingTab(ctk.CTkFrame):
             cache = []
             for identity, images in identity_images.items():
                 positions = [img["gallery_position"] for img in images]
-                best_pos  = min(positions)
+                best_pos  = max(positions)
                 avg_pos   = sum(positions) / len(positions)
-                best_img  = min(images, key=lambda x: x["gallery_position"])
+                best_img  = max(images, key=lambda x: x["gallery_position"])
                 cache.append({
                     "identity":   identity,
                     "images":     images,
@@ -862,7 +862,7 @@ class RankingTab(ctk.CTkFrame):
                     "n_images":   len(images),
                 })
 
-            cache.sort(key=lambda x: (x["best_pos"], x["avg_pos"]))
+            cache.sort(key=lambda x: (x["best_pos"], x["avg_pos"]), reverse=True)
             return cache
 
         def _on_done(cache):
