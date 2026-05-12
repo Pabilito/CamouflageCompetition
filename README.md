@@ -23,6 +23,11 @@ project/
 │   ├── ranking_tab.py             # "Ranking" tab
 │   └── manual_align.py            # Manual face-alignment dialog
 │
+├── data_processing/
+│   ├── cross_similarity.py        # A↔B cross-pattern cosine similarity analysis
+│   ├── enrich_spreadsheet.py      # Merge per-identity log scores into a single spreadsheet
+│   └── rank_correlation.py        # Spearman rank-correlation between ranking columns
+│
 ├── Pretrained_Models/             # Weight files
 │   ├── iresnet.py                 # IResNet architecture definition
 │   ├── vit_trans.py               # TransFace ViT architecture definition
