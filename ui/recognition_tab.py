@@ -20,7 +20,7 @@ from PIL import Image, ImageTk
 import numpy as np
 
 from core.camera import Camera
-from core.database import Database
+from core.database import Database, natural_sort_key
 from core.embeddings import EmbeddingEngine
 from core.face_aligner import FaceAligner
 from ui.manual_align import open_manual_aligner
@@ -652,7 +652,8 @@ class RecognitionTab(ctk.CTkFrame):
                 paths.setdefault(user_name, []).append((image_path, emb))
 
             # Refresh identity dropdown in case this is a brand-new user
-            all_users = sorted({u for g in self._galleries.values() for u in g})
+            all_users = sorted({u for g in self._galleries.values() for u in g},
+                               key=natural_sort_key)
             def _ui():
                 current = self._identity_var.get()
                 self._identity_menu.configure(values=all_users)
@@ -663,6 +664,11 @@ class RecognitionTab(ctk.CTkFrame):
                          f"{'y' if len(all_users) == 1 else 'ies'} loaded.",
                     text_color="#00ff9f")
             self.after(0, _ui)
+
+            # Recompute gallery search positions — the new control image may
+            # shift rankings.  Uses the in-memory gallery (already updated
+            # above) so no extra DB reads for embeddings.
+            self._recompute_gallery_positions()
 
         threading.Thread(target=_embed, daemon=True).start()
 
@@ -769,7 +775,8 @@ class RecognitionTab(ctk.CTkFrame):
                 # Atomic assign
                 self._galleries    = galleries
                 self._gallery_paths = gallery_paths
-                all_users = sorted({u for g in galleries.values() for u in g})
+                all_users = sorted({u for g in galleries.values() for u in g},
+                                   key=natural_sort_key)
                 self._gallery_ready   = True
                 self._gallery_loading = False
                 try:
@@ -793,6 +800,10 @@ class RecognitionTab(ctk.CTkFrame):
                             text="⚠  No control images found.", text_color="#ff6b6b")
 
                 self.after(0, _done)
+
+                # Backfill gallery search positions for any images that don't
+                # have one yet (e.g. after DB migration from older version).
+                self._recompute_gallery_positions()
 
             except Exception as exc:
                 self._gallery_loading = False
@@ -1462,6 +1473,9 @@ class RecognitionTab(ctk.CTkFrame):
 
                 query = self._engine.embed(model_name, np.array(img.convert("RGB")))
                 query_embeddings[model_name] = query
+                # Cache adversarial embedding so gallery-position recomputation
+                # can load it from the DB without re-running the model.
+                self._db.set_embedding(str(save_path), model_name, query)
 
                 # Worst-case: score against the closest individual control image
                 best_path, best_score = "", -2.0
@@ -1534,6 +1548,8 @@ class RecognitionTab(ctk.CTkFrame):
                 ranking_closest = ""
 
             # Write DB records — all with the same ranking_closest for consistency
+            gs_pos   = gallery_search_result["target_rank"] if gallery_search_result else None
+            gs_total = gallery_search_result["total"]       if gallery_search_result else None
             for r in results:
                 self._db.add_attack(
                     attacker_name=identity,
@@ -1547,6 +1563,8 @@ class RecognitionTab(ctk.CTkFrame):
                     is_profile=tags["is_profile"],
                     is_pitch=tags["is_pitch"],
                     camera_name=camera_name,
+                    gallery_position=gs_pos,
+                    gallery_total=gs_total,
                 )
 
             def _update_all():
@@ -1735,6 +1753,120 @@ class RecognitionTab(ctk.CTkFrame):
             if s > best_score:
                 best_score, best_path = s, path
         return best_path
+
+    def _recompute_gallery_positions(self) -> None:
+        """Batch-recompute gallery search positions for all adversarial images
+        using the in-memory gallery and numpy batch matmul.
+        Runs on a background thread — safe to call from _embed threads."""
+        if not self._gallery_ready:
+            return
+
+        model_names = self._engine.model_names
+        gallery_paths = self._gallery_paths  # model → identity → [(path, emb)]
+
+        # Build per-model gallery matrices: identity names + stacked embeddings
+        # so we can do batch matmul instead of per-pair python loops.
+        gallery_data: dict[str, tuple[list[str], list[int], object]] = {}
+        for mn in model_names:
+            identities = gallery_paths.get(mn, {})
+            if not identities:
+                continue
+            id_names: list[str] = []
+            id_boundaries: list[int] = []  # cumulative count per identity
+            all_embs: list = []
+            for id_name in sorted(identities.keys()):
+                pairs = identities[id_name]
+                id_names.append(id_name)
+                all_embs.extend(emb for _, emb in pairs)
+                id_boundaries.append(len(all_embs))
+            if all_embs:
+                gallery_data[mn] = (id_names, id_boundaries,
+                                    np.stack(all_embs))  # (N_total, dim)
+
+        if not gallery_data:
+            return
+
+        # Get all adversarial images that need positions
+        attack_images = self._db.get_distinct_attack_images()
+        if not attack_images:
+            return
+
+        # Load adversarial embeddings from DB (one bulk read per model)
+        adv_embs: dict[str, dict[str, object]] = {}  # model → {path: emb}
+        for mn in model_names:
+            adv_embs[mn] = self._db.get_all_embeddings_for_model(mn)
+
+        updates: list[tuple[str, int, int]] = []
+
+        for atk in attack_images:
+            img_path = atk["image_path"]
+            target   = atk["identity_name"]
+            if not target:
+                continue
+
+            # Collect per-identity best similarity averaged across models
+            id_score_sums:   dict[str, float] = {}
+            id_score_counts: dict[str, int]   = {}
+
+            for mn in model_names:
+                if mn not in gallery_data:
+                    continue
+                query = adv_embs.get(mn, {}).get(img_path)
+                if query is None:
+                    # Embedding not cached — compute from the image file and
+                    # store it so future recomputations are instant.
+                    try:
+                        face_rgb = np.array(Image.open(img_path).convert("RGB"))
+                        query = self._engine.embed(mn, face_rgb)
+                        self._db.set_embedding(img_path, mn, query)
+                    except Exception:
+                        continue
+
+                id_names, boundaries, gallery_mat = gallery_data[mn]
+
+                # Batch cosine similarity: query (dim,) @ gallery (N, dim).T → (N,)
+                norms = np.linalg.norm(gallery_mat, axis=1)
+                qnorm = np.linalg.norm(query)
+                if qnorm < 1e-10:
+                    continue
+                sims = (gallery_mat @ query) / (norms * qnorm + 1e-10)
+
+                # Max similarity per identity
+                prev = 0
+                for idx, boundary in enumerate(boundaries):
+                    best = float(np.max(sims[prev:boundary]))
+                    prev = boundary
+                    name = id_names[idx]
+                    id_score_sums[name]   = id_score_sums.get(name, 0.0) + best
+                    id_score_counts[name] = id_score_counts.get(name, 0) + 1
+
+            if not id_score_sums:
+                continue
+
+            # Rank identities by average cross-model best similarity (desc)
+            ranked = sorted(
+                ((name, id_score_sums[name] / id_score_counts[name])
+                 for name in id_score_sums),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+            total_ids = len(ranked)
+            target_pos = next(
+                (i + 1 for i, (name, _) in enumerate(ranked)
+                 if name == target),
+                None,
+            )
+            if target_pos is not None:
+                updates.append((img_path, target_pos, total_ids))
+
+        if updates:
+            self._db.bulk_update_gallery_positions(updates)
+            # Notify ranking tab
+            if self._ranking_tab is not None:
+                try:
+                    self.after(0, self._ranking_tab.mark_dirty)
+                except Exception:
+                    pass
 
     def _write_log(self, identity: str, frame_path: Path,
                    results: list[dict],

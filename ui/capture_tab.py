@@ -131,26 +131,39 @@ class CaptureTab(ctk.CTkFrame):
         ctk.CTkButton(new_row, text="Add", width=56,
                       command=self._add_user).grid(row=0, column=1)
 
+        # Batch-add row: create N identities named i<next>, i<next+1>, …
+        batch_row = ctk.CTkFrame(left, fg_color="transparent")
+        batch_row.grid(row=3, column=0, padx=14, pady=4, sticky="ew")
+        batch_row.columnconfigure(1, weight=1)
+        ctk.CTkLabel(batch_row, text="Batch:", font=ctk.CTkFont(size=11),
+                     text_color="#888").grid(row=0, column=0, padx=(0, 4), sticky="w")
+        self._batch_count_var = ctk.StringVar(value="5")
+        ctk.CTkEntry(batch_row, textvariable=self._batch_count_var,
+                     width=48, justify="center").grid(row=0, column=1, sticky="w")
+        ctk.CTkButton(batch_row, text="Add N Users", width=100,
+                      command=self._batch_add_users).grid(
+            row=0, column=2, padx=(4, 0))
+
         self._count_label = ctk.CTkLabel(
             left, text="No user selected", font=ctk.CTkFont(size=11), text_color="#aaa")
-        self._count_label.grid(row=3, column=0, padx=14, pady=(8, 4), sticky="w")
+        self._count_label.grid(row=4, column=0, padx=14, pady=(8, 4), sticky="w")
 
         ctk.CTkFrame(left, height=1, fg_color="#333").grid(
-            row=4, column=0, sticky="ew", padx=14, pady=6)
+            row=5, column=0, sticky="ew", padx=14, pady=6)
 
         ctk.CTkLabel(left, text="Saved Images",
                      font=ctk.CTkFont(size=11), text_color="#888").grid(
-            row=5, column=0, padx=14, sticky="w")
+            row=6, column=0, padx=14, sticky="w")
 
         self._thumb_frame = ctk.CTkScrollableFrame(
             left, height=300, fg_color="transparent", label_text="")
-        self._thumb_frame.grid(row=6, column=0, padx=10, pady=(4, 10), sticky="nsew")
-        left.rowconfigure(6, weight=1)
+        self._thumb_frame.grid(row=7, column=0, padx=10, pady=(4, 10), sticky="nsew")
+        left.rowconfigure(7, weight=1)
 
         ctk.CTkButton(left, text="Delete User", fg_color="#8b0000",
                       hover_color="#c00000", height=28,
                       command=self._delete_user).grid(
-            row=7, column=0, padx=14, pady=(0, 12), sticky="ew")
+            row=8, column=0, padx=14, pady=(0, 12), sticky="ew")
 
         # ── Right panel ───────────────────────────────────────────────────────
         right = ctk.CTkFrame(self, corner_radius=10, fg_color=("#1e1e2e", "#1e1e2e"))
@@ -278,6 +291,39 @@ class CaptureTab(ctk.CTkFrame):
         self._refresh_user_list()
         self._user_var.set(name)
         self._on_user_selected(name)
+
+    def _batch_add_users(self) -> None:
+        """Create N identities named i<next>, i<next+1>, … where <next> is
+        one past the highest existing i-prefixed numeric identity."""
+        import re
+        try:
+            n = int(self._batch_count_var.get())
+        except ValueError:
+            return
+        if n <= 0:
+            return
+
+        # Find the highest existing "i<number>" identity
+        existing = self._db.list_users()
+        max_idx = 0
+        for u in existing:
+            m = re.fullmatch(r"i(\d+)", u.name)
+            if m:
+                max_idx = max(max_idx, int(m.group(1)))
+
+        last_name = ""
+        for k in range(1, n + 1):
+            name = f"i{max_idx + k}"
+            try:
+                self._db.add_user(name)
+                last_name = name
+            except Exception:
+                pass
+
+        self._refresh_user_list()
+        if last_name:
+            self._user_var.set(last_name)
+            self._on_user_selected(last_name)
 
     def _delete_user(self) -> None:
         if self._current_user_id is None:

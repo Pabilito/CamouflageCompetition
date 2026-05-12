@@ -40,6 +40,8 @@ class AttackRow:
     is_profile:          int = 0
     is_pitch:            int = 0
     camera_name:         str = "unknown"
+    gallery_position:    int | None = None
+    gallery_total:       int | None = None
 
 
 class Database:
@@ -132,6 +134,17 @@ class Database:
             except Exception:
                 pass
 
+        # Gallery search position: stored per-image (all model rows share
+        # the same value).  NULL = not yet computed (backward compatible).
+        for col in ("gallery_position", "gallery_total"):
+            try:
+                with self._connect() as con:
+                    con.execute(
+                        f"ALTER TABLE attacks ADD COLUMN {col} INTEGER DEFAULT NULL"
+                    )
+            except Exception:
+                pass
+
     # ── Embedding cache ───────────────────────────────────────────────────────
 
     def get_embedding(self, image_path: str, model_name: str):
@@ -199,9 +212,11 @@ class Database:
     def list_users(self) -> list[UserRow]:
         with self._connect() as con:
             rows = con.execute(
-                "SELECT id, name, created_at FROM users ORDER BY name"
+                "SELECT id, name, created_at FROM users"
             ).fetchall()
-        return [UserRow(**dict(r)) for r in rows]
+        users = [UserRow(**dict(r)) for r in rows]
+        users.sort(key=lambda u: natural_sort_key(u.name))
+        return users
 
     def delete_user(self, user_id: int) -> None:
         with self._connect() as con:
@@ -277,6 +292,8 @@ class Database:
         is_profile: int = 0,
         is_pitch:   int = 0,
         camera_name: str = "unknown",
+        gallery_position: int | None = None,
+        gallery_total:    int | None = None,
     ) -> int:
         now = _now()
         with self._connect() as con:
@@ -284,11 +301,13 @@ class Database:
                 "INSERT INTO attacks "
                 "(attacker_name, model_name, similarity_score, image_path, "
                 " identity_name, matched_image_path, "
-                " pattern_id, is_frontal, is_profile, is_pitch, camera_name, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " pattern_id, is_frontal, is_profile, is_pitch, "
+                " camera_name, gallery_position, gallery_total, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (attacker_name, model_name, similarity_score, image_path,
                  identity_name, matched_image_path,
-                 pattern_id, is_frontal, is_profile, is_pitch, camera_name, now),
+                 pattern_id, is_frontal, is_profile, is_pitch,
+                 camera_name, gallery_position, gallery_total, now),
             )
             return cur.lastrowid
 
@@ -299,7 +318,8 @@ class Database:
     ) -> list[AttackRow]:
         cols = ("id, attacker_name, model_name, similarity_score, "
                 "image_path, identity_name, matched_image_path, created_at, "
-                "pattern_id, is_frontal, is_profile, is_pitch, camera_name")
+                "pattern_id, is_frontal, is_profile, is_pitch, camera_name, "
+                "gallery_position, gallery_total")
         with self._connect() as con:
             if model_name:
                 rows = con.execute(
@@ -321,7 +341,8 @@ class Database:
                 "SELECT id, attacker_name, model_name, "
                 "MIN(similarity_score) AS similarity_score, "
                 "image_path, identity_name, matched_image_path, created_at, "
-                "pattern_id, is_frontal, is_profile, is_pitch, camera_name "
+                "pattern_id, is_frontal, is_profile, is_pitch, camera_name, "
+                "gallery_position, gallery_total "
                 "FROM attacks WHERE model_name = ? "
                 "GROUP BY attacker_name "
                 "ORDER BY similarity_score ASC",
@@ -429,6 +450,72 @@ class Database:
             result[path] = d
         return result
 
+    # ── Gallery search positions ──────────────────────────────────────────
+
+    def update_gallery_position(self, image_path: str,
+                                gallery_position: int,
+                                gallery_total: int) -> int:
+        """Set gallery search position on ALL attack rows for a given image."""
+        with self._connect() as con:
+            cur = con.execute(
+                "UPDATE attacks SET gallery_position=?, gallery_total=? "
+                "WHERE image_path=?",
+                (gallery_position, gallery_total, image_path),
+            )
+            return cur.rowcount
+
+    def bulk_update_gallery_positions(
+        self, updates: list[tuple[str, int, int]]
+    ) -> int:
+        """Batch update gallery positions.
+        Each tuple: (image_path, gallery_position, gallery_total).
+        Returns total rows updated."""
+        total = 0
+        with self._connect() as con:
+            for image_path, pos, tot in updates:
+                cur = con.execute(
+                    "UPDATE attacks SET gallery_position=?, gallery_total=? "
+                    "WHERE image_path=?",
+                    (pos, tot, image_path),
+                )
+                total += cur.rowcount
+        return total
+
+    def get_gallery_search_data(self) -> list[dict]:
+        """Return one dict per distinct adversarial image with its stored
+        gallery position. Used by the Gallery Search ranking tab."""
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT image_path, identity_name, matched_image_path, "
+                "gallery_position, gallery_total "
+                "FROM attacks "
+                "GROUP BY image_path "
+                "ORDER BY image_path"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_distinct_attack_images(self) -> list[dict]:
+        """Return one dict per distinct adversarial image:
+        {image_path, identity_name, matched_image_path}."""
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT DISTINCT image_path, identity_name, "
+                "matched_image_path FROM attacks"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
 
 def _now() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
+
+
+def natural_sort_key(text: str):
+    """Sort key that treats embedded digit runs as integers.
+
+    'i2' < 'i10' < 'i20' instead of the ASCII order 'i10' < 'i2' < 'i20'.
+    """
+    import re
+    parts: list = []
+    for tok in re.split(r'(\d+)', text):
+        parts.append(int(tok) if tok.isdigit() else tok.lower())
+    return parts

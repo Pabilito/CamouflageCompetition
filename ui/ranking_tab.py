@@ -21,6 +21,16 @@ _ALL_MODELS = "All models (average)"
 _THRESHOLD  = 0.2565
 _PAGE_SIZE  = 20
 
+
+def _hq_path(image_path: str) -> str:
+    """Return the companion high-quality PNG path for a saved image.
+
+    Example: data/adversarial/alice/img_007.jpg → …/img_007_hq.png
+    Returns the path as a string; the file may or may not exist.
+    """
+    p = Path(image_path)
+    return str(p.with_name(p.stem + "_hq.png"))
+
 # Pattern badge colours (must match recognition_tab)
 _PATTERN_COLOURS = {
     0: "#555", 1: "#e06c75", 2: "#e5c07b", 3: "#61afef",
@@ -139,6 +149,10 @@ class RankingTab(ctk.CTkFrame):
         self._all_cache_model: str  = ""   # which model the cache belongs to
         self._all_page: int         = 0    # current 0-based page index
 
+        # ── Gallery Search state ──────────────────────────────────────────────
+        self._gs_cache: list[dict] = []    # per-identity gallery search results
+        self._gs_page:  int        = 0     # current 0-based page index
+
         self._build_ui()
         self._refresh()
 
@@ -180,6 +194,7 @@ class RankingTab(ctk.CTkFrame):
         self._tabs.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 4))
         self._tabs.add("Current Standings")
         self._tabs.add("All Images")
+        self._tabs.add("Gallery Search")
         self._tabs.set("Current Standings")
         self._tabs.configure(command=self._on_subtab_change)
 
@@ -289,12 +304,57 @@ class RankingTab(ctk.CTkFrame):
             command=self._page_next)
         self._btn_next.grid(row=0, column=5, padx=(8, 0))
 
+        # ── Gallery Search sub-tab ─────────────────────────────────────────────
+        gs = self._tabs.tab("Gallery Search")
+        gs.columnconfigure(0, weight=1)
+        gs.rowconfigure(0, weight=1)
+
+        self._gs_body = ctk.CTkScrollableFrame(
+            gs, fg_color=("#12122a", "#12122a"), corner_radius=6, label_text="")
+        self._gs_body.grid(row=0, column=0, sticky="nsew")
+
+        self._gs_summary = ctk.CTkLabel(
+            gs, text="", font=ctk.CTkFont(size=11), text_color="#888")
+        self._gs_summary.grid(row=1, column=0, sticky="w", pady=(2, 4))
+
+        gs_pag = ctk.CTkFrame(gs, fg_color="transparent")
+        gs_pag.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        gs_pag.columnconfigure(1, weight=1)
+
+        self._gs_btn_prev = ctk.CTkButton(
+            gs_pag, text="◀  Prev", width=90,
+            command=self._gs_page_prev)
+        self._gs_btn_prev.grid(row=0, column=0, padx=(0, 8))
+
+        self._gs_lbl_page = ctk.CTkLabel(
+            gs_pag, text="", font=ctk.CTkFont(size=11), text_color="#888",
+            anchor="center")
+        self._gs_lbl_page.grid(row=0, column=1, sticky="ew")
+
+        ctk.CTkLabel(gs_pag, text="Go to page:",
+                     font=ctk.CTkFont(size=11),
+                     text_color="#888").grid(row=0, column=2, padx=(0, 4))
+        self._gs_entry_page = ctk.CTkEntry(gs_pag, width=48,
+                                           font=ctk.CTkFont(size=11),
+                                           justify="center")
+        self._gs_entry_page.grid(row=0, column=3, padx=(0, 4))
+        self._gs_entry_page.bind("<Return>", lambda e: self._gs_page_goto())
+        ctk.CTkButton(gs_pag, text="Go", width=40,
+                      command=self._gs_page_goto).grid(row=0, column=4, padx=(0, 12))
+
+        self._gs_btn_next = ctk.CTkButton(
+            gs_pag, text="Next  ▶", width=90,
+            command=self._gs_page_next)
+        self._gs_btn_next.grid(row=0, column=5, padx=(8, 0))
+
     def _refresh(self, force: bool = False) -> None:
         if not force and not self._db_dirty:
             # Cache is still valid — just re-render current page (instant)
             current = self._tabs.get()
             if current == "Current Standings" and self._st_cache:
                 self._render_standings_page()
+            elif current == "Gallery Search" and self._gs_cache:
+                self._render_gs_page()
             elif self._all_cache_model == self._model_var.get() and self._all_cache:
                 self._render_all_page()
             self._notify_podium()
@@ -306,6 +366,9 @@ class RankingTab(ctk.CTkFrame):
         if current == "Current Standings":
             self._st_cache = []          # invalidate so DB is re-queried
             self._refresh_standings()
+        elif current == "Gallery Search":
+            self._gs_cache = []
+            self._refresh_gallery_search()
         else:
             self._all_cache_model = ""   # invalidate so DB is re-queried
             self._refresh_all_images()
@@ -324,6 +387,13 @@ class RankingTab(ctk.CTkFrame):
                 self._db_dirty = False
                 self._st_cache = []
                 self._refresh_standings()       # first visit or stale
+        elif current == "Gallery Search":
+            if self._gs_cache and not self._db_dirty:
+                self._render_gs_page()
+            else:
+                self._db_dirty = False
+                self._gs_cache = []
+                self._refresh_gallery_search()
         else:
             if (self._all_cache_model == self._model_var.get()
                     and self._all_cache and not self._db_dirty):
@@ -753,6 +823,211 @@ class RankingTab(ctk.CTkFrame):
         self._add_thumb(body, closest_path,  grid_row, _C_ALL["closest"], "closest match")
         self._add_delete_btn(body, img_path, grid_row, _C_ALL["delete"])
 
+    # ── Gallery Search ─────────────────────────────────────────────────────
+
+    def _refresh_gallery_search(self) -> None:
+        """Load stored gallery search positions from the DB."""
+        body = self._gs_body
+        for w in body.winfo_children():
+            w.destroy()
+        ctk.CTkLabel(body, text="Loading gallery search data…",
+                     font=self._font_12, text_color="#555").grid(
+            row=0, column=0, columnspan=10, pady=30)
+
+        def _query():
+            rows = self._db.get_gallery_search_data()
+
+            # Group by identity
+            identity_images: dict[str, list[dict]] = {}
+            for r in rows:
+                ident = r["identity_name"]
+                if not ident:
+                    continue
+                pos = r["gallery_position"]
+                if pos is None:
+                    continue   # not yet computed
+                identity_images.setdefault(ident, []).append(r)
+
+            cache = []
+            for identity, images in identity_images.items():
+                positions = [img["gallery_position"] for img in images]
+                best_pos  = min(positions)
+                avg_pos   = sum(positions) / len(positions)
+                best_img  = min(images, key=lambda x: x["gallery_position"])
+                cache.append({
+                    "identity":   identity,
+                    "images":     images,
+                    "positions":  positions,
+                    "best_pos":   best_pos,
+                    "avg_pos":    avg_pos,
+                    "best_img":   best_img["image_path"],
+                    "best_ref":   best_img["matched_image_path"] or "",
+                    "n_images":   len(images),
+                })
+
+            cache.sort(key=lambda x: (x["best_pos"], x["avg_pos"]))
+            return cache
+
+        def _on_done(cache):
+            self._gs_cache = cache
+            self._gs_page = 0
+            self._render_gs_page()
+
+        def _bg():
+            try:
+                cache = _query()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                cache = []
+            try:
+                if self.winfo_exists():
+                    self.after(0, lambda: _on_done(cache))
+            except (RuntimeError, tk.TclError):
+                pass
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    # ── Gallery Search pagination ─────────────────────────────────────────
+
+    def _gs_page_prev(self) -> None:
+        if self._gs_page > 0:
+            self._gs_page -= 1
+            self._render_gs_page()
+            _scroll_to_top(self._gs_body)
+
+    def _gs_page_next(self) -> None:
+        total_pages = max(1, -(-len(self._gs_cache) // _PAGE_SIZE))
+        if self._gs_page < total_pages - 1:
+            self._gs_page += 1
+            self._render_gs_page()
+            _scroll_to_top(self._gs_body)
+
+    def _gs_page_goto(self) -> None:
+        total_pages = max(1, -(-len(self._gs_cache) // _PAGE_SIZE))
+        try:
+            target = int(self._gs_entry_page.get().strip()) - 1
+        except ValueError:
+            self._gs_entry_page.delete(0, "end")
+            return
+        target = max(0, min(target, total_pages - 1))
+        self._gs_page = target
+        self._gs_entry_page.delete(0, "end")
+        self._render_gs_page()
+        _scroll_to_top(self._gs_body)
+
+    @staticmethod
+    def _gs_pos_colour(pos: int) -> str:
+        """Colour-code a gallery search position: 1=red, 2-5=yellow, 6+=green."""
+        if pos == 1:
+            return "#ff6b6b"
+        elif pos <= 5:
+            return "#ffd166"
+        else:
+            return "#00ff9f"
+
+    def _render_gs_page(self) -> None:
+        body = self._gs_body
+        for w in body.winfo_children():
+            w.destroy()
+        self._thumb_refs.clear()
+
+        # Column layout:
+        # 0=Rank  1=Identity  2=Positions  3=Best  4=Avg  5=BestAttack  6=Reference
+        _GS_COLS = 7
+        for i in range(_GS_COLS):
+            body.columnconfigure(i, weight=1 if i == 2 else 0)
+
+        data  = self._gs_cache
+        total = len(data)
+
+        if total == 0:
+            ctk.CTkLabel(body, text="No gallery search data yet.\n"
+                         "Score adversarial images first, then refresh.",
+                         font=self._font_12, text_color="#555").grid(
+                row=0, column=0, columnspan=_GS_COLS, pady=30)
+            self._gs_summary.configure(text="0 identities.")
+            self._gs_lbl_page.configure(text="")
+            self._gs_btn_prev.configure(state="disabled")
+            self._gs_btn_next.configure(state="disabled")
+            return
+
+        total_pages = max(1, -(-total // _PAGE_SIZE))
+        self._gs_page = max(0, min(self._gs_page, total_pages - 1))
+        start = self._gs_page * _PAGE_SIZE
+        end   = min(start + _PAGE_SIZE, total)
+        page_data = data[start:end]
+
+        # Header
+        HDR_BG = "#16213e"
+        headers = ["Rank", "Identity", "Positions (per image)",
+                   "Best", "Avg", "Best Attack", "Reference"]
+        for col, text in enumerate(headers):
+            ctk.CTkLabel(body, text=text,
+                         font=self._font_11_bold,
+                         text_color="#00d4ff", fg_color=HDR_BG,
+                         anchor="center").grid(
+                row=0, column=col, padx=2, pady=(4, 4), sticky="ew")
+
+        # Rows
+        for local_idx, entry in enumerate(page_data):
+            global_rank = start + local_idx + 1
+            grid_row    = local_idx + 1
+            medal       = _MEDAL.get(global_rank)
+            txt_col     = medal if medal else "#e0e0e0"
+
+            # Rank
+            ctk.CTkLabel(body, text=f"#{global_rank}", text_color=txt_col,
+                         font=self._font_11, anchor="center").grid(
+                row=grid_row, column=0, padx=4, pady=3, sticky="ew")
+
+            # Identity
+            ctk.CTkLabel(body, text=entry["identity"], text_color=txt_col,
+                         font=self._font_11, anchor="center").grid(
+                row=grid_row, column=1, padx=4, pady=3, sticky="ew")
+
+            # Positions — compact colour-coded badges in a flow frame
+            pos_frame = ctk.CTkFrame(body, fg_color="transparent")
+            pos_frame.grid(row=grid_row, column=2, padx=4, pady=3, sticky="w")
+            for pi, pos in enumerate(entry["positions"]):
+                ctk.CTkLabel(pos_frame, text=str(pos),
+                             font=self._font_11,
+                             text_color=self._gs_pos_colour(pos),
+                             width=28, anchor="center").pack(side="left", padx=1)
+
+            # Best
+            best_pos = entry["best_pos"]
+            ctk.CTkLabel(body, text=str(best_pos),
+                         text_color=self._gs_pos_colour(best_pos),
+                         font=self._font_11_bold, anchor="center").grid(
+                row=grid_row, column=3, padx=4, pady=3, sticky="ew")
+
+            # Avg
+            avg_pos = entry["avg_pos"]
+            ctk.CTkLabel(body, text=f"{avg_pos:.1f}",
+                         text_color=self._gs_pos_colour(round(avg_pos)),
+                         font=self._font_11, anchor="center").grid(
+                row=grid_row, column=4, padx=4, pady=3, sticky="ew")
+
+            # Best Attack thumbnail
+            self._add_thumb(body, entry["best_img"], grid_row, col=5,
+                            label="best attack")
+
+            # Reference thumbnail
+            self._add_thumb(body, entry["best_ref"], grid_row, col=6,
+                            label="closest match")
+
+        self._gs_summary.configure(
+            text=f"{total} identit{'y' if total == 1 else 'ies'} — "
+                 f"ranked by best gallery position ASC  •  "
+                 f"showing {start + 1}–{end}")
+        self._gs_lbl_page.configure(
+            text=f"Page {self._gs_page + 1} / {total_pages}")
+        self._gs_btn_prev.configure(
+            state="normal" if self._gs_page > 0 else "disabled")
+        self._gs_btn_next.configure(
+            state="normal" if self._gs_page < total_pages - 1 else "disabled")
+
     # ── Cell helpers ──────────────────────────────────────────────────────────
 
     def _add_thumb(self, body, path: str, grid_row: int, col: int,
@@ -838,8 +1113,10 @@ class RankingTab(ctk.CTkFrame):
         # that new page rather than restoring the old scroll fraction.
         saved_st_page    = self._st_page
         saved_all_page   = self._all_page
+        saved_gs_page    = self._gs_page
         saved_st_scroll  = _capture_scroll(self._standings_body)
         saved_all_scroll = _capture_scroll(self._all_body)
+        saved_gs_scroll  = _capture_scroll(self._gs_body)
 
         self._db.delete_attacks_by_image(image_path)
         self._db_dirty = True
@@ -847,16 +1124,24 @@ class RankingTab(ctk.CTkFrame):
 
         self._st_page  = saved_st_page
         self._all_page = saved_all_page
+        self._gs_page  = saved_gs_page
 
         # Re-render the visible sub-tab at the restored page, then either
         # scroll to top (if the clamp had to drop us to an earlier page) or
         # restore the previous scroll fraction (still on the same page).
-        if self._tabs.get() == "Current Standings":
+        current = self._tabs.get()
+        if current == "Current Standings":
             self._render_standings_page()
             if self._st_page == saved_st_page:
                 _restore_scroll(self._standings_body, saved_st_scroll)
             else:
                 _scroll_to_top(self._standings_body)
+        elif current == "Gallery Search":
+            self._render_gs_page()
+            if self._gs_page == saved_gs_page:
+                _restore_scroll(self._gs_body, saved_gs_scroll)
+            else:
+                _scroll_to_top(self._gs_body)
         else:
             self._render_all_page()
             if self._all_page == saved_all_page:
@@ -946,10 +1231,15 @@ class RankingTab(ctk.CTkFrame):
                 best_path = min(candidates, key=lambda p: img_avg.get(p, 1.0))
                 adv_path  = best_path
                 ctrl_path = img_meta[best_path]["closest"]
+            # Prefer high-quality companion images for the podium display
+            adv_hq  = _hq_path(adv_path)  if adv_path  else ""
+            ctrl_hq = _hq_path(ctrl_path) if ctrl_path else ""
             result.append({"rank": rank, "name": identity,
                             "score": best_avg,
                             "adv_path": adv_path,
-                            "ctrl_path": ctrl_path})
+                            "ctrl_path": ctrl_path,
+                            "adv_hq_path":  adv_hq  if adv_hq  and Path(adv_hq).exists()  else "",
+                            "ctrl_hq_path": ctrl_hq if ctrl_hq and Path(ctrl_hq).exists() else ""})
         return result
 
     def _notify_podium(self) -> None:
@@ -1207,8 +1497,11 @@ class _PodiumSlot(ctk.CTkFrame):
 
         if entry:
             score     = entry["score"]
-            adv_img   = self._load_img(entry.get("adv_path",  ""), img_size)
-            ctrl_img  = self._load_img(entry.get("ctrl_path", ""), img_size)
+            # Prefer high-quality companion images when available
+            adv_src   = entry.get("adv_hq_path")  or entry.get("adv_path",  "")
+            ctrl_src  = entry.get("ctrl_hq_path") or entry.get("ctrl_path", "")
+            adv_img   = self._load_img(adv_src,  img_size)
+            ctrl_img  = self._load_img(ctrl_src, img_size)
             score_col = "#00ff9f" if score < _THRESHOLD else "#ff6b6b"
             self._name_lbl.configure( text=entry["name"],              text_color="#e0e0e0")
             self._score_lbl.configure(text=f"Avg Similarity: {score:.4f}", text_color=score_col)
