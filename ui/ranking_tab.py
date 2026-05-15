@@ -11,10 +11,12 @@ from pathlib import Path
 
 import customtkinter as ctk
 import tkinter as tk
+from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 
 from core.database import Database, AttackRow
 from core.embeddings import EmbeddingEngine
+from core.face_aligner import FaceAligner
 
 _THUMB      = 56
 _ALL_MODELS = "All models (average)"
@@ -119,13 +121,15 @@ def _restore_scroll(scrollable_frame, top: float | None) -> None:
 
 class RankingTab(ctk.CTkFrame):
     def __init__(self, parent, db: Database, data_dir: str,
-                 engine: EmbeddingEngine, capture_tab=None, recognition_tab=None):
+                 engine: EmbeddingEngine, capture_tab=None, recognition_tab=None,
+                 aligner=None):
         super().__init__(parent, fg_color="transparent")
         self._db              = db
         self._data_dir        = data_dir
         self._engine          = engine
         self._capture_tab     = capture_tab
         self._recognition_tab = recognition_tab
+        self._aligner         = aligner or FaceAligner()
         self._thumb_refs: list = []
         self._podium_window: "PodiumWindow | None" = None
 
@@ -143,15 +147,16 @@ class RankingTab(ctk.CTkFrame):
         self._st_page:  int        = 0     # current 0-based page index
 
         # ── All Images state ──────────────────────────────────────────────────
-        # Cached sorted lists; rebuilt only on explicit refresh or model change.
-        # Switching pages just slices from the cache — no DB query, no image I/O.
-        self._all_cache: list[dict] = []   # current model's full sorted list
-        self._all_cache_model: str  = ""   # which model the cache belongs to
-        self._all_page: int         = 0    # current 0-based page index
+        self._all_cache: list[dict] = []
+        self._all_cache_model: str  = ""
+        self._all_page: int         = 0
 
         # ── Gallery Search state ──────────────────────────────────────────────
-        self._gs_cache: list[dict] = []    # per-identity gallery search results
-        self._gs_page:  int        = 0     # current 0-based page index
+        self._gs_cache: list[dict] = []
+        self._gs_page:  int        = 0
+        self._gs_import_running: bool = False
+        self._gs_gallery_stats: dict  = {}
+        self._gs_cancel_flag: "threading.Event | None" = None   # set to cancel import
 
         self._build_ui()
         self._refresh()
@@ -307,17 +312,24 @@ class RankingTab(ctk.CTkFrame):
         # ── Gallery Search sub-tab ─────────────────────────────────────────────
         gs = self._tabs.tab("Gallery Search")
         gs.columnconfigure(0, weight=1)
+        gs.columnconfigure(1, weight=0)   # right panel — fixed width
         gs.rowconfigure(0, weight=1)
 
+        # ── Left: results area ────────────────────────────────────────────────
+        gs_left = ctk.CTkFrame(gs, fg_color="transparent")
+        gs_left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        gs_left.columnconfigure(0, weight=1)
+        gs_left.rowconfigure(0, weight=1)
+
         self._gs_body = ctk.CTkScrollableFrame(
-            gs, fg_color=("#12122a", "#12122a"), corner_radius=6, label_text="")
+            gs_left, fg_color=("#12122a", "#12122a"), corner_radius=6, label_text="")
         self._gs_body.grid(row=0, column=0, sticky="nsew")
 
         self._gs_summary = ctk.CTkLabel(
-            gs, text="", font=ctk.CTkFont(size=11), text_color="#888")
+            gs_left, text="", font=ctk.CTkFont(size=11), text_color="#888")
         self._gs_summary.grid(row=1, column=0, sticky="w", pady=(2, 4))
 
-        gs_pag = ctk.CTkFrame(gs, fg_color="transparent")
+        gs_pag = ctk.CTkFrame(gs_left, fg_color="transparent")
         gs_pag.grid(row=2, column=0, sticky="ew", pady=(0, 6))
         gs_pag.columnconfigure(1, weight=1)
 
@@ -346,6 +358,52 @@ class RankingTab(ctk.CTkFrame):
             gs_pag, text="Next  ▶", width=90,
             command=self._gs_page_next)
         self._gs_btn_next.grid(row=0, column=5, padx=(8, 0))
+
+        # ── Right: external gallery dataset panel ─────────────────────────────
+        gs_right = ctk.CTkFrame(gs, fg_color="#0d1a2e", corner_radius=8,
+                                border_width=1, border_color="#1e3a5f")
+        gs_right.grid(row=0, column=1, sticky="ns", padx=(0, 0), pady=0)
+        gs_right.columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(gs_right, text="External Gallery",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color="#00d4ff").grid(
+            row=0, column=0, padx=12, pady=(10, 2), sticky="w")
+        ctk.CTkLabel(gs_right, text="Identity = subfolder name.",
+                     font=ctk.CTkFont(size=10), text_color="#555",
+                     anchor="w").grid(row=1, column=0, padx=12, pady=(0, 8), sticky="w")
+
+        self._gs_btn_add = ctk.CTkButton(
+            gs_right, text="＋  Add Folder", width=190,
+            command=self._gs_add_dataset)
+        self._gs_btn_add.grid(row=2, column=0, padx=12, pady=(0, 4))
+
+        self._gs_btn_recompute = ctk.CTkButton(
+            gs_right, text="↻  Recompute Positions", width=190,
+            fg_color="#1a3a1a", hover_color="#2a5a2a",
+            command=self._gs_trigger_recompute)
+        self._gs_btn_recompute.grid(row=3, column=0, padx=12, pady=(0, 10))
+
+        # Dataset list (scrollable)
+        self._gs_dataset_frame = ctk.CTkScrollableFrame(
+            gs_right, fg_color="transparent", width=210, height=280)
+        self._gs_dataset_frame.grid(row=4, column=0, padx=6, pady=(0, 6), sticky="nsew")
+        self._gs_dataset_frame.columnconfigure(0, weight=1)
+        gs_right.rowconfigure(4, weight=1)
+
+        # Progress area
+        self._gs_progress_label = ctk.CTkLabel(
+            gs_right, text="", font=ctk.CTkFont(size=10), text_color="#888",
+            wraplength=200, justify="left")
+        self._gs_progress_label.grid(row=5, column=0, padx=12, pady=(4, 2), sticky="w")
+
+        self._gs_progress_bar = ctk.CTkProgressBar(gs_right, width=200)
+        self._gs_progress_bar.grid(row=6, column=0, padx=12, pady=(0, 10))
+        self._gs_progress_bar.set(0)
+        self._gs_progress_bar.grid_remove()   # hidden until import starts
+
+        # Populate dataset list from DB on startup
+        self._gs_refresh_dataset_list()
 
     def _refresh(self, force: bool = False) -> None:
         if not force and not self._db_dirty:
@@ -822,6 +880,307 @@ class RankingTab(ctk.CTkFrame):
 
     # ── Gallery Search ─────────────────────────────────────────────────────
 
+    # ── Dataset panel helpers ──────────────────────────────────────────────
+
+    def _gs_refresh_dataset_list(self) -> None:
+        """Rebuild the list of external gallery datasets shown in the right panel."""
+        frame = self._gs_dataset_frame
+        for w in frame.winfo_children():
+            w.destroy()
+
+        datasets = self._db.get_ext_gallery_datasets()
+        if not datasets:
+            ctk.CTkLabel(frame, text="No datasets loaded.",
+                         font=ctk.CTkFont(size=10), text_color="#444").grid(
+                row=0, column=0, padx=6, pady=6, sticky="w")
+            return
+
+        for i, ds in enumerate(datasets):
+            row_frame = ctk.CTkFrame(frame, fg_color="#111830", corner_radius=6)
+            row_frame.grid(row=i, column=0, sticky="ew", pady=(0, 4), padx=2)
+            row_frame.columnconfigure(0, weight=1)
+
+            name_lbl = ctk.CTkLabel(
+                row_frame, text=ds["display_name"],
+                font=ctk.CTkFont(size=10, weight="bold"),
+                text_color="#c0d8ff", anchor="w", wraplength=160)
+            name_lbl.grid(row=0, column=0, padx=8, pady=(6, 1), sticky="ew")
+
+            count_lbl = ctk.CTkLabel(
+                row_frame,
+                text=f"{ds['image_count']} image{'s' if ds['image_count'] != 1 else ''}",
+                font=ctk.CTkFont(size=9), text_color="#556", anchor="w")
+            count_lbl.grid(row=1, column=0, padx=8, pady=(0, 6), sticky="ew")
+
+            ctk.CTkButton(
+                row_frame, text="✕", width=26, height=22,
+                fg_color="#3a0000", hover_color="#700000",
+                font=ctk.CTkFont(size=10),
+                command=lambda did=ds["id"]: self._gs_remove_dataset(did),
+            ).grid(row=0, column=1, rowspan=2, padx=(4, 6), pady=4)
+
+    def _gs_add_dataset(self) -> None:
+        """Open a folder-picker and import all images as an external gallery dataset."""
+        if self._gs_import_running:
+            return
+        folder = filedialog.askdirectory(title="Select gallery folder (subfolders = identities)")
+        if not folder:
+            return
+        folder = Path(folder)
+
+        # Discover image files grouped by identity (one level of subfolders)
+        _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        identity_images: dict[str, list[Path]] = {}
+        for sub in sorted(folder.iterdir()):
+            if sub.is_dir():
+                imgs = sorted(
+                    p for p in sub.iterdir()
+                    if p.is_file() and p.suffix.lower() in _IMG_EXTS
+                    and "_hq" not in p.stem
+                )
+                if imgs:
+                    identity_images[sub.name] = imgs
+
+        if not identity_images:
+            self._gs_progress_label.configure(
+                text="No identity subfolders with images found.", text_color="#ff6b6b")
+            return
+
+        total_imgs = sum(len(v) for v in identity_images.values())
+        display_name = folder.name
+
+        # Register in DB (get or create)
+        dataset_id = self._db.add_ext_gallery_dataset(str(folder), display_name)
+        already_done = self._db.get_ext_gallery_existing_paths(dataset_id)
+
+        self._gs_import_running = True
+        self._gs_cancel_flag = threading.Event()
+        cancel_flag = self._gs_cancel_flag
+        self._gs_btn_add.configure(text="✕  Cancel", fg_color="#5a0000",
+                                   hover_color="#8b0000",
+                                   command=self._gs_cancel_import)
+        self._gs_btn_recompute.configure(state="disabled")
+        self._gs_progress_bar.grid()
+        self._gs_progress_bar.set(0)
+        self._gs_progress_label.configure(
+            text=f"Importing {display_name}…  0 / {total_imgs}", text_color="#888")
+
+        def _bg() -> None:
+            import numpy as np
+            import concurrent.futures
+            import threading as _threading
+
+            # ── Pre-filter: skip images already embedded ──────────────────────
+            work: list[tuple[str, Path]] = []
+            skipped = 0
+            for identity, paths in identity_images.items():
+                for img_path in paths:
+                    if str(img_path) in already_done:
+                        skipped += 1
+                    else:
+                        work.append((identity, img_path))
+
+            total_work = len(work)
+            print(f"[EXT GALLERY] Starting import: {display_name}")
+            print(f"[EXT GALLERY] {total_imgs} images total, "
+                  f"{skipped} already embedded, {total_work} to process")
+            for identity in sorted(identity_images.keys()):
+                print(f"[EXT GALLERY]   identity: {identity!r}  "
+                      f"({len(identity_images[identity])} images)")
+
+            lock       = _threading.Lock()
+            batch: list[tuple] = []
+            BATCH_SIZE = 500
+            processed  = skipped
+            accepted   = skipped
+
+            def _post_progress(frac, p, a, identity):
+                try:
+                    if self.winfo_exists():
+                        self.after(0, lambda f=frac, pp=p, aa=a, id=identity:
+                            self._gs_import_progress(f, pp, total_imgs, aa, id))
+                except Exception:
+                    pass
+
+            def _flush_batch():
+                if batch:
+                    try:
+                        self._db.bulk_upsert_ext_gallery_embeddings(list(batch))
+                    except Exception as e:
+                        print(f"[EXT GALLERY] DB write error: {e}")
+                    batch.clear()
+
+            def _process_one(args):
+                if cancel_flag.is_set():
+                    return None, args[0]
+                identity, img_path = args
+                path_str = str(img_path)
+                try:
+                    pil_img = Image.open(img_path).convert("RGB")
+                except Exception:
+                    return None, identity
+                try:
+                    aligned = self._aligner.align(pil_img)
+                except Exception:
+                    aligned = None
+                if aligned is None:
+                    return None, identity
+                face_arr = np.array(aligned.image.convert("RGB"))
+                rows = []
+                for model_name in self._engine.model_names:
+                    try:
+                        emb  = self._engine.embed(model_name, face_arr)
+                        blob = emb.astype("float32").tobytes()
+                        rows.append((dataset_id, path_str, identity,
+                                     model_name, blob))
+                    except Exception as e:
+                        print(f"[EXT GALLERY] embed error {model_name} "
+                              f"{img_path.name}: {e}")
+                return rows if rows else None, identity
+
+            cancelled = False
+            N_WORKERS = 4
+            with concurrent.futures.ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
+                futures = {pool.submit(_process_one, item): item for item in work}
+                for future in concurrent.futures.as_completed(futures):
+                    if cancel_flag.is_set():
+                        cancelled = True
+                        # Cancel pending futures (already-running ones finish naturally)
+                        for f in futures:
+                            f.cancel()
+                        break
+                    rows, identity = future.result()
+                    with lock:
+                        processed += 1
+                        if rows:
+                            accepted += 1
+                            batch.extend(rows)
+                            if len(batch) >= BATCH_SIZE:
+                                _flush_batch()
+                        frac = processed / total_imgs
+                        # Post UI update for every accepted image; throttle skips
+                        if rows or processed % 10 == 0:
+                            _post_progress(frac, processed, accepted, identity)
+
+            with lock:
+                _flush_batch()
+
+            try:
+                real_count = self._db.count_ext_gallery_embeddings(dataset_id)
+                self._db.update_ext_gallery_image_count(dataset_id, real_count)
+                status = "Cancelled" if cancelled else "Import done"
+                print(f"[EXT GALLERY] {status}: {accepted} accepted, "
+                      f"{real_count} embeddings stored")
+            except Exception as e:
+                print(f"[EXT GALLERY] Count error: {e}")
+
+            try:
+                if self.winfo_exists():
+                    self.after(0, lambda: self._gs_import_done(cancelled=cancelled))
+            except Exception:
+                pass
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _gs_import_progress(self, frac: float, done: int,
+                            total: int, accepted: int,
+                            identity: str = "") -> None:
+        try:
+            self._gs_progress_bar.set(frac)
+            id_hint = f"  [{identity}]" if identity else ""
+            self._gs_progress_label.configure(
+                text=f"Importing…  {done} / {total}  ({accepted} accepted){id_hint}",
+                text_color="#888")
+        except Exception:
+            pass
+
+    def _gs_cancel_import(self) -> None:
+        """Signal the background import thread to stop after its current batch."""
+        if self._gs_cancel_flag is not None:
+            self._gs_cancel_flag.set()
+        self._gs_btn_add.configure(state="disabled", text="Cancelling…")
+        self._gs_progress_label.configure(text="Cancelling…", text_color="#ffd166")
+
+    def _gs_import_done(self, cancelled: bool = False) -> None:
+        self._gs_import_running = False
+        self._gs_cancel_flag    = None
+        try:
+            self._gs_progress_bar.set(1.0)
+            if cancelled:
+                self._gs_progress_label.configure(
+                    text="Import cancelled — partial data kept.", text_color="#ffd166")
+            else:
+                self._gs_progress_label.configure(
+                    text="Import complete.", text_color="#00ff9f")
+            # Restore Add Folder button
+            self._gs_btn_add.configure(
+                text="＋  Add Folder", state="normal",
+                fg_color=["#3a7ebf", "#1f538d"],   # CTk default button colours
+                hover_color=["#325882", "#14375e"],
+                command=self._gs_add_dataset)
+            self._gs_btn_recompute.configure(state="normal")
+            self._gs_refresh_dataset_list()
+        except Exception:
+            pass
+
+    def _gs_remove_dataset(self, dataset_id: int) -> None:
+        # Find dataset name for the confirmation message
+        datasets = self._db.get_ext_gallery_datasets()
+        ds = next((d for d in datasets if d["id"] == dataset_id), None)
+        name  = ds["display_name"] if ds else "this dataset"
+        count = ds["image_count"]  if ds else 0
+
+        confirmed = tk.messagebox.askyesno(
+            title="Remove dataset",
+            message=f"Remove \"{name}\" ({count} image{'s' if count != 1 else ''})?\n\n"
+                    "All stored embeddings for this dataset will be deleted.\n"
+                    "This cannot be undone.",
+            icon="warning",
+        )
+        if not confirmed:
+            return
+
+        self._db.remove_ext_gallery_dataset(dataset_id)
+        self._gs_refresh_dataset_list()
+        self._gs_progress_label.configure(text="Dataset removed.", text_color="#888")
+
+    def _gs_trigger_recompute(self) -> None:
+        """Ask the recognition tab to batch-recompute gallery positions using
+        the current merged gallery (control + external datasets), then refresh."""
+        if self._recognition_tab is None:
+            self._gs_progress_label.configure(
+                text="Recognition tab not available.", text_color="#ff6b6b")
+            return
+        self._gs_progress_label.configure(
+            text="Recomputing positions…", text_color="#888")
+
+        def _bg():
+            try:
+                self._recognition_tab._recompute_gallery_positions()
+            except Exception as exc:
+                try:
+                    if self.winfo_exists():
+                        self.after(0, lambda: self._gs_progress_label.configure(
+                            text=f"Error: {exc}", text_color="#ff6b6b"))
+                except Exception:
+                    pass
+                return
+            try:
+                if self.winfo_exists():
+                    self.after(0, self._gs_recompute_done)
+            except Exception:
+                pass
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _gs_recompute_done(self) -> None:
+        self._gs_progress_label.configure(
+            text="Positions updated.", text_color="#00ff9f")
+        self._gs_cache = []
+        self._refresh_gallery_search()
+
+    # ── Gallery search data refresh ────────────────────────────────────────
+
     def _refresh_gallery_search(self) -> None:
         """Load stored gallery search positions from the DB."""
         body = self._gs_body
@@ -845,41 +1204,231 @@ class RankingTab(ctk.CTkFrame):
                     continue   # not yet computed
                 identity_images.setdefault(ident, []).append(r)
 
+            # Build a lookup: folder_path_prefix → dataset display_name
+            # so we can detect whether a ref path lives inside an ext dataset folder.
+            try:
+                ext_datasets = self._db.get_ext_gallery_datasets()
+            except Exception:
+                ext_datasets = []
+            ext_folder_map: list[tuple[str, str]] = [
+                (str(Path(d["folder_path"])), d["display_name"])
+                for d in ext_datasets
+            ]
+
+            def _ext_info(path: str) -> dict | None:
+                """Return ext dataset info dict if path lives in an ext folder, else None."""
+                if not path:
+                    return None
+                ref_p = Path(path)
+                for folder, ds_name in ext_folder_map:
+                    try:
+                        ref_p.relative_to(folder)
+                        return {
+                            "dataset":  ds_name,
+                            "folder":   folder,
+                            "identity": ref_p.parent.name,
+                            "filename": ref_p.name,
+                        }
+                    except ValueError:
+                        continue
+                return None
+
+            # Pre-load CONTROL-ONLY embeddings (captures table) for the top-1 lookup.
+            # Using get_all_embeddings_for_model would include adversarial images too.
+            # ctrl_embs: only control (captures) images — used as gallery candidates
+            # adv_embs:  only adversarial images — used as query embeddings
+            model_names = self._engine.model_names
+            ctrl_embs: dict[str, dict[str, object]] = {}
+            adv_embs:  dict[str, dict[str, object]] = {}
+            for mn in model_names:
+                ctrl_embs[mn] = self._db.get_control_embeddings_for_model(mn)
+                adv_embs[mn]  = self._db.get_adversarial_embeddings_for_model(mn)
+
+            def _find_top1_any(adv_path: str) -> tuple[str, str] | None:
+                """Return (identity_name, image_path) of the closest CONTROL or EXT
+                gallery image to the adversarial image at adv_path, across all
+                identities. Query embedding comes from adv_embs; gallery candidates
+                come from ctrl_embs + ext gallery — never adversarial images."""
+                import numpy as np
+
+                id_scores: dict[str, list[float]] = {}
+
+                for mn in model_names:
+                    # Query = the adversarial image's embedding
+                    query = adv_embs.get(mn, {}).get(adv_path)
+                    if query is None:
+                        continue
+                    qnorm = np.linalg.norm(query)
+                    if qnorm < 1e-10:
+                        continue
+
+                    # Gallery candidates = control images grouped by identity
+                    ctrl_by_id: dict[str, dict[str, object]] = {}
+                    for p, emb in ctrl_embs[mn].items():
+                        ctrl_by_id.setdefault(Path(p).parent.name, {})[p] = emb
+
+                    for id_name, embs in ctrl_by_id.items():
+                        best = max(
+                            float(np.dot(query, emb) /
+                                  (qnorm * np.linalg.norm(emb) + 1e-10))
+                            for emb in embs.values()
+                        )
+                        id_scores.setdefault(id_name, []).append(best)
+
+                    # Ext gallery datasets
+                    for ds in ext_datasets:
+                        try:
+                            ext_rows = self._db.get_ext_gallery_embeddings_for_dataset_model(
+                                ds["id"], mn)
+                        except Exception:
+                            continue
+                        ext_by_id: dict[str, list] = {}
+                        for id_name, emb in ext_rows:
+                            ext_by_id.setdefault(id_name, []).append(emb)
+                        for id_name, embs in ext_by_id.items():
+                            best = max(
+                                float(np.dot(query, emb) /
+                                      (qnorm * np.linalg.norm(emb) + 1e-10))
+                                for emb in embs
+                            )
+                            id_scores.setdefault(id_name, []).append(best)
+
+                if not id_scores:
+                    return None
+
+                # Average across models, pick best identity
+                ranked = sorted(
+                    ((name, sum(s) / len(s)) for name, s in id_scores.items()),
+                    key=lambda x: x[1], reverse=True,
+                )
+                best_id = ranked[0][0]
+
+                # Find the specific closest image for best_id
+                best_score = -2.0
+                best_img   = ""
+                for mn in model_names:
+                    query = adv_embs.get(mn, {}).get(adv_path)
+                    if query is None:
+                        continue
+                    qnorm = np.linalg.norm(query)
+                    if qnorm < 1e-10:
+                        continue
+                    # Search control images
+                    for p, emb in ctrl_embs[mn].items():
+                        if Path(p).parent.name != best_id:
+                            continue
+                        s = float(np.dot(query, emb) /
+                                  (qnorm * np.linalg.norm(emb) + 1e-10))
+                        if s > best_score:
+                            best_score = s
+                            best_img   = p
+                    # Search ext gallery images (with actual paths)
+                    for ds in ext_datasets:
+                        try:
+                            ext_rows = self._db.get_ext_gallery_embeddings_with_path(
+                                ds["id"], mn)
+                        except Exception:
+                            continue
+                        for img_path, id_name, emb in ext_rows:
+                            if id_name != best_id:
+                                continue
+                            s = float(np.dot(query, emb) /
+                                      (qnorm * np.linalg.norm(emb) + 1e-10))
+                            if s > best_score:
+                                best_score = s
+                                best_img   = img_path   # real path now
+
+                return (best_id, best_img) if best_id else None
+
             cache = []
             for identity, images in identity_images.items():
-                positions = [img["gallery_position"] for img in images]
-                best_pos  = max(positions)
-                avg_pos   = sum(positions) / len(positions)
-                best_img  = max(images, key=lambda x: x["gallery_position"])
+                positions  = [img["gallery_position"] for img in images]
+                best_pos   = max(positions)   # highest rank = best attack
+                worst_pos  = min(positions)   # lowest rank = worst attack
+                avg_pos    = sum(positions) / len(positions)
+
+                # Highest gallery position = best attack (model ranked target identity
+                # furthest down — most other identities scored higher similarity).
+                # Lowest gallery position = worst attack (model still recognises target).
+                best_img_r  = max(images, key=lambda x: x["gallery_position"])
+                worst_img_r = min(images, key=lambda x: x["gallery_position"])
+
+                ref_path      = best_img_r["matched_image_path"] or ""
+                ref_ext_info  = _ext_info(ref_path)
+
+                # Top-1 any-identity match for the BEST attack image — this is the
+                # identity the model confused the attacker with when the disguise worked.
+                top1_result = _find_top1_any(best_img_r["image_path"])
+                if top1_result:
+                    top1_id, top1_img = top1_result
+                    top1_ext = _ext_info(top1_img)   # None if control, dict if ext dataset
+                else:
+                    top1_id  = ""
+                    top1_img = ""
+                    top1_ext = None
+
                 cache.append({
-                    "identity":   identity,
-                    "images":     images,
-                    "positions":  positions,
-                    "best_pos":   best_pos,
-                    "avg_pos":    avg_pos,
-                    "best_img":   best_img["image_path"],
-                    "best_ref":   best_img["matched_image_path"] or "",
-                    "n_images":   len(images),
+                    "identity":        identity,
+                    "images":          images,
+                    "positions":       positions,
+                    "best_pos":        best_pos,
+                    "worst_pos":       worst_pos,
+                    "avg_pos":         avg_pos,
+                    "best_img":        best_img_r["image_path"],
+                    "best_ref":        ref_path,
+                    "best_ref_ext":    ref_ext_info,
+                    "worst_top1_id":   top1_id,
+                    "worst_top1_img":  top1_img,
+                    "worst_top1_ext":  top1_ext,
+                    "n_images":        len(images),
                 })
 
             cache.sort(key=lambda x: (x["best_pos"], x["avg_pos"]), reverse=True)
-            return cache
 
-        def _on_done(cache):
+            # Gallery size stats: control group (captures table) + ext datasets
+            try:
+                ctrl_stats  = self._db.get_control_gallery_stats()   # {identities, images}
+            except Exception:
+                ctrl_stats  = {"identities": 0, "images": 0}
+            try:
+                ext_images   = sum(d["image_count"] for d in ext_datasets)
+                ext_ids_sets: set[str] = set()
+                for d in ext_datasets:
+                    try:
+                        ids = self._db.get_ext_gallery_identity_names(d["id"])
+                        ext_ids_sets.update(ids)
+                    except Exception:
+                        pass
+                ext_identities = len(ext_ids_sets)
+            except Exception:
+                ext_images     = 0
+                ext_identities = 0
+
+            gallery_stats = {
+                "ctrl_identities": ctrl_stats.get("identities", 0),
+                "ctrl_images":     ctrl_stats.get("images", 0),
+                "ext_identities":  ext_identities,
+                "ext_images":      ext_images,
+                "ext_datasets":    len(ext_datasets) if ext_datasets else 0,
+            }
+            return cache, gallery_stats
+
+        def _on_done(cache, gallery_stats):
             self._gs_cache = cache
+            self._gs_gallery_stats = gallery_stats
             self._gs_page = 0
             self._render_gs_page()
 
         def _bg():
             try:
-                cache = _query()
+                cache, gallery_stats = _query()
             except Exception:
                 import traceback
                 traceback.print_exc()
-                cache = []
+                cache, gallery_stats = [], {}
             try:
                 if self.winfo_exists():
-                    self.after(0, lambda: _on_done(cache))
+                    self.after(0, lambda: _on_done(cache, gallery_stats))
             except (RuntimeError, tk.TclError):
                 pass
 
@@ -915,7 +1464,9 @@ class RankingTab(ctk.CTkFrame):
 
     @staticmethod
     def _gs_pos_colour(pos: int) -> str:
-        """Colour-code a gallery search position: 1=red, 2-5=yellow, 6+=green."""
+        """Colour-code a gallery search position.
+        High position = model confused attacker with many others = best attack (green).
+        Position 1 = model still recognises target = worst attack (red)."""
         if pos == 1:
             return "#ff6b6b"
         elif pos <= 5:
@@ -930,8 +1481,9 @@ class RankingTab(ctk.CTkFrame):
         self._thumb_refs.clear()
 
         # Column layout:
-        # 0=Rank  1=Identity  2=Positions  3=Best  4=Avg  5=BestAttack  6=Reference
-        _GS_COLS = 7
+        # 0=Rank  1=Identity  2=Positions  3=Best  4=Avg
+        # 5=Best Attack  6=Closest (same id)  7=Closest (any id)
+        _GS_COLS = 8
         for i in range(_GS_COLS):
             body.columnconfigure(i, weight=1)
 
@@ -943,7 +1495,16 @@ class RankingTab(ctk.CTkFrame):
                          "Score adversarial images first, then refresh.",
                          font=self._font_12, text_color="#555").grid(
                 row=0, column=0, columnspan=_GS_COLS, pady=30)
-            self._gs_summary.configure(text="0 identities.")
+            gs = self._gs_gallery_stats
+            if gs:
+                ctrl_part = (f"{gs.get('ctrl_images',0)} ctrl / "
+                             f"{gs.get('ctrl_identities',0)} id")
+                ext_part  = (f"{gs.get('ext_images',0)} ext / "
+                             f"{gs.get('ext_identities',0)} id")
+                self._gs_summary.configure(
+                    text=f"0 attackers  •  Gallery: {ctrl_part}  +  {ext_part}")
+            else:
+                self._gs_summary.configure(text="0 identities.")
             self._gs_lbl_page.configure(text="")
             self._gs_btn_prev.configure(state="disabled")
             self._gs_btn_next.configure(state="disabled")
@@ -958,7 +1519,8 @@ class RankingTab(ctk.CTkFrame):
         # Header
         HDR_BG = "#16213e"
         headers = ["Rank", "Identity", "Positions (per image)",
-                   "Best", "Avg", "Best Attack", "Reference"]
+                   "Best", "Avg",
+                   "Best Attack", "Closest (same id)", "Closest (any id)"]
         for col, text in enumerate(headers):
             ctk.CTkLabel(body, text=text,
                          font=self._font_11_bold,
@@ -1021,17 +1583,32 @@ class RankingTab(ctk.CTkFrame):
                          font=self._font_11, anchor="center").grid(
                 row=grid_row, column=4, padx=4, pady=3, sticky="ew")
 
-            # Best Attack thumbnail
+            # Best Attack thumbnail (highest gallery position = hardest to identify)
             self._add_thumb(body, entry["best_img"], grid_row, col=5,
                             label="best attack")
 
-            # Reference thumbnail
-            self._add_thumb(body, entry["best_ref"], grid_row, col=6,
-                            label="closest match")
+            # Closest (same identity) — reference for the best attack
+            self._add_gs_ref_cell(body, entry["best_ref"],
+                                  entry.get("best_ref_ext"), grid_row, col=6)
 
+            # Closest (any identity) — top-1 gallery match for the worst attack
+            top1_img = entry.get("worst_top1_img", "")
+            top1_ext = entry.get("worst_top1_ext")
+            self._add_gs_ref_cell(body, top1_img, top1_ext, grid_row, col=7)
+
+        gs = self._gs_gallery_stats
+        ctrl_part = (f"{gs.get('ctrl_images',0)} ctrl img / "
+                     f"{gs.get('ctrl_identities',0)} identities")
+        ext_part  = (f"{gs.get('ext_images',0)} ext img / "
+                     f"{gs.get('ext_identities',0)} identities "
+                     f"({gs.get('ext_datasets',0)} dataset"
+                     f"{'s' if gs.get('ext_datasets',0) != 1 else ''})")
+        total_gallery_ids = gs.get('ctrl_identities', 0) + gs.get('ext_identities', 0)
         self._gs_summary.configure(
-            text=f"{total} identit{'y' if total == 1 else 'ies'} — "
-                 f"ranked by best gallery position ASC  •  "
+            text=f"{total} attacker{'s' if total != 1 else ''} ranked  •  "
+                 f"Gallery: {ctrl_part}  +  {ext_part}  "
+                 f"= {total_gallery_ids} total identities  •  "
+                 f"best position = highest gallery rank  •  "
                  f"showing {start + 1}–{end}")
         self._gs_lbl_page.configure(
             text=f"Page {self._gs_page + 1} / {total_pages}")
@@ -1040,7 +1617,168 @@ class RankingTab(ctk.CTkFrame):
         self._gs_btn_next.configure(
             state="normal" if self._gs_page < total_pages - 1 else "disabled")
 
-    # ── Cell helpers ──────────────────────────────────────────────────────────
+    def _add_gs_ref_cell(self, body, path: str, ext_info: dict | None,
+                         grid_row: int, col: int,
+                         override_label: str = "") -> None:
+        """Render a reference cell in the Gallery Search table.
+
+        For control images (ext_info is None) show the usual thumbnail.
+        For external dataset images, load the image from its real path and show
+        it alongside the dataset name, identity and filename — all centred.
+        """
+        if ext_info:
+            # Coloured border frame signals this is an external dataset image
+            frame = ctk.CTkFrame(body, fg_color="transparent",
+                                 border_width=2, border_color="#00d4ff",
+                                 corner_radius=6)
+            frame.grid(row=grid_row, column=col, padx=6, pady=3)
+
+            # Dataset name — shown as fallback if image cannot be loaded;
+            # hidden once the image loads successfully (frame border stays as indicator)
+            lbl_dataset  = ctk.CTkLabel(frame,
+                             text=ext_info["dataset"],
+                             font=self._font_11_bold,
+                             text_color="#00d4ff",
+                             anchor="center")
+            lbl_dataset.pack(anchor="center", padx=6, pady=(4, 0))
+            lbl_identity = ctk.CTkLabel(frame,
+                             text=ext_info["identity"],
+                             font=self._font_11,
+                             text_color="#aaa",
+                             anchor="center")
+            lbl_identity.pack(anchor="center")
+            lbl_filename = ctk.CTkLabel(frame,
+                             text=ext_info["filename"],
+                             font=ctk.CTkFont(family="Courier New", size=9),
+                             text_color="#555",
+                             anchor="center")
+            lbl_filename.pack(anchor="center", pady=(0, 4))
+
+            # Load the actual image if path exists on disk
+            if path and Path(path).exists():
+                placeholder = ctk.CTkLabel(frame, text="…", text_color="#444",
+                                           font=self._font_11,
+                                           width=_THUMB, height=_THUMB)
+                placeholder.pack(anchor="center", pady=4, before=lbl_dataset)
+
+                def _load(p=path, pl=placeholder,
+                          ld=lbl_dataset, li=lbl_identity, lf=lbl_filename,
+                          info=ext_info):
+                    try:
+                        img = Image.open(p).convert("RGB")
+                        img.thumbnail((_THUMB, _THUMB))
+                        out = Image.new("RGB", (_THUMB, _THUMB), (30, 30, 42))
+                        out.paste(img, ((_THUMB - img.width) // 2,
+                                        (_THUMB - img.height) // 2))
+                    except Exception:
+                        return   # keep text labels visible as fallback
+
+                    def _apply(pil_img=out, pl=pl,
+                               ld=ld, li=li, lf=lf, info=info):
+                        try:
+                            if not pl.winfo_exists():
+                                return
+                        except Exception:
+                            return
+                        ctk_img = ctk.CTkImage(light_image=pil_img,
+                                               dark_image=pil_img,
+                                               size=(_THUMB, _THUMB))
+                        self._thumb_refs.append(ctk_img)
+                        pl.configure(image=ctk_img, text="",
+                                     cursor="hand2", width=_THUMB, height=_THUMB)
+                        pl.bind("<Button-1>",
+                                lambda e, pp=p: self._open_viewer(pp, "closest any-id"))
+
+                        # Image loaded — hide all text, info moves to right-click
+                        try:
+                            ld.pack_forget()
+                            li.pack_forget()
+                            lf.pack_forget()
+                        except Exception:
+                            pass
+
+                        def _show_context(event, pp=p, info=info):
+                            menu = tk.Menu(pl, tearoff=0)
+                            menu.add_command(
+                                label=f"Dataset:   {info['dataset']}",
+                                state="disabled")
+                            menu.add_command(
+                                label=f"Identity:  {info['identity']}",
+                                state="disabled")
+                            menu.add_command(
+                                label=f"File:      {info['filename']}",
+                                state="disabled")
+                            menu.add_separator()
+                            menu.add_command(
+                                label="Copy path",
+                                command=lambda: (
+                                    pl.clipboard_clear(),
+                                    pl.clipboard_append(pp)
+                                ))
+                            menu.add_command(
+                                label="View full size",
+                                command=lambda: self._open_viewer(pp, "closest any-id"))
+                            try:
+                                menu.tk_popup(event.x_root, event.y_root)
+                            finally:
+                                menu.grab_release()
+
+                        pl.bind("<Button-3>", _show_context)
+
+                    try:
+                        if self.winfo_exists():
+                            self.after(0, _apply)
+                    except Exception:
+                        pass
+                threading.Thread(target=_load, daemon=True).start()
+        else:
+            if override_label:
+                frame = ctk.CTkFrame(body, fg_color="transparent")
+                frame.grid(row=grid_row, column=col, padx=4, pady=3)
+                ctk.CTkLabel(frame,
+                             text=override_label,
+                             font=self._font_11_bold,
+                             text_color="#e0e0e0",
+                             anchor="center").pack(anchor="center")
+                if path:
+                    placeholder = ctk.CTkLabel(frame, text="…", text_color="#444",
+                                               font=self._font_11,
+                                               width=_THUMB, height=_THUMB)
+                    placeholder.pack(anchor="center")
+
+                    def _load(p=path, pl=placeholder):
+                        try:
+                            img = Image.open(p).convert("RGB")
+                            img.thumbnail((_THUMB, _THUMB))
+                            out = Image.new("RGB", (_THUMB, _THUMB), (30, 30, 42))
+                            out.paste(img, ((_THUMB - img.width) // 2,
+                                            (_THUMB - img.height) // 2))
+                        except Exception:
+                            return
+                        def _apply(pil_img=out, pl=pl):
+                            try:
+                                if not pl.winfo_exists():
+                                    return
+                            except Exception:
+                                return
+                            ctk_img = ctk.CTkImage(light_image=pil_img,
+                                                   dark_image=pil_img,
+                                                   size=(_THUMB, _THUMB))
+                            self._thumb_refs.append(ctk_img)
+                            pl.configure(image=ctk_img, text="",
+                                         cursor="hand2", width=_THUMB, height=_THUMB)
+                            pl.bind("<Button-1>",
+                                    lambda e, pp=p: self._open_viewer(pp, "closest any-id"))
+                        try:
+                            if self.winfo_exists():
+                                self.after(0, _apply)
+                        except Exception:
+                            pass
+                    threading.Thread(target=_load, daemon=True).start()
+            else:
+                self._add_thumb(body, path, grid_row, col, label="closest match")
+
+    # ── Thumbnail loader ──────────────────────────────────────────────────────
 
     def _add_thumb(self, body, path: str, grid_row: int, col: int,
                    label: str, tags: dict | None = None) -> None:

@@ -101,6 +101,27 @@ class Database:
                     created_at  TEXT NOT NULL,
                     PRIMARY KEY (image_path, model_name)
                 );
+
+                CREATE TABLE IF NOT EXISTS ext_gallery_datasets (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    folder_path  TEXT    NOT NULL UNIQUE,
+                    display_name TEXT    NOT NULL,
+                    image_count  INTEGER NOT NULL DEFAULT 0,
+                    created_at   TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ext_gallery_embeddings (
+                    dataset_id    INTEGER NOT NULL
+                                  REFERENCES ext_gallery_datasets(id) ON DELETE CASCADE,
+                    image_path    TEXT    NOT NULL,
+                    identity_name TEXT    NOT NULL,
+                    model_name    TEXT    NOT NULL,
+                    embedding     BLOB    NOT NULL,
+                    PRIMARY KEY (image_path, model_name)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_ext_gallery_emb_identity
+                    ON ext_gallery_embeddings (identity_name, model_name);
             """)
 
         for col in ("identity_name", "matched_image_path"):
@@ -169,6 +190,41 @@ class Database:
                 "(image_path, model_name, embedding, created_at) VALUES (?,?,?,?)",
                 (image_path, model_name, blob, now),
             )
+
+    def get_control_embeddings_for_model(self, model_name: str) -> dict[str, object]:
+        """Return {image_path: embedding_array} for control images only
+        (i.e. paths that appear in the captures table), for one model."""
+        import numpy as np
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT e.image_path, e.embedding "
+                "FROM embeddings e "
+                "INNER JOIN captures c ON c.image_path = e.image_path "
+                "WHERE e.model_name = ?",
+                (model_name,),
+            ).fetchall()
+        return {
+            r["image_path"]: np.frombuffer(r["embedding"], dtype=np.float32).copy()
+            for r in rows
+        }
+
+
+    def get_adversarial_embeddings_for_model(self, model_name: str) -> dict[str, object]:
+        """Return {image_path: embedding_array} for adversarial images only
+        (i.e. paths that appear in the attacks table), for one model."""
+        import numpy as np
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT DISTINCT e.image_path, e.embedding "
+                "FROM embeddings e "
+                "INNER JOIN attacks a ON a.image_path = e.image_path "
+                "WHERE e.model_name = ?",
+                (model_name,),
+            ).fetchall()
+        return {
+            r["image_path"]: np.frombuffer(r["embedding"], dtype=np.float32).copy()
+            for r in rows
+        }
 
     def get_all_embeddings_for_model(self, model_name: str) -> dict[str, object]:
         """Return {image_path: embedding_array} for all cached entries of a model."""
@@ -503,6 +559,169 @@ class Database:
                 "matched_image_path FROM attacks"
             ).fetchall()
         return [dict(r) for r in rows]
+
+
+    # ── External gallery datasets ─────────────────────────────────────────────
+
+    def add_ext_gallery_dataset(self, folder_path: str, display_name: str) -> int:
+        """Register a new external gallery dataset. Returns its id."""
+        with self._connect() as con:
+            cur = con.execute(
+                "INSERT OR IGNORE INTO ext_gallery_datasets "
+                "(folder_path, display_name, image_count, created_at) VALUES (?,?,0,?)",
+                (str(folder_path), display_name, _now()),
+            )
+            if cur.lastrowid and cur.lastrowid > 0:
+                return cur.lastrowid
+            row = con.execute(
+                "SELECT id FROM ext_gallery_datasets WHERE folder_path=?",
+                (str(folder_path),),
+            ).fetchone()
+            return row["id"] if row else -1
+
+    def update_ext_gallery_image_count(self, dataset_id: int, count: int) -> None:
+        with self._connect() as con:
+            con.execute(
+                "UPDATE ext_gallery_datasets SET image_count=? WHERE id=?",
+                (count, dataset_id),
+            )
+
+    def get_ext_gallery_datasets(self) -> list[dict]:
+        """Return all registered external datasets."""
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT id, folder_path, display_name, image_count, created_at "
+                "FROM ext_gallery_datasets ORDER BY created_at"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def remove_ext_gallery_dataset(self, dataset_id: int) -> None:
+        """Delete a dataset and all its embeddings (CASCADE)."""
+        with self._connect() as con:
+            con.execute(
+                "DELETE FROM ext_gallery_datasets WHERE id=?", (dataset_id,)
+            )
+
+    def upsert_ext_gallery_embedding(
+        self, dataset_id: int, image_path: str,
+        identity_name: str, model_name: str, embedding
+    ) -> None:
+        """Store one embedding for an external gallery image."""
+        blob = embedding.astype("float32").tobytes()
+        with self._connect() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO ext_gallery_embeddings "
+                "(dataset_id, image_path, identity_name, model_name, embedding) "
+                "VALUES (?,?,?,?,?)",
+                (dataset_id, image_path, identity_name, model_name, blob),
+            )
+
+    def bulk_upsert_ext_gallery_embeddings(
+        self,
+        rows: list[tuple],   # (dataset_id, image_path, identity_name, model_name, blob)
+    ) -> None:
+        with self._connect() as con:
+            con.executemany(
+                "INSERT OR REPLACE INTO ext_gallery_embeddings "
+                "(dataset_id, image_path, identity_name, model_name, embedding) "
+                "VALUES (?,?,?,?,?)",
+                rows,
+            )
+
+    def get_ext_gallery_embeddings_for_identity(
+        self, identity_name: str, model_name: str
+    ) -> dict[str, object]:
+        """Return {image_path: embedding_array} for a given identity + model."""
+        import numpy as np
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT image_path, embedding FROM ext_gallery_embeddings "
+                "WHERE identity_name=? AND model_name=?",
+                (identity_name, model_name),
+            ).fetchall()
+        return {
+            r["image_path"]: np.frombuffer(r["embedding"], dtype=np.float32).copy()
+            for r in rows
+        }
+
+    def get_ext_gallery_embeddings_with_path(
+        self, dataset_id: int, model_name: str
+    ) -> list[tuple[str, str, object]]:
+        """Return list of (image_path, identity_name, embedding_array) for all
+        images in a dataset for one model. Used for closest-image lookup."""
+        import numpy as np
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT image_path, identity_name, embedding "
+                "FROM ext_gallery_embeddings "
+                "WHERE dataset_id=? AND model_name=?",
+                (dataset_id, model_name),
+            ).fetchall()
+        return [
+            (r["image_path"], r["identity_name"],
+             np.frombuffer(r["embedding"], dtype=np.float32).copy())
+            for r in rows
+        ]
+
+    def get_ext_gallery_embeddings_for_dataset_model(
+        self, dataset_id: int, model_name: str
+    ) -> list[tuple[str, object]]:
+        """Return list of (identity_name, embedding_array) for all images in a
+        dataset for one model. Used by _build_merged_gallery in recognition_tab."""
+        import numpy as np
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT identity_name, embedding FROM ext_gallery_embeddings "
+                "WHERE dataset_id=? AND model_name=?",
+                (dataset_id, model_name),
+            ).fetchall()
+        return [
+            (r["identity_name"],
+             np.frombuffer(r["embedding"], dtype=np.float32).copy())
+            for r in rows
+        ]
+
+    def count_ext_gallery_embeddings(self, dataset_id: int) -> int:
+        """Count distinct images (any model) stored for a dataset."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT COUNT(DISTINCT image_path) AS n "
+                "FROM ext_gallery_embeddings WHERE dataset_id=?",
+                (dataset_id,),
+            ).fetchone()
+        return row["n"] if row else 0
+
+    def get_ext_gallery_existing_paths(self, dataset_id: int) -> set[str]:
+        """Return set of image_path values already embedded for this dataset."""
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT DISTINCT image_path FROM ext_gallery_embeddings "
+                "WHERE dataset_id=?",
+                (dataset_id,),
+            ).fetchall()
+        return {r["image_path"] for r in rows}
+
+    def get_ext_gallery_identity_names(self, dataset_id: int) -> list[str]:
+        """Return distinct identity names stored for a dataset."""
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT DISTINCT identity_name FROM ext_gallery_embeddings "
+                "WHERE dataset_id=?",
+                (dataset_id,),
+            ).fetchall()
+        return [r["identity_name"] for r in rows]
+
+    def get_control_gallery_stats(self) -> dict:
+        """Return {identities: N, images: M} for the control gallery (captures table)."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT COUNT(DISTINCT u.name) AS identities, "
+                "COUNT(c.id) AS images "
+                "FROM users u LEFT JOIN captures c ON c.user_id = u.id"
+            ).fetchone()
+        if row:
+            return {"identities": row["identities"], "images": row["images"]}
+        return {"identities": 0, "images": 0}
 
 
 def _now() -> str:

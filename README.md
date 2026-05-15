@@ -213,11 +213,28 @@ Three sub-tabs:
 
 - **All Images** — every scored image, filterable by model or showing the cross-model average. Displays attack and closest-match thumbnails (loaded asynchronously) with tag badges on attack images. Individual rows can be deleted. Paginated with go-to-page navigation.
 
-- **Gallery Search** — per-identity summary of gallery search positions. Each row shows the identity name, per-image gallery-search position badges (colour-coded: red = position 1, yellow = 2–5, green = 6+), the best and average positions across all their adversarial images, and thumbnails of the best-ranked attack and its closest reference image. Ranked by best position ascending (lower = harder to distinguish from the gallery). Paginated with go-to-page navigation.
+- **Gallery Search** — per-identity summary of gallery search positions across all scored adversarial images. Each row shows:
+  - The identity name and colour-coded position badges per image (green = high position = best attack, yellow = 2–5, red = position 1 = model still recognises)
+  - **Best** and **Avg** position across all their images
+  - **Best Attack** — thumbnail of the adversarial image with the highest gallery position (most confused)
+  - **Closest (same id)** — the control image most similar to that best attack
+  - **Closest (any id)** — the gallery image (control or external dataset) that the best attack was most confused with; if from an external dataset, shows the dataset name, identity, filename, and a thumbnail if the file is accessible
+  - Ranked by best position descending (highest position = hardest to distinguish from the gallery)
+  - Paginated with go-to-page navigation
+
+  **External Gallery panel** (right side of the Gallery Search tab): expand the gallery used for position ranking by loading additional image datasets. Subfolders within the selected folder are treated as identities. Features:
+  - **＋ Add Folder** — open a folder picker; all images are face-detected, aligned, and embedded across all models in a parallel worker pool (4 threads). Already-embedded images are skipped on re-import
+  - **✕ Cancel** — appears during import; stops after the current batch and keeps all partial data already written to the database. Re-adding the same folder later resumes from where it left off
+  - Dataset list showing name and image count, with a ✕ remove button per entry (confirmation dialog required)
+  - **↻ Recompute Positions** — recomputes gallery search positions for all existing adversarial images using the merged gallery (control + all external datasets). Disabled during import
+  - Progress bar and status label showing images processed, accepted, and current identity
+  - Gallery summary line showing total identities and images from both control and external sources
+
+  External gallery data is stored in the database (`ext_gallery_datasets` and `ext_gallery_embeddings` tables) and is used exclusively for gallery search position computation — it does not affect scoring, recognition thresholds, or any other tab.
 
 #### Thumbnail Previews
 
-Clicking any thumbnail in any sub-tab opens a full-screen viewer. The viewer automatically displays the lossless high-quality companion image (`img_NNN_hq.png`) when it exists alongside the saved crop, so you always see the original unprocessed frame rather than the 112×112 aligned crop.
+Clicking any thumbnail in any sub-tab opens a full-screen viewer. The viewer automatically displays the lossless high-quality companion image (`img_NNN_hq.png`) when it exists alongside the saved crop, so you always see the original unprocessed frame rather than the 112×112 aligned crop. External gallery thumbnails in the Gallery Search tab open the original file directly from its source folder.
 
 #### Podium View
 
@@ -236,5 +253,7 @@ The "Clear All" button opens a dialog with two options:
 |---|---|
 | `users` | Registered identity names |
 | `captures` | Control picture paths linked to users |
-| `attacks` | Per-model similarity scores for each adversarial image, plus classification tags (pattern_id, is_frontal, is_profile, is_pitch) |
-| `embeddings` | Cached face embeddings (image_path × model_name → float32 BLOB) |
+| `attacks` | Per-model similarity scores for each adversarial image, plus classification tags (pattern_id, is_frontal, is_profile, is_pitch), and gallery search position (gallery_position, gallery_total) |
+| `embeddings` | Cached face embeddings for control and adversarial images (image_path × model_name → float32 BLOB) |
+| `ext_gallery_datasets` | Registered external gallery folders (id, folder_path, display_name, image_count) |
+| `ext_gallery_embeddings` | Face embeddings for external gallery images (dataset_id, image_path, identity_name, model_name → float32 BLOB); deleted automatically when the parent dataset is removed |

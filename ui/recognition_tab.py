@@ -1501,18 +1501,40 @@ class RecognitionTab(ctk.CTkFrame):
             # For each model, compute the best similarity to each identity's
             # gallery.  Average across models, then sort descending (highest
             # similarity first) to get a ranked identification list.
+            # The gallery includes both control images AND any external datasets.
             gallery_search_result: dict | None = None
             if query_embeddings:
+                # Build merged gallery (control + ext datasets) for this scoring.
+                # _build_merged_gallery() does a DB read for ext embeddings; it
+                # runs here on the background _infer thread, so this is safe.
+                merged_gallery = self._build_merged_gallery()
+
                 identity_avg: dict[str, list[float]] = {}  # name → per-model best scores
                 for model_name, query in query_embeddings.items():
-                    all_identities = self._gallery_paths.get(model_name, {})
-                    for id_name, pairs in all_identities.items():
-                        best = max(
-                            (self._engine.cosine_similarity(query, emb)
-                             for _, emb in pairs),
-                            default=-2.0,
-                        )
-                        identity_avg.setdefault(id_name, []).append(best)
+                    if model_name not in merged_gallery:
+                        # Fall back to in-memory control gallery if ext merge failed
+                        all_identities = self._gallery_paths.get(model_name, {})
+                        for id_name, pairs in all_identities.items():
+                            best = max(
+                                (self._engine.cosine_similarity(query, emb)
+                                 for _, emb in pairs),
+                                default=-2.0,
+                            )
+                            identity_avg.setdefault(id_name, []).append(best)
+                        continue
+
+                    id_names, boundaries, gallery_mat = merged_gallery[model_name]
+                    norms = np.linalg.norm(gallery_mat, axis=1)
+                    qnorm = np.linalg.norm(query)
+                    if qnorm < 1e-10:
+                        continue
+                    sims = (gallery_mat @ query) / (norms * qnorm + 1e-10)
+
+                    prev = 0
+                    for idx, boundary in enumerate(boundaries):
+                        best = float(np.max(sims[prev:boundary]))
+                        prev = boundary
+                        identity_avg.setdefault(id_names[idx], []).append(best)
 
                 # Build ranked list: (identity, cross-model average best similarity)
                 ranked = sorted(
@@ -1754,34 +1776,79 @@ class RecognitionTab(ctk.CTkFrame):
                 best_score, best_path = s, path
         return best_path
 
+    def _build_merged_gallery(
+        self,
+    ) -> dict[str, tuple[list[str], list[int], "np.ndarray"]]:
+        """Build per-model gallery matrices that include BOTH the standard
+        control gallery AND any external gallery datasets.
+
+        Returns gallery_data: model_name → (id_names, boundaries, matrix)
+        where matrix is shape (N_total_images, embedding_dim) and boundaries
+        is a cumulative image-count list aligned with id_names, exactly as
+        expected by _recompute_gallery_positions and the live scorer.
+        """
+        model_names   = self._engine.model_names
+        gallery_paths = self._gallery_paths   # model → identity → [(path, emb)]
+
+        # Start from the standard control gallery
+        # Collect: model → identity → list of embeddings
+        merged: dict[str, dict[str, list]] = {}
+        for mn in model_names:
+            identities = gallery_paths.get(mn, {})
+            for id_name, pairs in identities.items():
+                merged.setdefault(mn, {}).setdefault(id_name, []).extend(
+                    emb for _, emb in pairs
+                )
+
+        # Merge external gallery datasets (DB read — runs on background thread)
+        try:
+            datasets = self._db.get_ext_gallery_datasets()
+        except Exception:
+            datasets = []
+
+        for ds in datasets:
+            dataset_id = ds["id"]
+            for mn in model_names:
+                try:
+                    ext_embs = self._db.get_ext_gallery_embeddings_for_dataset_model(
+                        dataset_id, mn
+                    )
+                except Exception:
+                    continue
+                for id_name, emb in ext_embs:
+                    merged.setdefault(mn, {}).setdefault(id_name, []).append(emb)
+
+        # Pack into matrix structures
+        gallery_data: dict[str, tuple[list[str], list[int], "np.ndarray"]] = {}
+        for mn, identities in merged.items():
+            if not identities:
+                continue
+            id_names:     list[str] = []
+            boundaries:   list[int] = []
+            all_embs:     list      = []
+            for id_name in sorted(identities.keys()):
+                embs = identities[id_name]
+                if not embs:
+                    continue
+                id_names.append(id_name)
+                all_embs.extend(embs)
+                boundaries.append(len(all_embs))
+            if all_embs:
+                gallery_data[mn] = (id_names, boundaries, np.stack(all_embs))
+
+        return gallery_data
+
     def _recompute_gallery_positions(self) -> None:
         """Batch-recompute gallery search positions for all adversarial images
-        using the in-memory gallery and numpy batch matmul.
+        using the merged gallery (control + external datasets) and numpy batch matmul.
         Runs on a background thread — safe to call from _embed threads."""
         if not self._gallery_ready:
             return
 
         model_names = self._engine.model_names
-        gallery_paths = self._gallery_paths  # model → identity → [(path, emb)]
 
-        # Build per-model gallery matrices: identity names + stacked embeddings
-        # so we can do batch matmul instead of per-pair python loops.
-        gallery_data: dict[str, tuple[list[str], list[int], object]] = {}
-        for mn in model_names:
-            identities = gallery_paths.get(mn, {})
-            if not identities:
-                continue
-            id_names: list[str] = []
-            id_boundaries: list[int] = []  # cumulative count per identity
-            all_embs: list = []
-            for id_name in sorted(identities.keys()):
-                pairs = identities[id_name]
-                id_names.append(id_name)
-                all_embs.extend(emb for _, emb in pairs)
-                id_boundaries.append(len(all_embs))
-            if all_embs:
-                gallery_data[mn] = (id_names, id_boundaries,
-                                    np.stack(all_embs))  # (N_total, dim)
+        # Build per-model gallery matrices merging control gallery + ext datasets
+        gallery_data = self._build_merged_gallery()
 
         if not gallery_data:
             return
