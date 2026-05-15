@@ -1,5 +1,6 @@
 /Ignore/*
 data_processing/Comp1
+data_processing/results
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

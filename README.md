@@ -24,9 +24,19 @@ project/
 │   └── manual_align.py            # Manual face-alignment dialog
 │
 ├── data_processing/
-│   ├── cross_similarity.py        # A↔B cross-pattern cosine similarity analysis
-│   ├── enrich_spreadsheet.py      # Merge per-identity log scores into a single spreadsheet
-│   └── rank_correlation.py        # Spearman rank-correlation between ranking columns
+│   ├── run_all.py                    # Master script — runs every sub-script in sequence
+│   ├── config.py                     # Shared constants, thresholds, and DB helpers
+│   ├── extract_rankings.py           # Export Current Standings & Gallery Search as CSV
+│   ├── model_accuracy.py             # Per-model accuracy (overall / pose / pattern)
+│   ├── score_statistics.py           # Model-independent score stats per pose & pattern
+│   ├── cross_pattern_similarity.py   # Adversarial ↔ Adversarial cross-pattern similarity
+│   └── results/                      # Output directory
+│       ├── current_standings.csv
+│       ├── gallery_search.csv
+│       ├── model_accuracy.csv
+│       ├── score_statistics.csv
+│       ├── cross_pattern_pairs.csv
+│       └── cross_pattern_summary.csv
 │
 ├── Pretrained_Models/             # Weight files
 │   ├── iresnet.py                 # IResNet architecture definition
