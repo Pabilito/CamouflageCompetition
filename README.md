@@ -29,14 +29,10 @@ project/
 │   ├── extract_rankings.py           # Export Current Standings & Gallery Search as CSV
 │   ├── model_accuracy.py             # Per-model accuracy (overall / pose / pattern)
 │   ├── score_statistics.py           # Model-independent score stats per pose & pattern
+│   ├── score_distributions.py        # Similarity score distributions
 │   ├── cross_pattern_similarity.py   # Adversarial ↔ Adversarial cross-pattern similarity
 │   └── results/                      # Output directory
-│       ├── current_standings.csv
-│       ├── gallery_search.csv
-│       ├── model_accuracy.csv
-│       ├── score_statistics.csv
-│       ├── cross_pattern_pairs.csv
-│       └── cross_pattern_summary.csv
+│       └── <...>.csv / <...>.png
 │
 ├── Pretrained_Models/             # Weight files
 │   ├── iresnet.py                 # IResNet architecture definition

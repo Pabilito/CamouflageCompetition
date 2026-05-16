@@ -11,28 +11,43 @@ attack); high position means the model was confused with many other identities
 Statistics computed
 ───────────────────
   • Rank-N accuracy (N = 1 … 10)
-        Fraction of (image, model) pairs where gallery_position ≥ N.
-        "Position ≥ N" means the attack moved the true identity below N
-        other gallery entries, i.e. the model was fooled by at least N − 1
-        alternative identities.
+        Fraction of (image, model) pairs where gallery_position ≤ N.
+        Lower = better attack (true identity still ranked near the top).
   • Mean / std / median / min / max gallery position
+  • Mean Reciprocal Rank (MRR = mean(1/position); lower = better for attacker)
   • Attack success rate (position > 1 = model did NOT immediately identify)
 
 All three breakdowns:
-  1. Overall   — one row per model + one ALL_MODELS aggregate
-  2. Per model × pose   (frontal / profile / pitch)
-  3. Per model × pattern
+  1. Overall   — per-model positions recomputed from embeddings
+  2. Per pose  (frontal / profile / pitch)
+  3. Per pattern
 
 Two output formats per breakdown: heatmap PNG and table PNG.
+
+"All Models" rows
+─────────────────
+  Two variants are produced for the position-summary table:
+
+  • All Models (per-model avg)  — pools per-(image, model) positions across
+    all five models (same as the ALL_MODELS aggregate in the CSV).
+
+  • All Models (avg sim)  — replicates the ranking-tab Gallery Search
+    approach: for each adversarial image, cosine similarities are averaged
+    across models per gallery identity, the gallery is ranked by that
+    average, and the true identity's rank is recorded.  This is the
+    method used in the live UI.
+
+All rate columns (Rank ≤ N, MRR) are displayed on a 0–1 scale.
+Heatmap cells show "value\npos/total" to give absolute counts alongside
+the normalised metric.
 
 Produces CSV:
   gallery_search_stats.csv   — all computed metrics, one row per
                                 (model, group_by, group_value)
 
-Produces PNGs (6 files):
+Produces PNGs (3 files):
   fig_gs_rank_n_heatmap.png / fig_gs_rank_n_table.png
-  fig_gs_positions_heatmap.png / fig_gs_positions_table.png
-  fig_gs_breakdown_heatmap.png / fig_gs_breakdown_table.png
+  fig_gs_positions_table.png
 
 Usage
 ─────
@@ -86,24 +101,146 @@ FONT_HEADER = {"fontsize": 9, "fontweight": "bold"}
 
 def _build_records(rows: list[dict]) -> list[dict]:
     """
-    Flatten the raw attack rows into one record per (image_path, model_name)
-    that has a gallery_position.  Attach pose / pattern metadata.
+    Flatten raw attack rows into one record per image_path.
+
+    gallery_position is stored per-image (UPDATE ... WHERE image_path=?
+    with no model filter), so it is model-agnostic.  We deduplicate by
+    image_path and attach pose/pattern metadata.
     """
+    seen: set[str] = set()
     records = []
     for r in rows:
         pos = r.get("gallery_position")
         if pos is None:
             continue
+        path = r["image_path"]
+        if path in seen:
+            continue
+        seen.add(path)
         gt = r.get("gallery_total") or 0
         records.append({
-            "image_path":  r["image_path"],
-            "model":       r["model_name"],
-            "identity":    r.get("identity_name", ""),
-            "position":    int(pos),
+            "image_path":    path,
+            "model":         "all",
+            "identity":      r.get("identity_name", ""),
+            "position":      int(pos),
             "gallery_total": int(gt),
-            "pose":        pose_label(r),
-            "pattern_id":  r.get("pattern_id", 0) or 0,
+            "pose":          pose_label(r),
+            "pattern_id":    r.get("pattern_id", 0) or 0,
         })
+    return records
+
+def _compute_per_model_records(con, attack_rows: list[dict]) -> list[dict]:
+    """
+    Compute gallery_position per (adversarial image, model) from embeddings.
+
+    Algorithm (per model):
+      1. Query = adversarial embedding for that model.
+      2. For every gallery identity (control images in captures),
+         score = max cosine similarity across that identity's images.
+      3. Rank all identities descending; position = 1-based rank of
+         the attacker's own true identity.
+    """
+    print("  Loading gallery (control) embeddings...")
+    gallery_rows = con.execute(
+        "SELECT u.name AS identity, e.model_name, e.embedding "
+        "FROM embeddings e "
+        "INNER JOIN captures c ON c.image_path = e.image_path "
+        "INNER JOIN users u ON u.id = c.user_id"
+    ).fetchall()
+
+    gallery: dict = {}
+    for r in gallery_rows:
+        emb = np.frombuffer(r["embedding"], dtype=np.float32).copy()
+        gallery.setdefault(r["identity"], {}).setdefault(r["model_name"], []).append(emb)
+
+    gallery_identities = sorted(gallery.keys())
+    n_gallery = len(gallery_identities)
+    print(f"  Gallery: {n_gallery} identities, {len(gallery_rows)} embeddings")
+    if n_gallery == 0:
+        print("  [WARN] No gallery embeddings — falling back to stored positions")
+        return []
+
+    print("  Loading adversarial embeddings...")
+    adv_rows = con.execute(
+        "SELECT DISTINCT e.image_path, e.model_name, e.embedding "
+        "FROM embeddings e "
+        "INNER JOIN attacks a ON a.image_path = e.image_path"
+    ).fetchall()
+
+    adv: dict = {}
+    for r in adv_rows:
+        emb = np.frombuffer(r["embedding"], dtype=np.float32).copy()
+        adv.setdefault(r["image_path"], {})[r["model_name"]] = emb
+
+    meta: dict = {}
+    for r in attack_rows:
+        p = r["image_path"]
+        if p not in meta:
+            meta[p] = {
+                "identity":   r.get("identity_name", ""),
+                "pose":       pose_label(r),
+                "pattern_id": r.get("pattern_id", 0) or 0,
+                "pos_stored": r.get("gallery_position"),
+                "tot_stored": r.get("gallery_total") or n_gallery,
+            }
+
+    models = [m for m in MODEL_ORDER if any(m in adv.get(p, {}) for p in adv)]
+    print(f"  Computing positions: {len(adv)} images x {len(models)} models...")
+
+    records = []
+    for img_path, model_embs in adv.items():
+        m_meta = meta.get(img_path, {})
+        true_id = m_meta.get("identity", "")
+
+        for model in models:
+            query = model_embs.get(model)
+            if query is None:
+                stored = m_meta.get("pos_stored")
+                if stored is not None:
+                    records.append({
+                        "image_path":    img_path,
+                        "model":         model,
+                        "identity":      true_id,
+                        "position":      int(stored),
+                        "gallery_total": int(m_meta["tot_stored"]),
+                        "pose":          m_meta.get("pose", "unknown"),
+                        "pattern_id":    m_meta.get("pattern_id", 0),
+                    })
+                continue
+
+            qnorm = np.linalg.norm(query)
+            if qnorm < 1e-10:
+                continue
+
+            id_scores = []
+            for gid in gallery_identities:
+                embs = gallery[gid].get(model, [])
+                if not embs:
+                    continue
+                best = max(
+                    float(np.dot(query, e) / (qnorm * np.linalg.norm(e) + 1e-10))
+                    for e in embs
+                )
+                id_scores.append((gid, best))
+
+            if not id_scores:
+                continue
+
+            id_scores.sort(key=lambda x: x[1], reverse=True)
+            ranked = [x[0] for x in id_scores]
+            position = (ranked.index(true_id) + 1) if true_id in ranked else len(ranked) + 1
+
+            records.append({
+                "image_path":    img_path,
+                "model":         model,
+                "identity":      true_id,
+                "position":      position,
+                "gallery_total": len(id_scores),
+                "pose":          m_meta.get("pose", "unknown"),
+                "pattern_id":    m_meta.get("pattern_id", 0),
+            })
+
+    print(f"  Done: {len(records)} (image, model) position records")
     return records
 
 
@@ -114,9 +251,11 @@ def _compute_metrics(records: list[dict]) -> tuple[list[dict], list[str]]:
 
     Returns (result_rows, models_present).
     """
-    # Discover models present
     models_present = [m for m in MODEL_ORDER
                       if any(r["model"] == m for r in records)]
+    if not models_present:  # fallback: "all" pseudo-model
+        models_present = list(dict.fromkeys(
+            r["model"] for r in records))
 
     # ── bucket: model → group_by → group_value → [positions]
     buckets: dict[str, dict[str, dict[str, list[int]]]] = defaultdict(
@@ -141,6 +280,8 @@ def _compute_metrics(records: list[dict]) -> tuple[list[dict], list[str]]:
                   for k in RANK_N_VALUES}
         # Attack success: position > 1 (model did NOT immediately recognise)
         asr = float(np.mean(arr > 1)) if n else np.nan
+        # Mean Reciprocal Rank: mean(1/position); lower = better for attacker
+        mrr = float(np.mean(1.0 / arr)) if n else np.nan
         row = {
             "model":        model,
             "model_short":  model_short,
@@ -153,6 +294,7 @@ def _compute_metrics(records: list[dict]) -> tuple[list[dict], list[str]]:
             "min_pos":      float(np.min(arr))    if n else np.nan,
             "max_pos":      float(np.max(arr))    if n else np.nan,
             "attack_success_rate": asr,
+            "mrr":                 mrr,
         }
         row.update(rank_n)
         return row
@@ -185,7 +327,7 @@ def _write_csv(results: list[dict], out_path: Path) -> None:
     fieldnames = (
         ["model", "model_short", "group_by", "group_value", "n_images",
          "mean_pos", "std_pos", "median_pos", "min_pos", "max_pos",
-         "attack_success_rate"]
+         "attack_success_rate", "mrr"]
         + [f"rank{k}_acc" for k in RANK_N_VALUES]
     )
     with open(out_path, "w", newline="", encoding="utf-8") as f:
@@ -207,35 +349,79 @@ def _write_csv(results: list[dict], out_path: Path) -> None:
 #  Cell = rank-N accuracy % (overall only)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _load_rank_n_overall(results: list[dict]) -> tuple[list, list, np.ndarray]:
-    """
-    Return (model_labels, rank_labels, values) for the rank-N overall heatmap.
-    Rows = real models (not ALL_MODELS), Cols = Rank-1 … Rank-10.
-    """
-    model_labels = [m for m in MODEL_ORDER
-                    if any(r["model"] == m and r["group_by"] == "overall"
-                           for r in results)]
-    rank_labels  = [f"Rank ≤ {k}" for k in RANK_N_VALUES]
-    values       = np.full((len(model_labels), len(RANK_N_VALUES)), np.nan)
+def _load_rank_n_overall(
+        results: list[dict],
+        avg_sim_results: list[dict] | None = None,
+) -> tuple[list, list, np.ndarray, list]:
+    """Rank-N accuracy table. Rows = models + optional All (avg sim) row."""
+    _rn_full = [m for m in MODEL_ORDER
+                if any(r["model"] == m and r["group_by"] == "overall"
+                       and r["model"] != "ALL_MODELS" for r in results)]
+    if not _rn_full:
+        _rn_full = list(dict.fromkeys(
+            r["model"] for r in results
+            if r["group_by"] == "overall" and r["model"] != "ALL_MODELS"))
+    model_labels = [MODEL_SHORT.get(m, m) for m in _rn_full]
+    if avg_sim_results is not None:
+        model_labels = model_labels + ["All (avg sim)"]
 
-    mi = {m: i for i, m in enumerate(model_labels)}
+    rank_labels = [f"Rank ≤ {k}" for k in RANK_N_VALUES]
+    values      = np.full((len(model_labels), len(RANK_N_VALUES)), np.nan)
+
+    mi = {lbl: i for i, lbl in enumerate(model_labels)}
+
+    # Per-model rows
     for r in results:
         if r["group_by"] != "overall" or r["model"] == "ALL_MODELS":
             continue
-        i = mi.get(r["model"])
+        i = mi.get(MODEL_SHORT.get(r["model"], r["model"]))
         if i is None:
             continue
         for j, k in enumerate(RANK_N_VALUES):
             v = r.get(f"rank{k}_acc")
             if v is not None and not (isinstance(v, float) and np.isnan(v)):
-                values[i, j] = float(v) * 100
+                values[i, j] = float(v)
 
-    return model_labels, rank_labels, values
+    # All (avg sim) row — computed from avg_sim_results
+    if avg_sim_results is not None:
+        asi = mi.get("All (avg sim)")
+        if asi is not None:
+            avg_sim_metrics, _ = _compute_metrics(avg_sim_results)
+            for r in avg_sim_metrics:
+                if r["group_by"] == "overall" and r["model"] == "ALL_MODELS":
+                    for j, k in enumerate(RANK_N_VALUES):
+                        v = r.get(f"rank{k}_acc")
+                        if v is not None and not (isinstance(v, float) and np.isnan(v)):
+                            values[asi, j] = float(v)
+                    break
+
+    # n_images per model row (0 for avg-sim row — shown as fraction of n_images)
+    n_per_model = [0] * len(model_labels)
+    for r in results:
+        if r["group_by"] != "overall" or r["model"] == "ALL_MODELS":
+            continue
+        i = mi.get(MODEL_SHORT.get(r["model"], r["model"]))
+        if i is not None:
+            n = r.get("n_images")
+            if n:
+                try:
+                    n_per_model[i] = int(float(n))
+                except (TypeError, ValueError):
+                    pass
+    # avg-sim row: use the total unique image count
+    if avg_sim_results is not None:
+        asi = mi.get("All (avg sim)")
+        if asi is not None:
+            n_per_model[asi] = len(avg_sim_results)
+
+    return model_labels, rank_labels, values, n_per_model
 
 
 def plot_rank_n_heatmap(results: list[dict], out_path: Path,
-                        gallery_total: int = 0) -> None:
-    model_labels, rank_labels, values = _load_rank_n_overall(results)
+                        gallery_total: int = 0,
+                        avg_sim_results: list[dict] | None = None) -> None:
+    model_labels, rank_labels, values, n_per_model = _load_rank_n_overall(
+        results, avg_sim_results=avg_sim_results)
     n_rows, n_cols = values.shape
 
     fig_w = max(10, n_cols * 1.1 + 2.5)
@@ -243,44 +429,57 @@ def plot_rank_n_heatmap(results: list[dict], out_path: Path,
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     _dark(fig, ax)
 
-    im = ax.imshow(values, aspect="auto", cmap=CMAP_RATE, vmin=0, vmax=100)
+    im = ax.imshow(values, aspect="auto", cmap=CMAP_RATE, vmin=0, vmax=1)
 
     for i in range(n_rows):
         for j in range(n_cols):
             v = values[i, j]
             if np.isnan(v):
                 continue
-            color = "black" if 25 < v < 75 else "white"
-            ax.text(j, i, f"{v:.1f}%", ha="center", va="center",
-                    color=color, fontsize=8)
+            rgba = plt.get_cmap(CMAP_RATE)(v)
+            lum = 0.299*rgba[0] + 0.587*rgba[1] + 0.114*rgba[2]
+            color = "black" if lum > 0.45 else "white"
+            n_total = n_per_model[i]
+            k_pos   = int(round(v * n_total)) if n_total > 0 else 0
+            frac_s  = f"\n{k_pos}/{n_total}" if n_total > 0 else ""
+            ax.text(j, i, f"{v:.3f}{frac_s}", ha="center", va="center",
+                    color=color, fontsize=7.5, fontweight="bold", linespacing=1.3)
+
+    # Separator before All (avg sim) row if present
+    if "All (avg sim)" in model_labels:
+        sep_i = model_labels.index("All (avg sim)")
+        ax.axhline(sep_i - 0.5, color=FG, lw=0.8, alpha=0.4)
 
     ax.set_xticks(range(n_cols))
     ax.set_xticklabels(rank_labels, rotation=30, ha="right",
                        fontsize=9, color=FG)
     ax.set_yticks(range(n_rows))
+    yticklabels = model_labels
     ax.set_yticklabels(model_labels, fontsize=9, color=FG)
+    for tick, lbl in zip(ax.get_yticklabels(), model_labels):
+        tick.set_color("#ffdd88" if lbl == "All (avg sim)" else FG)
+        tick.set_fontweight("bold" if lbl == "All (avg sim)" else "normal")
     ax.tick_params(colors=FG, length=0)
     for sp in ax.spines.values():
         sp.set_visible(False)
 
     cbar = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.025)
-    cbar.set_label("Rank-N Accuracy (%)", color=FG, fontsize=9)
+    cbar.set_label("Rank-N Accuracy (0–1)", color=FG, fontsize=9)
     _style_cbar(cbar)
 
     gt_note = f"  (gallery size ≈ {gallery_total})" if gallery_total else ""
     ax.set_title(f"Gallery Search — Rank-N Accuracy per Model{gt_note}",
                  color=FG, **FONT_TITLE, pad=12)
-    _subtitle(ax, "Rank ≤ N accuracy = fraction where target ranked within top N  |  "
-              "green = lower recognition rate = better attack")
     fig.tight_layout()
     _save(fig, out_path)
 
 
 def plot_rank_n_table(results: list[dict], out_path: Path,
-                      gallery_total: int = 0) -> None:
-    model_labels, rank_labels, values_pct = _load_rank_n_overall(results)
-    n_rows, n_cols = values_pct.shape
-    values = values_pct / 100.0
+                      gallery_total: int = 0,
+                      avg_sim_results: list[dict] | None = None) -> None:
+    model_labels, rank_labels, values, n_per_model = _load_rank_n_overall(
+        results, avg_sim_results=avg_sim_results)
+    n_rows, n_cols = values.shape
 
     annots = [[""] * n_cols for _ in range(n_rows)]
     for i in range(n_rows):
@@ -289,57 +488,199 @@ def plot_rank_n_table(results: list[dict], out_path: Path,
             if not np.isnan(v):
                 annots[i][j] = f"{v:.3f}"
 
+    avg_sim_idx = next((i for i, l in enumerate(model_labels)
+                        if l == "All (avg sim)"), None)
+    sep_rows  = [avg_sim_idx] if avg_sim_idx is not None else None
+    bold_rows = [avg_sim_idx] if avg_sim_idx is not None else None
+
     gt_note = f"  (gallery size ≈ {gallery_total})" if gallery_total else ""
     _plain_table(
         title=f"Gallery Search — Rank-N Accuracy per Model{gt_note}",
-        subtitle="Rank ≤ N accuracy (0–1) — fraction where target ranked within top N  |  lower = better attack",
         row_labels=model_labels,
         col_labels=rank_labels,
         values=values,
         annots=annots,
         out_path=out_path,
+        sep_before_rows=sep_rows,
+        bold_rows=bold_rows,
         row_label_header="Model",
     )
-def _load_position_summary(results: list[dict]) -> tuple[list, list, np.ndarray, list]:
+def _compute_avg_sim_positions(con) -> list[dict] | None:
     """
-    Rows = all models + ALL_MODELS (overall only).
-    Cols = Mean Pos / Median Pos / ASR% / Rank1 / Rank5 / Rank10.
-    """
-    row_labels = [m for m in MODEL_ORDER
-                  if any(r["model"] == m and r["group_by"] == "overall"
-                         for r in results)] + ["ALL_MODELS"]
-    col_keys   = ["mean_pos", "median_pos", "attack_success_rate",
-                  "rank1_acc", "rank5_acc", "rank10_acc"]
-    col_labels = ["Mean Pos", "Median Pos", "ASR %",
-                  "Rank ≤ 1 %", "Rank ≤ 5 %", "Rank ≤ 10 %"]
+    Compute per-image gallery position using averaged cosine similarity
+    across all models — the same method as the ranking-tab Gallery Search tab.
 
-    # For normalisation direction: pos → lower is worse (model still recognises)
-    # We flip for colour: want green = good for attacker
+    For each adversarial image:
+      1. For each gallery identity, compute the best cosine similarity per
+         model, then average those best scores across models.
+      2. Rank all identities by descending average similarity.
+      3. Position = 1-based rank of the true identity.
+
+    Returns a list of records (schema compatible with _compute_per_model_records)
+    with model="ALL_SIM_AVG", or None if embeddings are missing.
+    """
+    try:
+        gallery_rows = con.execute(
+            "SELECT u.name AS identity, e.model_name, e.embedding "
+            "FROM embeddings e "
+            "INNER JOIN captures c ON c.image_path = e.image_path "
+            "INNER JOIN users u ON u.id = c.user_id"
+        ).fetchall()
+    except Exception as exc:
+        print(f"  [WARN] avg-sim gallery query failed: {exc}")
+        return None
+
+    if not gallery_rows:
+        return None
+
+    # gallery[identity][model_name] = [emb, ...]
+    gallery: dict = {}
+    for r in gallery_rows:
+        emb = np.frombuffer(r["embedding"], dtype=np.float32).copy()
+        gallery.setdefault(r["identity"], {}).setdefault(r["model_name"], []).append(emb)
+    gallery_identities = sorted(gallery.keys())
+
+    try:
+        adv_rows = con.execute(
+            "SELECT DISTINCT e.image_path, e.model_name, e.embedding, "
+            "       a.identity_name, a.is_frontal, a.is_profile, a.is_pitch, "
+            "       a.pattern_id, a.gallery_total "
+            "FROM embeddings e "
+            "INNER JOIN attacks a ON a.image_path = e.image_path"
+        ).fetchall()
+    except Exception as exc:
+        print(f"  [WARN] avg-sim adv query failed: {exc}")
+        return None
+
+    # adv[image_path][model_name] = emb; meta[image_path] = {...}
+    adv: dict = {}
+    meta: dict = {}
+    for r in adv_rows:
+        emb = np.frombuffer(r["embedding"], dtype=np.float32).copy()
+        adv.setdefault(r["image_path"], {})[r["model_name"]] = emb
+        if r["image_path"] not in meta:
+            meta[r["image_path"]] = {
+                "identity":      r["identity_name"] or "",
+                "pose":          pose_label(dict(r)),
+                "pattern_id":    r["pattern_id"] or 0,
+                "gallery_total": r["gallery_total"] or len(gallery_identities),
+            }
+
+    records = []
+    for img_path, model_embs in adv.items():
+        m_meta  = meta.get(img_path, {})
+        true_id = m_meta.get("identity", "")
+
+        # For each gallery identity collect best cosine sim per model, then average
+        id_scores: dict[str, list[float]] = {}
+        for gid in gallery_identities:
+            for model_name, query in model_embs.items():
+                embs = gallery.get(gid, {}).get(model_name, [])
+                if not embs:
+                    continue
+                qnorm = np.linalg.norm(query)
+                if qnorm < 1e-10:
+                    continue
+                best = max(
+                    float(np.dot(query, e) / (qnorm * np.linalg.norm(e) + 1e-10))
+                    for e in embs
+                )
+                id_scores.setdefault(gid, []).append(best)
+
+        if not id_scores:
+            continue
+
+        # Average across models; rank descending
+        avg_scores = [(gid, sum(s) / len(s)) for gid, s in id_scores.items()]
+        avg_scores.sort(key=lambda x: x[1], reverse=True)
+        ranked   = [x[0] for x in avg_scores]
+        position = (ranked.index(true_id) + 1) if true_id in ranked else len(ranked) + 1
+
+        records.append({
+            "image_path":    img_path,
+            "model":         "ALL_SIM_AVG",
+            "identity":      true_id,
+            "position":      position,
+            "gallery_total": len(avg_scores),
+            "pose":          m_meta.get("pose", "unknown"),
+            "pattern_id":    m_meta.get("pattern_id", 0),
+        })
+
+    print(f"  Avg-sim positions: {len(records)} records")
+    return records or None
+
+
+def _load_position_summary(
+        results: list[dict],
+        avg_sim_results: list[dict] | None = None,
+) -> tuple[list, list, np.ndarray, list]:
+    """
+    Position summary table.
+    Rows = per-model rows + "All Models" (per-model pool avg) +
+           optionally "All (avg sim)" (averaged-similarity method from UI).
+    Cols = Mean Pos / Median Pos / MRR / Rank ≤ 1 / Rank ≤ 5 / Rank ≤ 10.
+    All rate columns stored and displayed on a 0–1 scale.
+    """
+    _mf = [m for m in MODEL_ORDER
+           if any(r["model"] == m and r["group_by"] == "overall" for r in results)]
+    if not _mf:
+        _mf = list(dict.fromkeys(
+            r["model"] for r in results
+            if r["group_by"] == "overall" and r["model"] != "ALL_MODELS"))
+
+    row_labels = [MODEL_SHORT.get(m, m) for m in _mf]
+    if avg_sim_results is not None:
+        row_labels = row_labels + ["All (avg sim)"]
+
+    col_keys   = ["mean_pos", "median_pos", "mrr",
+                  "rank1_acc", "rank5_acc", "rank10_acc"]
+    col_labels = ["Mean Pos", "Median Pos", "MRR",
+                  "Rank ≤ 1", "Rank ≤ 5", "Rank ≤ 10"]
+
     n_rows = len(row_labels)
     n_cols = len(col_keys)
     raw    = np.full((n_rows, n_cols), np.nan)
     annots = [[""] * n_cols for _ in range(n_rows)]
 
-    ri = {m: i for i, m in enumerate(row_labels)}
-    for r in results:
-        if r["group_by"] != "overall":
-            continue
-        i = ri.get(r["model"])
-        if i is None:
-            continue
+    ri = {lbl: i for i, lbl in enumerate(row_labels)}
+
+    def _fill_row(row_idx: int, r: dict) -> None:
         for j, key in enumerate(col_keys):
             v = r.get(key)
             if v is None:
                 continue
-            fv = float(v) if not isinstance(v, float) else v
-            if np.isnan(fv):
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if fv != fv:  # NaN check
                 continue
             if key in ("mean_pos", "median_pos"):
-                raw[i, j] = fv
-                annots[i][j] = f"{fv:.1f}"
+                raw[row_idx, j] = fv
+                annots[row_idx][j] = f"{fv:.2f}"
             else:
-                raw[i, j] = fv * 100
-                annots[i][j] = f"{fv * 100:.1f}%"
+                # Store as 0-1; never multiply to %
+                raw[row_idx, j] = fv
+                annots[row_idx][j] = f"{fv:.3f}"
+
+    # Per-model + ALL_MODELS aggregate rows
+    for r in results:
+        if r["group_by"] != "overall":
+            continue
+        dk = MODEL_SHORT.get(r["model"], r["model"])
+        i  = ri.get(dk)
+        if i is not None:
+            _fill_row(i, r)
+
+    # "All (avg sim)" row from the separate avg-similarity computation
+    if avg_sim_results is not None:
+        avg_sim_metrics, _ = _compute_metrics(avg_sim_results)
+        asi = ri.get("All (avg sim)")
+        if asi is not None:
+            for r in avg_sim_metrics:
+                if r["group_by"] == "overall" and r["model"] == "ALL_MODELS":
+                    _fill_row(asi, r)
+                    break
 
     return row_labels, col_labels, raw, annots
 
@@ -353,32 +694,23 @@ def plot_positions_heatmap(results: list[dict], out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     _dark(fig, ax)
 
-    # Separate colour norms per column group
-    # Cols 0-1: absolute position (low = bad = red for attacker)
-    # Cols 2-5: rate (high = good = green for attacker)
+    # Colour-scale each column independently.
+    # Pos/MRR cols (j < 3): lower = better attack → invert for green.
+    # Rank-N cols (j >= 3): lower = better attack → invert for green.
+    # (ASR col removed; rank-N rate on 0-1 scale.)
     display = np.zeros_like(raw)
-    # Build a normalised 0-1 display matrix to colour uniformly
     for j in range(n_cols):
-        col = raw[:, j]
+        col   = raw[:, j]
         valid = col[~np.isnan(col)]
         if len(valid) == 0:
             continue
         lo, hi = valid.min(), valid.max()
-        invert = (j < 2) or (j >= 3)   # pos cols and rank-N cols: lower = better attack; ASR col: higher = better
-        if invert:
-            # invert so green = better for attacker
-            if hi > lo:
-                display[:, j] = np.where(np.isnan(col), np.nan,
-                                         1.0 - (col - lo) / (hi - lo))
-            else:
-                display[:, j] = np.where(np.isnan(col), np.nan, 0.5)
+        # All cols: lower value = better attack → invert so green = better
+        if hi > lo:
+            display[:, j] = np.where(np.isnan(col), np.nan,
+                                     1.0 - (col - lo) / (hi - lo))
         else:
-            # ASR: high = good for attacker
-            if hi > lo:
-                display[:, j] = np.where(np.isnan(col), np.nan,
-                                         (col - lo) / (hi - lo))
-            else:
-                display[:, j] = np.where(np.isnan(col), np.nan, 0.5)
+            display[:, j] = np.where(np.isnan(col), np.nan, 0.5)
 
     cmap = plt.get_cmap(CMAP_POS)
     rgba = np.zeros((*display.shape, 4))
@@ -404,7 +736,7 @@ def plot_positions_heatmap(results: list[dict], out_path: Path) -> None:
                     color=tc, fontsize=8.5)
 
     # Column separators between pos cols and rate cols
-    ax.axvline(1.5, color=FG, lw=0.7, alpha=0.3)
+    ax.axvline(2.5, color=FG, lw=0.7, alpha=0.3)  # pos/MRR | rank-N cols
 
     ax.set_xticks(range(n_cols))
     ax.set_xticklabels(col_labels, rotation=25, ha="right",
@@ -418,68 +750,49 @@ def plot_positions_heatmap(results: list[dict], out_path: Path) -> None:
     ax.set_title("Gallery Search — Position Summary per Model",
                  color=FG, **FONT_TITLE, pad=12)
     _subtitle(ax, "Mean/Median: higher = better attack  |  "
-              "ASR = position > 1  |  green = better for attacker  |  "
-              "colour scaled within each column")
+              "MRR / Rank ≤ N: lower = better attack  |  "
+              "green = better for attacker  |  colour scaled within each column")
     fig.tight_layout()
     _save(fig, out_path)
 
 
-def plot_positions_table(results: list[dict], out_path: Path) -> None:
-    row_labels, col_labels, raw, _ = _load_position_summary(results)
-    n_rows, n_cols = raw.shape
+def plot_positions_table(results: list[dict], out_path: Path,
+                         avg_sim_results: list[dict] | None = None) -> None:
+    """Position summary table.  Optionally includes an 'All (avg sim)' row."""
+    row_labels, col_labels, raw, annots = _load_position_summary(
+        results, avg_sim_results=avg_sim_results)
 
-    # Build clean annotations: position cols as-is, rate cols as 0-1
-    annots = [[""] * n_cols for _ in range(n_rows)]
-    col_keys = ["mean_pos", "median_pos", "attack_success_rate",
-                "rank1_acc", "rank5_acc", "rank10_acc"]
-    ri_map = {m: i for i, m in enumerate(row_labels)}
-    for r in results:
-        if r["group_by"] != "overall":
-            continue
-        i = ri_map.get(r["model"])
-        if i is None:
-            continue
-        for j, key in enumerate(col_keys):
-            v = r.get(key)
-            if v is None:
-                continue
-            fv = float(v) if not isinstance(v, float) else v
-            if np.isnan(fv):
-                continue
-            if key in ("mean_pos", "median_pos"):
-                annots[i][j] = f"{fv:.2f}"
-            else:
-                annots[i][j] = f"{fv:.3f}"
-
-    # Values: keep raw (positions as raw numbers, rates as 0-1 fractions)
-    # But _plain_table just uses annots, so pass raw directly
-    all_idx = row_labels.index("ALL_MODELS") if "ALL_MODELS" in row_labels else None
+    avg_sim_idx = next((i for i, l in enumerate(row_labels) if l == "All (avg sim)"), None)
+    sep_rows  = [avg_sim_idx] if avg_sim_idx is not None else []
+    bold_rows = [avg_sim_idx] if avg_sim_idx is not None else []
 
     _plain_table(
         title="Gallery Search — Position Summary per Model",
-        subtitle="Mean/Median position (higher = better attack)  |  ASR and Rank-N as fractions (0–1)",
         row_labels=row_labels,
         col_labels=col_labels,
         values=raw,
         annots=annots,
         out_path=out_path,
-        sep_before_rows=[all_idx] if all_idx is not None else None,
-        bold_rows=[all_idx] if all_idx is not None else None,
-        col_group_seps=[2],   # separator between position cols and rate cols
+        sep_before_rows=sep_rows   if sep_rows  else None,
+        bold_rows=bold_rows        if bold_rows else None,
+        col_group_seps=[3],        # pos/MRR cols | rank-N cols
         row_label_header="Model",
     )
 def _load_breakdown(results: list[dict], group_by: str,
                     metric_key: str = "rank1_acc"
                     ) -> tuple[list, list, np.ndarray, list]:
     """
-    Rows = real models (not ALL_MODELS).
-    Cols = group values for `group_by` (pose labels or pattern IDs).
-    Cell = metric_key value (0-100 %).
-    Annotation = "mean_pos / metric_key%".
+    Breakdown by pose or pattern.
+    Rows = models present (model-agnostic: just "all").
+    Cols = group values.
     """
-    model_labels = [m for m in MODEL_ORDER
-                    if any(r["model"] == m and r["group_by"] == group_by
-                           for r in results)]
+    _bd = [m for m in MODEL_ORDER
+           if any(r["model"] == m and r["group_by"] == group_by for r in results)]
+    if not _bd:
+        _bd = list(dict.fromkeys(
+            r["model"] for r in results
+            if r["group_by"] == group_by and r["model"] != "ALL_MODELS"))
+    model_labels = [MODEL_SHORT.get(m, m) for m in _bd]
     gvs = sorted(set(
         r["group_value"] for r in results
         if r["group_by"] == group_by and r["model"] != "ALL_MODELS"
@@ -489,23 +802,27 @@ def _load_breakdown(results: list[dict], group_by: str,
     values = np.full((n_rows, n_cols), np.nan)
     annots = [[""] * n_cols for _ in range(n_rows)]
 
-    mi = {m: i for i, m in enumerate(model_labels)}
+    mi = {lbl: idx for idx, lbl in enumerate(model_labels)}
     gi = {g: j for j, g in enumerate(gvs)}
 
     for r in results:
         if r["group_by"] != group_by or r["model"] == "ALL_MODELS":
             continue
-        i = mi.get(r["model"])
+        i = mi.get(MODEL_SHORT.get(r["model"], r["model"]))
         j = gi.get(r["group_value"])
         if i is None or j is None:
             continue
-        v_rate = r.get(metric_key)
-        v_mean = r.get("mean_pos")
-        if v_rate is not None and not (isinstance(v_rate, float) and np.isnan(v_rate)):
-            pct = float(v_rate) * 100
-            values[i, j] = pct
-            mean_s = f"{float(v_mean):.1f}" if v_mean and not np.isnan(float(v_mean)) else "?"
-            annots[i][j] = f"{pct:.1f}%\nμ={mean_s}"
+        try:
+            v_rate = float(r.get(metric_key, "nan"))
+            v_mean = float(r.get("mean_pos", "nan"))
+        except (TypeError, ValueError):
+            continue
+        if v_rate != v_rate:
+            continue
+        pct = v_rate * 100
+        values[i, j] = pct
+        mean_s = f"{v_mean:.1f}" if v_mean == v_mean else "?"
+        annots[i][j] = f"{v_rate:.3f}\nμ={mean_s}"
 
     return model_labels, gvs, values, annots
 
@@ -521,9 +838,11 @@ def _plot_breakdown_panel(ax, model_labels, col_labels, values, annots,
             if not txt:
                 continue
             v = values[i, j]
-            tc = "black" if 25 < v < 75 else "white"
+            rgba = plt.get_cmap(CMAP_RATE)(v / 100.0)
+            lum = 0.299*rgba[0] + 0.587*rgba[1] + 0.114*rgba[2]
+            tc = "black" if lum > 0.45 else "white"
             ax.text(j, i, txt, ha="center", va="center",
-                    color=tc, fontsize=7.5, linespacing=1.4)
+                    color=tc, fontsize=8, fontweight="bold", linespacing=1.4)
 
     ax.set_xticks(range(n_cols))
     ax.set_xticklabels(col_labels, rotation=30, ha="right",
@@ -567,7 +886,9 @@ def plot_breakdown_heatmap(results: list[dict], out_path: Path) -> None:
              "green = better for attacker",
              ha="center", fontsize=7.5, color=MUTED, style="italic")
 
-    cbar = fig.colorbar(im2, ax=[ax1, ax2], pad=0.02, fraction=0.02)
+    fig.subplots_adjust(right=0.88)
+    cbar_ax = fig.add_axes([0.90, 0.15, 0.015, 0.7])
+    cbar = fig.colorbar(im2, cax=cbar_ax)
     cbar.set_label("Attack Success Rate (%)", color=FG, fontsize=9)
     _style_cbar(cbar)
 
@@ -631,8 +952,14 @@ def plot_breakdown_table(results: list[dict], out_path: Path) -> None:
                 continue
             v_rate = r.get("rank1_acc")
             v_mean = r.get("mean_pos")
-            if v_rate is not None and not (isinstance(v_rate, float) and np.isnan(float(v_rate))):
+            if v_rate is None:
+                continue
+            try:
                 pct = float(v_rate)
+            except (TypeError, ValueError):
+                continue
+            if pct != pct:  # NaN check
+                continue
                 mean_s = f"{float(v_mean):.1f}" if v_mean and not np.isnan(float(v_mean)) else "?"
                 ann[i][j] = "{:.3f}\nμ={}".format(pct, mean_s)
         return ann
@@ -739,11 +1066,12 @@ def plot_breakdown_table(results: list[dict], out_path: Path) -> None:
                 facecolor=fig.get_facecolor())
     plt.close(fig)
     print(f"Wrote {out_path}")
-def _plain_table(title: str, subtitle: str,
+def _plain_table(title: str,
                  row_labels: list[str], col_labels: list[str],
                  values: "np.ndarray",            # 2-D, 0-1 floats or NaN
                  annots: "list[list[str]]",        # same shape, display strings
                  out_path: "Path",
+                 subtitle: str = "",
                  sep_before_rows: "list[int] | None" = None,
                  bold_rows: "list[int] | None" = None,
                  col_group_seps: "list[int] | None" = None,
@@ -779,7 +1107,7 @@ def _plain_table(title: str, subtitle: str,
     ROW_LBL_W = max(1.8, max(len(l) for l in row_labels) * 0.11 + 0.3)
     HDR_H_IN  = 0.55          # header row height
     ROW_H_IN  = 0.38          # data row height
-    TOP_PAD   = 0.65          # title + subtitle
+    TOP_PAD   = 0.45 if not subtitle else 0.65  # title only vs title + subtitle
     BOT_PAD   = 0.15
 
     fig_w = ROW_LBL_W + n_cols * COL_W_IN + 0.3
@@ -806,13 +1134,14 @@ def _plain_table(title: str, subtitle: str,
 
     hdr_y = fig_h - TOP_PAD - HDR_H_IN / 2
 
-    # ── title & subtitle ──────────────────────────────────────────────────────
+    # ── title (+ optional subtitle) ──────────────────────────────────────────
     ax.text(fig_w / 2, fig_h - 0.12, title,
             ha="center", va="top", fontsize=12, fontweight="bold",
             color=FG, transform=ax.transData)
-    ax.text(fig_w / 2, fig_h - 0.38, subtitle,
-            ha="center", va="top", fontsize=7.5, color=MUTED,
-            style="italic", transform=ax.transData)
+    if subtitle:
+        ax.text(fig_w / 2, fig_h - 0.38, subtitle,
+                ha="center", va="top", fontsize=7.5, color=MUTED,
+                style="italic", transform=ax.transData)
 
     # ── header background ─────────────────────────────────────────────────────
     from matplotlib.patches import FancyBboxPatch as FBP
@@ -953,11 +1282,11 @@ def _print_summary(results: list[dict], models_present: list[str]) -> None:
 
     # ── Overall position + ASR ────────────────────────────────────────────
     print("\n── Gallery Search — overall position stats per model ──")
-    hdr = f"  {'model':<30}  {'n':>5}  {'mean':>7}  {'median':>7}  "
+    hdr = f"  {'model':<30}  {'n':>5}  {'mean':>7}  {'median':>7}  {'MRR':>7}  "
     hdr += "  ".join(f"R≤{k:2d}%" for k in [1, 2, 5, 10])
     print(hdr)
     print("  " + "─" * (len(hdr) - 2))
-    for model in models_present + ["ALL_MODELS"]:
+    for model in models_present + ["ALL_MODELS"]:  # models_present = ["all"]
         r = next((x for x in results
                   if x["model"] == model and x["group_by"] == "overall"), None)
         if not r:
@@ -967,8 +1296,9 @@ def _print_summary(results: list[dict], models_present: list[str]) -> None:
         med  = float(r["median_pos"]) if r["median_pos"] else 0
         parts = [f"{float(r.get(f'rank{k}_acc', 0)) * 100:5.1f}%"
                  for k in [1, 2, 5, 10]]
-        label = MODEL_SHORT.get(model, model) if model != "ALL_MODELS" else "All Models"
-        print(f"  {label:<30}  {n:>5}  {mean:>7.2f}  {med:>7.1f}  " +
+        mrr_v = float(r.get("mrr", 0) or 0)
+        label = "All Models" if model == "ALL_MODELS" else MODEL_SHORT.get(model, model)
+        print(f"  {label:<30}  {n:>5}  {mean:>7.2f}  {med:>7.1f}  {mrr_v:>7.4f}  " +
               "  ".join(parts))
 
     # ── Per-pose ──────────────────────────────────────────────────────────
@@ -985,9 +1315,10 @@ def _print_summary(results: list[dict], models_present: list[str]) -> None:
                 continue
             parts = [f"{float(r.get(f'rank{k}_acc', 0)) * 100:5.1f}%"
                      for k in [1, 2, 5, 10]]
-            label = MODEL_SHORT.get(model, model)
+            label = model if model == "all" else MODEL_SHORT.get(model, model)
             mean  = float(r["mean_pos"]) if r["mean_pos"] else 0
-            print(f"    {label:<28}  n={r['n_images']:>4}  mean={mean:.1f}  " +
+            mrr_v = float(r.get("mrr", 0) or 0)
+            print(f"    {label:<28}  n={r['n_images']:>4}  mean={mean:.1f}  mrr={mrr_v:.4f}  " +
                   "  ".join(parts))
 
     # ── Per-pattern ───────────────────────────────────────────────────────
@@ -1004,9 +1335,10 @@ def _print_summary(results: list[dict], models_present: list[str]) -> None:
                 continue
             parts = [f"{float(r.get(f'rank{k}_acc', 0)) * 100:5.1f}%"
                      for k in [1, 2, 5, 10]]
-            label = MODEL_SHORT.get(model, model)
+            label = model if model == "all" else MODEL_SHORT.get(model, model)
             mean  = float(r["mean_pos"]) if r["mean_pos"] else 0
-            print(f"    {label:<28}  n={r['n_images']:>4}  mean={mean:.1f}  " +
+            mrr_v = float(r.get("mrr", 0) or 0)
+            print(f"    {label:<28}  n={r['n_images']:>4}  mean={mean:.1f}  mrr={mrr_v:.4f}  " +
                   "  ".join(parts))
 
 
@@ -1028,22 +1360,33 @@ def main() -> None:
 
     out_dir = ensure_results_dir(Path(args.out))
 
-    con     = open_db(db_path)
-    rows    = load_all_attack_rows(con)
-    con.close()
+    con  = open_db(db_path)
+    rows = load_all_attack_rows(con)
+    # con stays open for _compute_per_model_records
 
     if not rows:
         print("No attack records found.", file=sys.stderr)
         sys.exit(1)
 
-    records = _build_records(rows)
+    print("Computing per-model gallery positions from embeddings...")
+    records = _compute_per_model_records(con, rows)
     if not records:
-        print("No gallery_position values found in attack records.\n"
-              "Run 'Recompute Positions' in the Gallery Search tab first.",
-              file=sys.stderr)
+        print("[WARN] Falling back to stored model-agnostic positions.")
+        records = _build_records(rows)
+    print("\nComputing avg-similarity positions (UI method)...")
+    avg_sim_records = _compute_avg_sim_positions(con)
+    if avg_sim_records:
+        print(f"  {len(avg_sim_records)} avg-sim records computed.")
+    else:
+        print("  [WARN] avg-sim positions unavailable — 'All (avg sim)' row will be omitted.")
+
+    con.close()
+
+    if not records:
+        print("No gallery position data found.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Loaded {len(records)} (image, model) records with gallery positions.")
+    print(f"Loaded {len(records)} (image, model) position records.")
 
     # Derive gallery total for axis labels
     gallery_total = int(np.median([r["gallery_total"] for r in records
@@ -1063,17 +1406,13 @@ def main() -> None:
 
     print("\n[1] Rank-N accuracy (overall)")
     plot_rank_n_heatmap(results, out_dir / "fig_gs_rank_n_heatmap.png",
-                        gallery_total)
+                        gallery_total, avg_sim_results=avg_sim_records)
     plot_rank_n_table(results,  out_dir / "fig_gs_rank_n_table.png",
-                      gallery_total)
+                      gallery_total, avg_sim_results=avg_sim_records)
 
-    print("\n[2] Position summary (mean / median / ASR / Rank-1,5,10)")
-    plot_positions_heatmap(results, out_dir / "fig_gs_positions_heatmap.png")
-    plot_positions_table(results,   out_dir / "fig_gs_positions_table.png")
-
-    print("\n[3] Breakdown by pose and pattern")
-    plot_breakdown_heatmap(results, out_dir / "fig_gs_breakdown_heatmap.png")
-    plot_breakdown_table(results,   out_dir / "fig_gs_breakdown_table.png")
+    print("\n[2] Position summary (mean / median / MRR / Rank-1,5,10)")
+    plot_positions_table(results, out_dir / "fig_gs_positions_table.png",
+                         avg_sim_results=avg_sim_records)
 
     print(f"\n{'=' * 60}")
     print(f"Done.  Outputs in: {out_dir}")

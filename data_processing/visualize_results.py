@@ -6,19 +6,13 @@ Generate figures for three analyses, each in two formats: heatmap and table.
 Figures produced (saved to the same output directory as the CSVs):
   1. fig_overall_accuracy_heatmap.png   — heatmap
   2. fig_overall_accuracy_table.png     — table
-  3. fig_score_statistics_heatmap.png   — heatmap
-  4. fig_score_statistics_table.png     — table
-  5. fig_cross_pattern_heatmap.png      — heatmap
-  6. fig_cross_pattern_table.png        — table
+  3. fig_cross_pattern_heatmap.png      — heatmap
+  4. fig_cross_pattern_table.png        — table
 
 Each figure covers:
   • "Overall accuracy per model"
       Rows: models  |  Cols: overall, pose groups, pattern groups
       Cell value: accuracy % + n_recognised/n_images
-
-  • "Score statistics (per-model thresholds)"
-      Rows: group (overall / pose / pattern)  |  Cols: models
-      Cell value: attack-success rate % + n_fooled/n_evaluated
 
   • "Cross-pattern accuracy per model"
       Rows: pattern pair (+ ALL)  |  Cols: models
@@ -83,17 +77,14 @@ def _read_csv(path: Path) -> list[dict]:
 def _load_overall_accuracy(rows: list[dict]) -> tuple[list, list, np.ndarray, list]:
     """
     Returns (model_labels, group_labels, values_2d, annotation_2d).
-    Rows = models, Cols = groups.
-    Only "overall/all", "pose/*", "pattern/*" — not ALL_MODELS.
+    Rows = individual models + "Average" average row.
+    Cols = overall / pose groups / pattern groups.
     """
-    # Collect models in canonical order (excluding ALL_MODELS)
-    model_order = []
-    for r in rows:
-        m = r["model"]
-        if m != "ALL_MODELS" and m not in model_order:
-            model_order.append(m)
+    # Collect individual models in canonical order
+    model_order = [m for m in MODEL_ORDER
+                   if any(r["model"] == m for r in rows)]
 
-    # Collect groups in a stable order: overall first, then pose, then pattern
+    # Collect groups in stable order: overall first, then pose, then pattern
     group_order = []
     group_label_map: dict[str, str] = {}
     for gb_prefix, label_prefix in [("overall", ""), ("pose", "pose:"), ("pattern", "pat:")]:
@@ -106,30 +97,35 @@ def _load_overall_accuracy(rows: list[dict]) -> tuple[list, list, np.ndarray, li
             group_order.append(key)
             group_label_map[key] = f"{label_prefix}{gv}" if label_prefix else gv
 
-    n_models = len(model_order)
+    # Individual models + "Average" row at bottom
+    n_models = len(model_order) + 1   # +1 for All Models
     n_groups = len(group_order)
     values   = np.full((n_models, n_groups), np.nan)
     annots   = [[""] * n_groups for _ in range(n_models)]
 
-    # Index lookup
     m_idx = {m: i for i, m in enumerate(model_order)}
     g_idx = {g: i for i, g in enumerate(group_order)}
+    all_row = len(model_order)  # index of the All Models row
 
     for r in rows:
-        if r["model"] == "ALL_MODELS":
-            continue
         key = f"{r['group_by']}/{r['group_value']}"
-        mi = m_idx.get(r["model"])
         gi = g_idx.get(key)
-        if mi is None or gi is None:
+        if gi is None or not r.get("accuracy"):
             continue
-        if r["accuracy"]:
-            acc = float(r["accuracy"]) * 100
-            values[mi, gi] = acc
-            annots[mi][gi] = f"{acc:.1f}%\n{r['n_recognised']}/{r['n_images']}"
+        acc_frac = float(r["accuracy"])   # 0-1
+        ann_s = f"{acc_frac*100:.1f}%"
+        if r["model"] == "ALL_MODELS":
+            values[all_row, gi] = acc_frac
+            annots[all_row][gi] = ann_s
+        else:
+            mi = m_idx.get(r["model"])
+            if mi is not None:
+                values[mi, gi] = acc_frac
+                annots[mi][gi] = ann_s
 
-    col_labels = [group_label_map[g] for g in group_order]
-    return model_order, col_labels, values, annots
+    col_labels     = [group_label_map[g] for g in group_order]
+    display_labels = [MODEL_SHORT.get(m, m) for m in model_order] + ["Average"]
+    return display_labels, col_labels, values, annots
 
 
 def plot_overall_accuracy_heatmap(rows: list[dict], out_path: Path) -> None:
@@ -142,7 +138,7 @@ def plot_overall_accuracy_heatmap(rows: list[dict], out_path: Path) -> None:
     fig.patch.set_facecolor("#0f1117")
     ax.set_facecolor("#0f1117")
 
-    im = ax.imshow(values, aspect="auto", cmap=CMAP_ACCURACY, vmin=0, vmax=100)
+    im = ax.imshow(values, aspect="auto", cmap=CMAP_ACCURACY, vmin=0, vmax=1)
 
     # Annotations
     for i in range(n_rows):
@@ -151,30 +147,42 @@ def plot_overall_accuracy_heatmap(rows: list[dict], out_path: Path) -> None:
             if not txt:
                 continue
             v = values[i, j]
-            color = "black" if 25 < v < 75 else "white"
+            cmap_obj = plt.get_cmap(CMAP_ACCURACY)
+            rgba = cmap_obj(v)
+            lum = 0.299*rgba[0] + 0.587*rgba[1] + 0.114*rgba[2]
+            color = "black" if lum > 0.45 else "white"
             ax.text(j, i, txt, ha="center", va="center",
-                    color=color, fontsize=7.5, linespacing=1.4)
+                    color=color, fontsize=8, fontweight="bold")
 
     ax.set_xticks(range(n_cols))
     ax.set_xticklabels(col_labels, rotation=35, ha="right",
                        fontsize=9, color="white")
     ax.set_yticks(range(n_rows))
+    yticklabels = [
+        plt.Text(0, i, lbl, color="#ffdd88" if lbl == "Average" else "white",
+                 fontsize=9, fontweight="bold" if lbl == "Average" else "normal")
+        for i, lbl in enumerate(model_labels)
+    ]
     ax.set_yticklabels(model_labels, fontsize=9, color="white")
+    # Colour "Average" tick label amber
+    for tick, lbl in zip(ax.get_yticklabels(), model_labels):
+        tick.set_color("#ffdd88" if lbl == "Average" else "white")
+        tick.set_fontweight("bold" if lbl == "Average" else "normal")
     ax.tick_params(colors="white", length=0)
     for spine in ax.spines.values():
         spine.set_visible(False)
 
+    # Separator before All Models row
+    ax.axhline(n_rows - 1.5, color="white", lw=0.8, alpha=0.4)
     # Column-type separators
     _add_col_separators(ax, col_labels, n_rows)
 
     cbar = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.03)
-    cbar.set_label("Accuracy (%)", color="white", fontsize=9)
+    cbar.set_label("Accuracy (0–1)", color="white", fontsize=9)
     cbar.ax.yaxis.set_tick_params(color="white")
     plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white")
 
     ax.set_title("Overall Accuracy per Model", color="white", **FONT_TITLE, pad=12)
-    _add_subtitle(ax, "green = model still recognises (higher = worse attack); "
-                  "red = fooled", color="#aaa")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
@@ -186,8 +194,7 @@ def plot_overall_accuracy_table(rows: list[dict], out_path: Path) -> None:
     model_labels, col_labels, values_pct, _ = _load_overall_accuracy(rows)
     n_rows, n_cols = values_pct.shape
 
-    # Convert to 0-1
-    values = values_pct / 100.0
+    values = values_pct  # already 0-1
 
     # Re-load raw counts for annotations
     m_idx = {m: i for i, m in enumerate(model_labels)}
@@ -212,7 +219,7 @@ def plot_overall_accuracy_table(rows: list[dict], out_path: Path) -> None:
             continue
         if r["accuracy"]:
             acc = float(r["accuracy"])
-            annots[mi][gi] = "{:.3f}\n{}/{}".format(acc, r["n_recognised"], r["n_images"])
+            annots[mi][gi] = "{:.3f}".format(acc)
 
     # Column group separators: find where pose/pattern sections start
     col_group_seps = []
@@ -223,15 +230,17 @@ def plot_overall_accuracy_table(rows: list[dict], out_path: Path) -> None:
             col_group_seps.append(j)
         prev_prefix = prefix
 
+    all_idx = len(model_labels) - 1  # All Models is last row
     _plain_table(
         title="Overall Accuracy per Model",
-        subtitle="accuracy (0–1)  +  recognised / total   |   columns: all · pose groups · pattern groups",
         row_labels=model_labels,
         col_labels=[group_label_map[g] for g in group_order],
         values=values,
         annots=annots,
         out_path=out_path,
         col_group_seps=col_group_seps,
+        sep_before_rows=[all_idx],
+        bold_rows=[all_idx],
         row_label_header="Model",
     )
 def _load_score_statistics(rows: list[dict], model_order: list[str]
@@ -291,7 +300,7 @@ def _load_score_statistics(rows: list[dict], model_order: list[str]
             values[ri, ci] = asr
             n_s = r.get(success_key, "?")
             n_e = r.get(n_key, "?")
-            annots[ri][ci] = f"{asr:.1f}%\n{n_s}/{n_e}"
+            annots[ri][ci] = f"{asr:.1f}%"
 
     group_labels = [f"{'pose:' if gb=='pose' else 'pat:' if gb=='pattern' else ''}{gv}"
                     for gb, gv in group_order]
@@ -317,9 +326,12 @@ def plot_score_statistics_heatmap(rows: list[dict], model_order: list[str],
             if not txt:
                 continue
             v = values[i, j]
-            color = "black" if 25 < v < 75 else "white"
+            cmap_obj = plt.get_cmap(CMAP_ACCURACY)
+            rgba = cmap_obj(v)
+            lum = 0.299*rgba[0] + 0.587*rgba[1] + 0.114*rgba[2]
+            color = "black" if lum > 0.45 else "white"
             ax.text(j, i, txt, ha="center", va="center",
-                    color=color, fontsize=7.5, linespacing=1.4)
+                    color=color, fontsize=8, fontweight="bold")
 
     ax.set_xticks(range(n_cols))
     ax.set_xticklabels(col_labels, rotation=35, ha="right",
@@ -339,8 +351,6 @@ def plot_score_statistics_heatmap(rows: list[dict], model_order: list[str],
 
     ax.set_title("Score Statistics — Attack Success Rate per Model",
                  color="white", **FONT_TITLE, pad=12)
-    _add_subtitle(ax, "red = model fooled (higher = better attack); "
-                  "green = model recognises", color="#aaa")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
@@ -370,7 +380,7 @@ def plot_score_statistics_table(rows: list[dict], model_order: list[str],
             asr = float(rate_str)
             n_s = r.get(f"success_{short}", "?")
             n_e = r.get(f"n_{short}", "?")
-            annots[ri][ci] = "{:.3f}\n{}/{}".format(asr, n_s, n_e)
+            annots[ri][ci] = "{:.3f}".format(asr)
 
     # Separator before pattern section
     sep_rows = []
@@ -383,7 +393,6 @@ def plot_score_statistics_table(rows: list[dict], model_order: list[str],
 
     _plain_table(
         title="Score Statistics — Attack Success Rate per Model",
-        subtitle="attack success rate (0–1)  +  fooled / evaluated   |   rows: overall · pose · pattern",
         row_labels=group_labels,
         col_labels=col_labels,
         values=values,
@@ -395,45 +404,50 @@ def plot_score_statistics_table(rows: list[dict], model_order: list[str],
 def _load_cross_pattern(rows: list[dict]) -> tuple[list, list, np.ndarray, list]:
     """
     Returns (pair_labels, model_labels, values_2d, annots_2d).
-    Rows = pattern pairs (including ALL), Cols = models (excluding ALL).
-    Cell = match rate % + n_matched/n_pairs.
+    Rows = pattern pairs (+ ALL pair), Cols = individual models + "Average".
+    Cell = match rate (stored as % for heatmap colouring).
     """
-    pair_labels  = []
-    model_labels = []
+    # Build ordered pair list; move ALL to end
+    pair_labels_seen: list[str] = []
     for r in rows:
         pp = r["pattern_pair"]
-        m  = r["model"]
-        if pp not in pair_labels:
-            pair_labels.append(pp)
-        if m != "ALL" and m not in model_labels:
-            model_labels.append(m)
+        if pp not in pair_labels_seen:
+            pair_labels_seen.append(pp)
+    if "ALL" in pair_labels_seen:
+        pair_labels_seen.remove("ALL")
+        pair_labels_seen.append("ALL")
+    pair_labels = pair_labels_seen
 
-    # Move ALL to end of pairs
-    if "ALL" in pair_labels:
-        pair_labels.remove("ALL")
-        pair_labels.append("ALL")
+    # Individual models in canonical order + "Average" column at end
+    full_models_in_csv = {r["model"] for r in rows if r["model"] != "ALL"}
+    model_full  = [m for m in MODEL_ORDER if m in full_models_in_csv]
+    model_labels = [MODEL_SHORT.get(m, m) for m in model_full] + ["Average"]
 
     n_pairs  = len(pair_labels)
     n_models = len(model_labels)
     values   = np.full((n_pairs, n_models), np.nan)
     annots   = [[""] * n_models for _ in range(n_pairs)]
 
-    pi_map = {p: i for i, p in enumerate(pair_labels)}
-    mi_map = {m: j for j, m in enumerate(model_labels)}
+    pi_map   = {p: i for i, p in enumerate(pair_labels)}
+    mi_map   = {full: j for j, full in enumerate(model_full)}
+    all_col  = len(model_full)  # index of All Models column
 
     for r in rows:
-        if r["model"] == "ALL":
-            continue
         pi = pi_map.get(r["pattern_pair"])
-        mi = mi_map.get(r["model"])
-        if pi is None or mi is None:
+        if pi is None:
             continue
         acc_str = r.get("accuracy", "")
         if not acc_str:
             continue
-        acc = float(acc_str) * 100
-        values[pi, mi] = acc
-        annots[pi][mi] = f"{acc:.1f}%\n{r['n_matched']}/{r['n_pairs']}"
+        acc = float(acc_str)
+        if r["model"] == "ALL":
+            values[pi, all_col] = acc
+            annots[pi][all_col] = f"{acc:.3f}"
+        else:
+            mi = mi_map.get(r["model"])
+            if mi is not None:
+                values[pi, mi] = acc
+                annots[pi][mi] = f"{acc:.3f}"
 
     return pair_labels, model_labels, values, annots
 
@@ -448,7 +462,7 @@ def plot_cross_pattern_heatmap(rows: list[dict], out_path: Path) -> None:
     fig.patch.set_facecolor("#0f1117")
     ax.set_facecolor("#0f1117")
 
-    im = ax.imshow(values, aspect="auto", cmap=CMAP_XPATT, vmin=0, vmax=100)
+    im = ax.imshow(values, aspect="auto", cmap=CMAP_XPATT, vmin=0, vmax=1)
 
     for i in range(n_pairs):
         for j in range(n_models):
@@ -456,18 +470,27 @@ def plot_cross_pattern_heatmap(rows: list[dict], out_path: Path) -> None:
             if not txt:
                 continue
             v = values[i, j]
-            color = "black" if 25 < v < 75 else "white"
+            cmap_obj = plt.get_cmap(CMAP_ACCURACY)
+            rgba = cmap_obj(v / 100.0)
+            lum = 0.299*rgba[0] + 0.587*rgba[1] + 0.114*rgba[2]
+            color = "black" if lum > 0.45 else "white"
             ax.text(j, i, txt, ha="center", va="center",
-                    color=color, fontsize=7.5, linespacing=1.4)
+                    color=color, fontsize=8, fontweight="bold")
 
-    # Bold / separator for ALL row
+    # Separator before ALL pair row
     if "ALL" in pair_labels:
         sep_y = pair_labels.index("ALL") - 0.5
-        ax.axhline(sep_y, color="white", lw=1.2, alpha=0.5)
+        ax.axhline(sep_y, color="white", lw=0.8, alpha=0.4)
+
+    # Separator before All Models column (last col)
+    ax.axvline(n_models - 1.5, color="white", lw=0.8, alpha=0.4)
 
     ax.set_xticks(range(n_models))
-    ax.set_xticklabels(model_labels, rotation=35, ha="right",
-                       fontsize=9, color="white")
+    xticklabels = model_labels
+    ax.set_xticklabels(xticklabels, rotation=35, ha="right", fontsize=9, color="white")
+    for tick, lbl in zip(ax.get_xticklabels(), model_labels):
+        tick.set_color("#ffdd88" if lbl == "Average" else "white")
+        tick.set_fontweight("bold" if lbl == "Average" else "normal")
     ax.set_yticks(range(n_pairs))
     ax.set_yticklabels(pair_labels, fontsize=9, color="white")
     ax.tick_params(colors="white", length=0)
@@ -475,15 +498,12 @@ def plot_cross_pattern_heatmap(rows: list[dict], out_path: Path) -> None:
         spine.set_visible(False)
 
     cbar = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.03)
-    cbar.set_label("Match Rate (%)", color="white", fontsize=9)
+    cbar.set_label("Match Rate (0–1)", color="white", fontsize=9)
     cbar.ax.yaxis.set_tick_params(color="white")
     plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white")
 
     ax.set_title("Cross-Pattern Accuracy per Model (per-model thresholds)",
                  color="white", **FONT_TITLE, pad=12)
-    _add_subtitle(ax, "match rate % + n_matched/n_pairs  |  "
-                  "green = cross-pattern images match (same identity recognised)",
-                  color="#aaa")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
@@ -492,31 +512,17 @@ def plot_cross_pattern_heatmap(rows: list[dict], out_path: Path) -> None:
 
 
 def plot_cross_pattern_table(rows: list[dict], out_path: Path) -> None:
-    pair_labels, model_labels, values_pct, _ = _load_cross_pattern(rows)
+    pair_labels, model_labels, values_pct, annots = _load_cross_pattern(rows)
     n_pairs, n_models = values_pct.shape
-    values = values_pct / 100.0
+    values = values_pct  # already 0-1
 
     # Re-build annotations with 0-1 values
-    pi_map = {p: i for i, p in enumerate(pair_labels)}
-    mi_map = {m: j for j, m in enumerate(model_labels)}
-    annots = [[""] * n_models for _ in range(n_pairs)]
-    for r in rows:
-        if r["model"] == "ALL":
-            continue
-        pi = pi_map.get(r["pattern_pair"])
-        mi = mi_map.get(r["model"])
-        if pi is None or mi is None:
-            continue
-        acc_str = r.get("accuracy", "")
-        if acc_str:
-            acc = float(acc_str)
-            annots[pi][mi] = "{:.3f}\n{}/{}".format(acc, r["n_matched"], r["n_pairs"])
 
     all_idx = pair_labels.index("ALL") if "ALL" in pair_labels else None
 
+    all_col_idx = len(model_labels) - 1  # All Models is last column
     _plain_table(
         title="Cross-Pattern Accuracy per Model",
-        subtitle="match rate (0–1)  +  n_matched / n_pairs   |   pattern-pair rows  ·  model columns",
         row_labels=pair_labels,
         col_labels=model_labels,
         values=values,
@@ -524,13 +530,9 @@ def plot_cross_pattern_table(rows: list[dict], out_path: Path) -> None:
         out_path=out_path,
         sep_before_rows=[all_idx] if all_idx is not None else None,
         bold_rows=[all_idx] if all_idx is not None else None,
+        col_group_seps=[all_col_idx],
         row_label_header="Pair",
     )
-def _add_subtitle(ax: plt.Axes, text: str, color: str = "#aaa") -> None:
-    ax.text(0.5, 1.01, text, transform=ax.transAxes,
-            ha="center", va="bottom", fontsize=7.5, color=color, style="italic")
-
-
 def _add_col_separators(ax: plt.Axes, col_labels: list[str], n_rows: int) -> None:
     """Add faint vertical lines between pose/pattern/overall groups."""
     current_prefix = None
@@ -566,7 +568,7 @@ def _add_colorbar_axis(fig: plt.Figure, cmap, norm, label: str) -> None:
 #  Plain table renderer  (no cell colours, values in 0–1)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _plain_table(title: str, subtitle: str,
+def _plain_table(title: str,
                  row_labels: list[str], col_labels: list[str],
                  values: "np.ndarray",            # 2-D, 0-1 floats or NaN
                  annots: "list[list[str]]",        # same shape, display strings
@@ -606,7 +608,7 @@ def _plain_table(title: str, subtitle: str,
     ROW_LBL_W = max(1.8, max(len(l) for l in row_labels) * 0.11 + 0.3)
     HDR_H_IN  = 0.55          # header row height
     ROW_H_IN  = 0.38          # data row height
-    TOP_PAD   = 0.65          # title + subtitle
+    TOP_PAD   = 0.35          # title only
     BOT_PAD   = 0.15
 
     fig_w = ROW_LBL_W + n_cols * COL_W_IN + 0.3
@@ -633,13 +635,10 @@ def _plain_table(title: str, subtitle: str,
 
     hdr_y = fig_h - TOP_PAD - HDR_H_IN / 2
 
-    # ── title & subtitle ──────────────────────────────────────────────────────
+    # ── title ─────────────────────────────────────────────────────────────────
     ax.text(fig_w / 2, fig_h - 0.12, title,
             ha="center", va="top", fontsize=12, fontweight="bold",
             color=FG, transform=ax.transData)
-    ax.text(fig_w / 2, fig_h - 0.38, subtitle,
-            ha="center", va="top", fontsize=7.5, color=MUTED,
-            style="italic", transform=ax.transData)
 
     # ── header background ─────────────────────────────────────────────────────
     from matplotlib.patches import FancyBboxPatch as FBP
@@ -731,6 +730,14 @@ MODEL_ORDER = [
     "edgeface_base",
 ]
 
+MODEL_SHORT: dict[str, str] = {
+    "IResNet_R18_Glint360K":  "IResNet18",
+    "InceptionResnetCASIA":   "FaceNet",
+    "SwinFace":               "SwinFace",
+    "TransFace_S_Glint360K":  "TransFace",
+    "edgeface_base":          "EdgeFace",
+}
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate heatmap and table figures from data-processing CSVs.")
@@ -756,23 +763,10 @@ def main() -> None:
     else:
         print("[1] model_accuracy.csv not found — skipping")
 
-    # ── 2. Score statistics / attack success ──────────────────────────
-    stat_rows = _read_csv(out_dir / "score_statistics.csv")
-    if stat_rows:
-        print("\n[2] Score statistics (attack success rate)")
-        plot_score_statistics_heatmap(
-            stat_rows, MODEL_ORDER,
-            out_dir / "fig_score_statistics_heatmap.png")
-        plot_score_statistics_table(
-            stat_rows, MODEL_ORDER,
-            out_dir / "fig_score_statistics_table.png")
-    else:
-        print("[2] score_statistics.csv not found — skipping")
-
-    # ── 3. Cross-pattern accuracy ─────────────────────────────────────
+    # ── 2. Cross-pattern accuracy ─────────────────────────────────────
     xp_rows = _read_csv(out_dir / "cross_pattern_by_pair.csv")
     if xp_rows:
-        print("\n[3] Cross-pattern accuracy per model")
+        print("\n[2] Cross-pattern accuracy per model")
         plot_cross_pattern_heatmap(
             xp_rows, out_dir / "fig_cross_pattern_heatmap.png")
         plot_cross_pattern_table(

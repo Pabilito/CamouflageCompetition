@@ -36,6 +36,7 @@ SCRIPTS: list[tuple[str, str, bool]] = [
     ("score_statistics.py",         "Score statistics (model-independent)",          True),
     ("cross_pattern_similarity.py", "Cross-pattern adversarial similarity",          True),
     ("gallery_search_stats.py",     "Gallery search statistics and figures",         True),
+    ("score_distributions.py",      "Similarity score distribution plots per model", True),
     ("visualize_results.py",        "Visualisations for accuracy / score / pattern", False),
 ]
 

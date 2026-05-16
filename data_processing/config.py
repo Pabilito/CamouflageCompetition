@@ -43,7 +43,7 @@ MODEL_ORDER: list[str] = [
 
 MODEL_SHORT: dict[str, str] = {
     "IResNet_R18_Glint360K":  "IResNet18",
-    "InceptionResnetCASIA":   "InceptionResnet",
+    "InceptionResnetCASIA":   "FaceNet",
     "SwinFace":               "SwinFace",
     "TransFace_S_Glint360K":  "TransFace",
     "edgeface_base":          "EdgeFace",
