@@ -26,12 +26,17 @@ from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
-# Sub-scripts in execution order
-SCRIPTS: list[tuple[str, str]] = [
-    ("extract_rankings.py",          "Ranking exports (standings + gallery search)"),
-    ("model_accuracy.py",            "Model accuracy (overall / pose / pattern)"),
-    ("score_statistics.py",          "Score statistics (model-independent)"),
-    ("cross_pattern_similarity.py",  "Cross-pattern adversarial similarity"),
+# Sub-scripts in execution order.
+# Each entry is (filename, description, needs_db).
+# needs_db=False → only --out is passed (e.g. visualize_results.py reads CSVs,
+# not the database directly).
+SCRIPTS: list[tuple[str, str, bool]] = [
+    ("extract_rankings.py",         "Ranking exports (standings + gallery search)",  True),
+    ("model_accuracy.py",           "Model accuracy (overall / pose / pattern)",     True),
+    ("score_statistics.py",         "Score statistics (model-independent)",          True),
+    ("cross_pattern_similarity.py", "Cross-pattern adversarial similarity",          True),
+    ("gallery_search_stats.py",     "Gallery search statistics and figures",         True),
+    ("visualize_results.py",        "Visualisations for accuracy / score / pattern", False),
 ]
 
 
@@ -58,7 +63,7 @@ def main() -> None:
     failed  = 0
     t_total = time.time()
 
-    for script_name, description in SCRIPTS:
+    for script_name, description, needs_db in SCRIPTS:
         script_path = _SCRIPT_DIR / script_name
         if not script_path.exists():
             print(f"\n⚠  {script_name} not found — skipping")
@@ -70,9 +75,13 @@ def main() -> None:
         print(f"   {script_name}")
         print(f"{'─' * 70}")
 
+        cmd = [python, str(script_path), "--out", out_arg]
+        if needs_db:
+            cmd += ["--db", db_arg]
+
         t0 = time.time()
         result = subprocess.run(
-            [python, str(script_path), "--db", db_arg, "--out", out_arg],
+            cmd,
             cwd=str(_SCRIPT_DIR.parent),   # run from project root
         )
         elapsed = time.time() - t0
