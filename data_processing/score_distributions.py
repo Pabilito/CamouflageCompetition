@@ -656,6 +656,17 @@ def generate_plots_for_model(
         pattern_combos = pattern_combo_scores,
     )
 
+    # Return computed data for the combined overview figure
+    return {
+        "model":               model,
+        "mated_scores":        mated_scores,
+        "nonmated_scores":     nonmated_scores,
+        "adv_frontal_scores":  (m_front, nm_front),
+        "adv_profile_scores":  (m_profil, nm_profil),
+        "pattern_combo_scores": pattern_combo_scores,
+        "combos":              combos if combos else [],
+    }
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -985,6 +996,110 @@ def plot_biometric_summary(models: list[str], out_root: Path) -> None:
     _save(fig, out_path)
     print(f"  Biometric summary figure → {out_path}")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Combined overview figure (all models × plots 1–4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_combined_overview(
+    model_data_list: list[dict],
+    out_root: Path,
+) -> None:
+    """
+    One big figure: rows = models, columns = Plot1 | Plot2 | Plot3_combo_0 |
+    Plot3_combo_1 | … | Plot4.  Each Plot3 combo gets its own column so the
+    layout matches the individual per-model Plot 3 subplots exactly.
+    Saved to out_root/all_models_overview.png.
+    """
+    if not model_data_list:
+        print("  No model data — skipping combined overview.")
+        return
+
+    # Determine combo list from first model that has combos
+    combos: list[tuple[int, int]] = []
+    for md in model_data_list:
+        if md["combos"]:
+            combos = md["combos"]
+            break
+
+    n_models  = len(model_data_list)
+    n_combos  = len(combos)
+    # Layout: Plot1 | Plot2 | combo_0 … combo_N | Plot4
+    NCOLS     = 2 + n_combos + 1
+
+    fig, axes = plt.subplots(
+        n_models, NCOLS,
+        figsize=(6.5 * NCOLS, 4.5 * n_models),
+        squeeze=False,
+    )
+    fig.suptitle("All Models — Score Distribution Overview", fontsize=14,
+                 fontweight="bold", y=1.01)
+
+    COMBO_COLORS = [
+        "#e41a1c", "#377eb8", "#4daf4a", "#984ea3",
+        "#ff7f00", "#a65628", "#f781bf", "#999999",
+        "#01665e", "#8c510a",
+    ]
+    NM_COLOR    = "#555555"
+    COL_FRONTAL = "#1f77b4"
+    COL_PROFILE = "#d62728"
+
+    for row_idx, md in enumerate(model_data_list):
+        model                = md["model"]
+        mated_scores         = md["mated_scores"]
+        nonmated_scores      = md["nonmated_scores"]
+        m_front, nm_front    = md["adv_frontal_scores"]
+        m_profil, nm_profil  = md["adv_profile_scores"]
+        pattern_combo_scores = md["pattern_combo_scores"]
+
+        col_idx = 0
+
+        # ── Plot 1 ────────────────────────────────────────────────────────────
+        ax = axes[row_idx][col_idx]; col_idx += 1
+        _draw_dist(ax, mated_scores,    PALETTE["mated"],     "Mated")
+        _draw_dist(ax, nonmated_scores, PALETTE["non_mated"], "Non-mated", linestyle=":")
+        _style_ax(ax, f"{model}\nMated vs Non-Mated")
+        _draw_threshold_lines(ax, mated_scores, nonmated_scores)
+        _unify_ylim([ax])
+
+        # ── Plot 2 ────────────────────────────────────────────────────────────
+        ax = axes[row_idx][col_idx]; col_idx += 1
+        _draw_dist(ax, m_front,   COL_FRONTAL, "Mated – Frontal")
+        _draw_dist(ax, nm_front,  COL_FRONTAL, "Non-mated – Frontal", linestyle=":")
+        _draw_dist(ax, m_profil,  COL_PROFILE, "Mated – Profile")
+        _draw_dist(ax, nm_profil, COL_PROFILE, "Non-mated – Profile", linestyle=":")
+        _style_ax(ax, f"{model}\nPose Breakdown")
+        _unify_ylim([ax])
+
+        # ── Plot 3 — one subplot per combo ────────────────────────────────────
+        for c_idx, (pA, pB) in enumerate(combos):
+            col_pA = COMBO_COLORS[c_idx % len(COMBO_COLORS)]
+            ax = axes[row_idx][col_idx]; col_idx += 1
+            m_sc, nm_sc = pattern_combo_scores.get((pA, pB), (np.array([]), np.array([])))
+            _draw_dist(ax, m_sc,  col_pA,   f"Mated P{pA}\u21d4P{pB}")
+            _draw_dist(ax, nm_sc, NM_COLOR, "Non-mated", linestyle="--")
+            _style_ax(ax, f"{model}\nPattern {pA} vs {pB}")
+            _draw_threshold_lines(ax, m_sc, nm_sc)
+            _unify_ylim([ax])
+
+        # ── Plot 4 ────────────────────────────────────────────────────────────
+        ax = axes[row_idx][col_idx]; col_idx += 1
+        COL_CTRL_ADV = PALETTE["mated"]
+        _draw_dist(ax, mated_scores,    COL_CTRL_ADV, "Mated ctrl\u2194adv",     fill=False)
+        _draw_dist(ax, nonmated_scores, COL_CTRL_ADV, "Non-mated ctrl\u2194adv", linestyle=":", fill=False)
+        for c_idx, (pA, pB) in enumerate(combos):
+            col = COMBO_COLORS[c_idx % len(COMBO_COLORS)]
+            m_sc, nm_sc = pattern_combo_scores.get((pA, pB), (np.array([]), np.array([])))
+            _draw_dist(ax, m_sc,  col, f"Mated P{pA}\u21d4P{pB}",     fill=False)
+            _draw_dist(ax, nm_sc, col, f"Non-mated P{pA}\u21d4P{pB}", linestyle=":", fill=False)
+        _style_ax(ax, f"{model}\nCombined")
+        _unify_ylim([ax])
+
+    fig.tight_layout()
+    out_path = out_root / "all_models_overview.png"
+    _save(fig, out_path)
+    print(f"  Combined overview → {out_path}")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1018,13 +1133,19 @@ def main() -> None:
     print(f"Output root: {out_root.resolve()}")
     print(f"KDE smoothing: {'enabled (scipy)' if HAS_KDE else 'disabled (install scipy to enable)'}")
 
+    model_data_list = []
     for model in models:
-        generate_plots_for_model(model, con, out_root, rng)
+        data = generate_plots_for_model(model, con, out_root, rng)
+        if data is not None:
+            model_data_list.append(data)
 
     con.close()
 
     print("\nGenerating biometric summary figure …")
     plot_biometric_summary(models, out_root)
+
+    print("\nGenerating combined overview figure …")
+    generate_combined_overview(model_data_list, out_root)
 
     print("\nAll done.")
 
