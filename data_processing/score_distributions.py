@@ -59,6 +59,14 @@ try:
 except ImportError:
     HAS_KDE = False
 
+# ── Try pyeer ─────────────────────────────────────────────────────────────────
+try:
+    from pyeer.eer_info import get_eer_stats
+    from pyeer.report import generate_eer_report, export_error_rates
+    HAS_PYEER = True
+except ImportError:
+    HAS_PYEER = False
+
 # ── Colour palette ────────────────────────────────────────────────────────────
 PALETTE = {
     "mated":             "#1f77b4",   # strong blue
@@ -266,11 +274,79 @@ def _style_ax(ax: plt.Axes, title: str, xlabel: str = "Cosine Similarity") -> No
     ax.spines[["top", "right"]].set_visible(False)
 
 
+def _draw_threshold_lines(
+    ax: plt.Axes,
+    gscores: np.ndarray,
+    iscores: np.ndarray,
+) -> None:
+    """
+    Compute EER, FMR100, FMR1000 thresholds via pyeer, draw vertical dashed
+    lines, then rebuild the axis legend to include both the existing
+    distribution entries and a clearly separated threshold section.
+    Silently skips if pyeer is unavailable or scores are too few.
+    """
+    if not HAS_PYEER or len(gscores) < 5 or len(iscores) < 5:
+        return
+    try:
+        # Standard convention: mated=genuine, nonmated=impostor.
+        # EER will be high (attack works), thresholds are correctly positioned:
+        # EER_th at crossing, FMR100_th at 99th pct of nonmated (right of EER).
+        st = get_eer_stats(gscores.tolist(), iscores.tolist())
+
+        # Acc@EER = 1 - EER; TPR at FMR operating points
+        acc_eer    = 1.0 - st.eer
+        tpr_fmr100 = 1.0 - st.fmr100
+        tpr_fmr1k  = 1.0 - st.fmr1000
+
+        threshold_defs = [
+            (st.eer_th,     f"EER [{st.eer_th:.3f}] (Acc={acc_eer:.3f})",          "#333333"),
+            (st.fmr100_th,  f"FMR100 [{st.fmr100_th:.3f}] (TPR={tpr_fmr100:.3f})", "#e67e22"),
+            (st.fmr1000_th, f"FMR1000 [{st.fmr1000_th:.3f}] (TPR={tpr_fmr1k:.3f})","#8e44ad"),
+        ]
+        # Draw plain vertical lines
+        for th, _, color in threshold_defs:
+            ax.axvline(th, color=color, lw=1.2, linestyle="--", alpha=0.8)
+
+        # Collect existing legend handles/labels
+        existing_h, existing_l = ax.get_legend_handles_labels()
+
+        # Build threshold+accuracy handles
+        thresh_handles = [
+            matplotlib.lines.Line2D([], [], color=c, lw=1.2,
+                                    linestyle="--", label=lbl)
+            for _, lbl, c in threshold_defs
+        ]
+
+        # Invisible spacer handle to act as a section divider
+        spacer = matplotlib.lines.Line2D([], [], color="none", label="─ Thresholds ─")
+
+        # Rebuild as one combined legend
+        all_handles = existing_h + [spacer] + thresh_handles
+        ax.legend(
+            handles=all_handles,
+            fontsize=7,
+            loc="upper left",
+            bbox_to_anchor=(1.01, 1),
+            borderaxespad=0,
+            framealpha=0.7,
+        )
+    except Exception:
+        pass
+
+
 def _save(fig: plt.Figure, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved → {path}")
+
+
+def _unify_ylim(axes_flat) -> None:
+    """Set the same y-axis upper bound on all axes (max across all, bottom=0)."""
+    ymax = max((ax.get_ylim()[1] for ax in axes_flat if ax.get_visible()), default=1.0)
+    for ax in axes_flat:
+        if ax.get_visible():
+            ax.set_ylim(0, ymax)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -327,6 +403,8 @@ def generate_plots_for_model(
     _draw_dist(ax, mated_scores,    PALETTE["mated"],     "Mated")
     _draw_dist(ax, nonmated_scores, PALETTE["non_mated"], "Non-mated", linestyle=":")
     _style_ax(ax, f"{model}\nMated vs Non-Mated Score Distributions")
+    _draw_threshold_lines(ax, mated_scores, nonmated_scores)
+    _unify_ylim([ax])
     fig.tight_layout()
     _save(fig, out_dir / "plot1_mated_vs_nonmated.png")
     print("done")
@@ -366,11 +444,14 @@ def generate_plots_for_model(
     _draw_dist(ax, m_profil,  COL_PROFILE, "Mated – Profile")
     _draw_dist(ax, nm_profil, COL_PROFILE, "Non-mated – Profile", linestyle=":")
     _style_ax(ax, f"{model}\nPose-Stratified Score Distributions")
+    _unify_ylim([ax])
     fig.tight_layout()
     _save(fig, out_dir / "plot2_pose_breakdown.png")
     print("done")
 
     # ── PLOT 3 ─────────────────────────────────────────────────────────────────
+    # Also accumulate scores for biometric stats (keyed by combo tuple)
+    pattern_combo_scores: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
     print("  Plot 3 …", end=" ")
 
     # Collect available patterns (non-zero pattern_id)
@@ -476,14 +557,17 @@ def generate_plots_for_model(
             m_scores  = adv_adv_scores(mated_pairs_p3)
             nm_scores = adv_adv_scores(nonmated_pairs_p3)
 
+            pattern_combo_scores[(pA, pB)] = (m_scores, nm_scores)
             _draw_dist(ax, m_scores,  col_pA, f"Mated P{pA}↔P{pB}",  bins=30)
             _draw_dist(ax, nm_scores, NM_COLOR, "Non-mated", bins=30, linestyle="--")
             _style_ax(ax, f"Pattern {pA} vs Pattern {pB}")
+            _draw_threshold_lines(ax, m_scores, nm_scores)
 
         # Hide unused subplots
         for idx in range(n_combos, nrows * ncols):
             axes[idx // ncols][idx % ncols].set_visible(False)
 
+        _unify_ylim([axes[r][c] for r in range(nrows) for c in range(ncols)])
         fig.tight_layout()
         _save(fig, out_dir / "plot3_cross_pattern.png")
         print("done")
@@ -558,10 +642,348 @@ def generate_plots_for_model(
             _draw_dist(ax, nm_scores_p4, col_pA, f"Non-mated P{pA}↔P{pB}", bins=30, linestyle=":", fill=False)
 
     _style_ax(ax, f"{model}\nCombined: ctrl↔adv (Plot 1) + cross-pattern adv↔adv (Plot 3)")
+    _unify_ylim([ax])
     fig.tight_layout()
     _save(fig, out_dir / "plot4_combined.png")
     print("done")
 
+    # ── BIOMETRIC STATS ────────────────────────────────────────────────────────
+    compute_biometric_stats(
+        model          = model,
+        out_dir        = out_dir,
+        mated_scores   = mated_scores,
+        nonmated_scores= nonmated_scores,
+        pattern_combos = pattern_combo_scores,
+    )
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Biometric statistics (pyeer)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_biometric_stats(
+    model:    str,
+    out_dir:  Path,
+    # Plot-1 scores
+    mated_scores:    np.ndarray,
+    nonmated_scores: np.ndarray,
+    # Plot-3 per-combo scores: {(pA, pB): (mated_arr, nonmated_arr)}
+    pattern_combos:  dict[tuple[int, int], tuple[np.ndarray, np.ndarray]],
+) -> None:
+    """
+    Compute EER, FMR100, FMR1000 and export ROC rates using pyeer.
+    Outputs per model_dir:
+      biometric_stats.csv   – summary table (EER, FMR100, FMR1000, AUC, d')
+      roc_<tag>.csv         – FMR / FNMR columns for each experiment
+    """
+    if not HAS_PYEER:
+        print("  [biometric stats] pyeer not installed – skipping. "
+              "Run: pip install pyeer")
+        return
+
+    import csv
+
+    experiments: list[tuple[str, np.ndarray, np.ndarray]] = []
+
+    # Plot-1 experiment
+    if len(mated_scores) > 0 and len(nonmated_scores) > 0:
+        experiments.append(("ctrl_vs_adversarial", mated_scores, nonmated_scores))
+
+    # Plot-3 per-pattern-combo experiments
+    for (pA, pB), (m_sc, nm_sc) in sorted(pattern_combos.items()):
+        if len(m_sc) > 0 and len(nm_sc) > 0:
+            experiments.append((f"P{pA}_vs_P{pB}", m_sc, nm_sc))
+
+    # Aggregate: pool all mated and all non-mated scores from every experiment
+    # with equal weight (sample the same n from each so no single experiment
+    # dominates due to differing pair counts).
+    all_mated_parts   = [mated_scores]   + [m for _, (m, _) in sorted(pattern_combos.items()) if len(m) > 0]
+    all_nonmated_parts= [nonmated_scores]+ [nm for _, (_, nm) in sorted(pattern_combos.items()) if len(nm) > 0]
+    if all_mated_parts and all_nonmated_parts:
+        min_m  = min(len(a) for a in all_mated_parts)
+        min_nm = min(len(a) for a in all_nonmated_parts)
+        rng_agg = random.Random(RANDOM_SEED)
+        agg_mated   = np.concatenate([
+            np.array(rng_agg.sample(list(a), min(min_m,  len(a))), dtype=np.float32)
+            for a in all_mated_parts
+        ])
+        agg_nonmated = np.concatenate([
+            np.array(rng_agg.sample(list(a), min(min_nm, len(a))), dtype=np.float32)
+            for a in all_nonmated_parts
+        ])
+        if len(agg_mated) > 0 and len(agg_nonmated) > 0:
+            experiments.append(("all_mated_vs_nonmated", agg_mated, agg_nonmated))
+
+    if not experiments:
+        print("  [biometric stats] no score pairs available – skipping.")
+        return
+
+    print(f"  Biometric stats ({len(experiments)} experiment(s)) …", end=" ")
+
+    summary_rows: list[dict] = []
+
+    for tag, gscores, iscores in experiments:
+        try:
+            # Standard: mated=genuine, nonmated=impostor
+            stats = get_eer_stats(gscores.tolist(), iscores.tolist())
+        except Exception as exc:
+            print(f"\n  [WARN] pyeer failed for {tag}: {exc}")
+            continue
+
+        # TPR = 1 - FNMR at each operating point
+        tpr_eer    = round(1.0 - stats.eer,    6)
+        tpr_fmr100 = round(1.0 - stats.fmr100, 6)
+        tpr_fmr1000= round(1.0 - stats.fmr1000,6)
+
+        summary_rows.append({
+            "experiment":      tag,
+            "n_mated":         len(gscores),
+            "n_nonmated":      len(iscores),
+            "EER":             round(stats.eer,     6),
+            "Acc@EER":         tpr_eer,   # Acc = 1 - EER
+            "FNMR@FMR100":     round(stats.fmr100,  6),
+            "TPR@FMR100":      tpr_fmr100,
+            "FNMR@FMR1000":    round(stats.fmr1000, 6),
+            "TPR@FMR1000":     tpr_fmr1000,
+            "AUC":             round(stats.auc,     6),
+            "EER_thresh":      round(stats.eer_th,  6),
+        })
+
+        # Export ROC (FMR vs 1-FNMR) as CSV
+        roc_path = out_dir / f"roc_{tag}.csv"
+        try:
+            export_error_rates(stats.fmr, stats.fnmr, str(roc_path))
+        except Exception as exc:
+            print(f"\n  [WARN] could not export ROC for {tag}: {exc}")
+
+    if not summary_rows:
+        print("no results.")
+        return
+
+    # Write summary CSV
+    summary_path = out_dir / "biometric_stats.csv"
+    fieldnames = list(summary_rows[0].keys())
+    with open(summary_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+    print(f"done → {summary_path.name} + {len(summary_rows)} roc_*.csv file(s)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Biometric stats summary figure
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_biometric_summary(models: list[str], out_root: Path) -> None:
+    """
+    Read biometric_stats.csv and roc_*.csv from each model's subfolder and
+    produce a single summary figure saved to out_root/biometric_summary.png.
+
+    Layout: one row per model, two columns:
+      Col 1 – grouped bar chart: EER / FMR100 / FMR1000 per experiment
+      Col 2 – ROC curve (1-FNMR vs FMR) per experiment
+    """
+    import csv
+
+    # Colour cycle for experiments (same order every model)
+    EXP_COLORS = [
+        "#1f77b4", "#d62728", "#2ca02c", "#984ea3",
+        "#ff7f00", "#8c564b", "#e377c2", "#7f7f7f",
+    ]
+
+    # ── collect data ──────────────────────────────────────────────────────────
+    model_data: list[dict] = []   # one entry per model that has data
+
+    for model in models:
+        model_dir = out_root / model
+        stats_path = model_dir / "biometric_stats.csv"
+        if not stats_path.exists():
+            continue
+
+        rows: list[dict] = []
+        with open(stats_path, newline="") as f:
+            rows = list(csv.DictReader(f))
+
+        if not rows:
+            continue
+
+        # Load ROC files
+        roc_data: dict[str, tuple[list, list]] = {}
+        for row in rows:
+            tag = row["experiment"]
+            roc_path = model_dir / f"roc_{tag}.csv"
+            if roc_path.exists():
+                fmr_vals, fnmr_vals = [], []
+                with open(roc_path, newline="") as f:
+                    for r in csv.DictReader(f):
+                        try:
+                            fmr_vals.append(float(r["FMR"]))
+                            fnmr_vals.append(float(r["FNMR"]))
+                        except (ValueError, KeyError):
+                            pass
+                if fmr_vals:
+                    roc_data[tag] = (fmr_vals, fnmr_vals)
+
+        model_data.append({"model": model, "rows": rows, "roc": roc_data})
+
+    if not model_data:
+        print("  [biometric summary] no biometric_stats.csv files found – skipping.")
+        return
+
+    n_models = len(model_data)
+    fig, axes = plt.subplots(
+        n_models, 3,
+        figsize=(20, 4.5 * n_models),
+        squeeze=False,
+        gridspec_kw={"width_ratios": [3, 3, 4]},
+    )
+    fig.suptitle("Biometric Performance Summary", fontsize=13, fontweight="bold", y=1.01)
+
+    # EER = error rate; FMR100/FMR1000 in CSV are FNMR at those operating points
+    METRICS = ["EER", "FNMR@FMR100", "FNMR@FMR1000"]
+
+    for row_idx, mdata in enumerate(model_data):
+        model   = mdata["model"]
+        rows    = mdata["rows"]
+        roc     = mdata["roc"]
+        exps    = [r["experiment"] for r in rows]
+        colors  = [EXP_COLORS[i % len(EXP_COLORS)] for i in range(len(exps))]
+
+        # ── Col 1: grouped bar chart ──────────────────────────────────────────
+        ax_bar = axes[row_idx][0]
+        n_exp     = len(exps)
+        n_metrics = len(METRICS)
+        x         = np.arange(n_exp)
+        bar_w     = 0.22
+        offsets   = np.linspace(-(n_metrics - 1) / 2, (n_metrics - 1) / 2, n_metrics) * bar_w
+
+        metric_colors = {"EER": "#1f77b4", "FNMR@FMR100": "#ff7f0e", "FNMR@FMR1000": "#2ca02c"}
+        metric_csv_key = {"EER": "EER", "FNMR@FMR100": "FNMR@FMR100", "FNMR@FMR1000": "FNMR@FMR1000"}
+
+        for m_idx, metric in enumerate(METRICS):
+            vals = []
+            for r in rows:
+                try:
+                    vals.append(float(r[metric_csv_key[metric]]))
+                except (ValueError, KeyError):
+                    vals.append(0.0)
+            ax_bar.bar(
+                x + offsets[m_idx], vals,
+                width=bar_w,
+                label=metric,
+                color=metric_colors[metric],
+                alpha=0.85,
+                edgecolor="white",
+                linewidth=0.5,
+            )
+
+        ax_bar.set_xticks(x)
+        ax_bar.set_xticklabels(
+            [e.replace("_", " ") for e in exps],
+            fontsize=7, rotation=20, ha="right",
+        )
+        ax_bar.set_ylabel("Error Rate", fontsize=8)
+        ax_bar.set_ylim(bottom=0)
+        ax_bar.set_title(f"{model} — EER / FNMR@FMR100 / FNMR@FMR1000", fontsize=9, fontweight="bold")
+        ax_bar.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.01, 1),
+                      borderaxespad=0, framealpha=0.7)
+        ax_bar.grid(axis="y", lw=0.4, alpha=0.5)
+        ax_bar.spines[["top", "right"]].set_visible(False)
+
+        # ── Col 2: ROC curves ─────────────────────────────────────────────────
+        ax_roc = axes[row_idx][1]
+
+        # Chance line
+        ax_roc.plot([0, 1], [0, 1], color="#cccccc", lw=1, linestyle="--", zorder=0)
+
+        for i, exp in enumerate(exps):
+            if exp not in roc:
+                continue
+            fmr_vals, fnmr_vals = roc[exp]
+            tpr = [1.0 - v for v in fnmr_vals]   # TPR = 1 - FNMR
+            ax_roc.plot(
+                fmr_vals, tpr,
+                color=colors[i], lw=1.8, alpha=0.85,
+                label=exp.replace("_", " "),
+            )
+
+            # Mark EER point: x=EER (FMR=FNMR=EER at crossing), y=TPR@EER
+            try:
+                eer_fmr = float(rows[i]["EER"])
+                tpr_eer = float(rows[i]["TPR@EER"])
+                if eer_fmr <= 0.3:
+                    ax_roc.scatter([eer_fmr], [tpr_eer],
+                                   color=colors[i], s=40, zorder=5)
+            except (ValueError, KeyError, IndexError):
+                pass
+
+        ax_roc.set_xlabel("FMR", fontsize=8)
+        ax_roc.set_ylabel("1 − FNMR (TPR)", fontsize=8)
+        ax_roc.set_xlim(0, 1)
+        ax_roc.set_ylim(0, 1)
+        ax_roc.set_title(f"{model} — ROC Curves", fontsize=9, fontweight="bold")
+        ax_roc.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.01, 1),
+                      borderaxespad=0, framealpha=0.7)
+        ax_roc.grid(lw=0.4, alpha=0.4)
+        ax_roc.spines[["top", "right"]].set_visible(False)
+
+        # ── Col 3: accuracy table ─────────────────────────────────────────────
+        ax_tbl = axes[row_idx][2]
+        ax_tbl.axis("off")
+
+        TABLE_COLS = ["Experiment", "Acc@EER", "TPR@FMR100", "TPR@FMR1000", "AUC"]
+        table_data = []
+        for r in rows:
+            def _fmt(key):
+                try:
+                    return f"{float(r[key]):.3f}"
+                except (KeyError, ValueError):
+                    return "—"
+            table_data.append([
+                r["experiment"].replace("_", " "),
+                _fmt("Acc@EER"),
+                _fmt("TPR@FMR100"),
+                _fmt("TPR@FMR1000"),
+                _fmt("AUC"),
+            ])
+
+        tbl = ax_tbl.table(
+            cellText=table_data,
+            colLabels=TABLE_COLS,
+            cellLoc="center",
+            loc="center",
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(7.5)
+        tbl.auto_set_column_width(col=list(range(len(TABLE_COLS))))
+
+        # Style header row
+        for col_idx in range(len(TABLE_COLS)):
+            cell = tbl[0, col_idx]
+            cell.set_facecolor("#2c3e50")
+            cell.set_text_props(color="white", fontweight="bold")
+
+        # Alternate row shading; highlight last row (aggregate experiment)
+        last_row = len(table_data)
+        for r_idx in range(1, last_row + 1):
+            if r_idx == last_row:
+                bg = "#d4e6f1"   # light blue highlight for aggregate row
+            else:
+                bg = "#f0f4f8" if r_idx % 2 == 0 else "white"
+            for col_idx in range(len(TABLE_COLS)):
+                cell = tbl[r_idx, col_idx]
+                cell.set_facecolor(bg)
+                if r_idx == last_row:
+                    cell.set_text_props(fontweight="bold")
+
+        ax_tbl.set_title(f"{model} — Accuracy Table", fontsize=9, fontweight="bold")
+
+    fig.tight_layout()
+    out_path = out_root / "biometric_summary.png"
+    _save(fig, out_path)
+    print(f"  Biometric summary figure → {out_path}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
@@ -600,6 +1022,10 @@ def main() -> None:
         generate_plots_for_model(model, con, out_root, rng)
 
     con.close()
+
+    print("\nGenerating biometric summary figure …")
+    plot_biometric_summary(models, out_root)
+
     print("\nAll done.")
 
 
