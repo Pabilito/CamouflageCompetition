@@ -167,6 +167,91 @@ def cosine(v1: np.ndarray, v2: np.ndarray) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# All-models aggregation helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_all_control_embeddings(
+    con: sqlite3.Connection,
+    models: list[str],
+) -> dict[str, dict[str, np.ndarray]]:
+    """Return {model: {image_path: embedding}} for control images of all models."""
+    return {m: load_control_embeddings(con, m) for m in models}
+
+
+def load_all_adversarial_embeddings(
+    con: sqlite3.Connection,
+    models: list[str],
+) -> dict[str, dict[str, np.ndarray]]:
+    """Return {model: {image_path: embedding}} for adversarial images of all models."""
+    return {m: load_adversarial_embeddings(con, m) for m in models}
+
+
+def avg_cosine(
+    ctrl_path: str,
+    adv_path:  str,
+    ctrl_embs_all: dict[str, dict[str, np.ndarray]],
+    adv_embs_all:  dict[str, dict[str, np.ndarray]],
+) -> float | None:
+    """
+    Average cosine similarity across all models for a (ctrl, adv) pair.
+    Returns None if no model has both embeddings.
+    Mirrors the gallery-search aggregation in recognition_tab.py.
+    """
+    scores = []
+    for m in ctrl_embs_all:
+        c = ctrl_embs_all[m].get(ctrl_path)
+        a = adv_embs_all[m].get(adv_path)
+        if c is not None and a is not None:
+            scores.append(cosine(c, a))
+    return float(np.mean(scores)) if scores else None
+
+
+def avg_cosine_adv_adv(
+    path_a: str,
+    path_b: str,
+    adv_embs_all: dict[str, dict[str, np.ndarray]],
+) -> float | None:
+    """
+    Average cosine similarity across all models for an (adv_A, adv_B) pair.
+    Returns None if no model has both embeddings.
+    """
+    scores = []
+    for m in adv_embs_all:
+        a = adv_embs_all[m].get(path_a)
+        b = adv_embs_all[m].get(path_b)
+        if a is not None and b is not None:
+            scores.append(cosine(a, b))
+    return float(np.mean(scores)) if scores else None
+
+
+def scores_from_pairs_all_models(
+    pairs:          list[tuple[str, str]],
+    ctrl_embs_all:  dict[str, dict[str, np.ndarray]],
+    adv_embs_all:   dict[str, dict[str, np.ndarray]],
+) -> np.ndarray:
+    """Averaged-similarity scores for ctrl↔adv pairs across all models."""
+    out = []
+    for c, a in pairs:
+        v = avg_cosine(c, a, ctrl_embs_all, adv_embs_all)
+        if v is not None:
+            out.append(v)
+    return np.array(out, dtype=np.float32)
+
+
+def scores_adv_adv_all_models(
+    pairs:        list[tuple[str, str]],
+    adv_embs_all: dict[str, dict[str, np.ndarray]],
+) -> np.ndarray:
+    """Averaged-similarity scores for adv↔adv pairs across all models."""
+    out = []
+    for a, b in pairs:
+        v = avg_cosine_adv_adv(a, b, adv_embs_all)
+        if v is not None:
+            out.append(v)
+    return np.array(out, dtype=np.float32)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Pair-building helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -670,6 +755,271 @@ def generate_plots_for_model(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# All-models aggregated plot generation
+# ─────────────────────────────────────────────────────────────────────────────
+
+ALL_MODELS_LABEL = "All Models (avg sim)"
+
+def generate_plots_for_all_models(
+    models:   list[str],
+    con:      sqlite3.Connection,
+    out_root: Path,
+    rng:      random.Random,
+) -> dict | None:
+    """
+    Generate the same four plots and biometric stats as generate_plots_for_model,
+    but using scores averaged across all models for every pair — mirroring the
+    gallery-search aggregation in the ranking tab.
+
+    Output folder: out_root / "all_models"
+    """
+    label = ALL_MODELS_LABEL
+    print(f"\n[{label}]")
+
+    out_dir = out_root / "all_models"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Load data for every model ──────────────────────────────────────────────
+    ctrl_embs_all = load_all_control_embeddings(con, models)
+    adv_embs_all  = load_all_adversarial_embeddings(con, models)
+    atk_meta      = load_attack_meta(con)
+    ctrl_id       = load_capture_identity(con)
+
+    # Use the union of all per-model path sets
+    all_ctrl_paths: set[str] = set()
+    for m_emb in ctrl_embs_all.values():
+        all_ctrl_paths |= m_emb.keys()
+
+    all_adv_paths: set[str] = set()
+    for m_emb in adv_embs_all.values():
+        all_adv_paths |= m_emb.keys()
+
+    if not all_ctrl_paths:
+        print(f"  No control embeddings across models – skipping.")
+        return None
+    if not all_adv_paths:
+        print(f"  No adversarial embeddings across models – skipping.")
+        return None
+
+    # Group control paths by identity (union across models)
+    ctrl_by_id: dict[str, list[str]] = defaultdict(list)
+    for path, ident in ctrl_id.items():
+        if path in all_ctrl_paths:
+            ctrl_by_id[ident].append(path)
+
+    # Group adversarial paths by identity (union across models)
+    adv_by_id: dict[str, list[str]] = defaultdict(list)
+    for path in all_adv_paths:
+        meta  = atk_meta.get(path, {})
+        ident = meta.get("identity_name", "")
+        if ident:
+            adv_by_id[ident].append(path)
+
+    # ── PLOT 1 ─────────────────────────────────────────────────────────────────
+    print("  Plot 1 …", end=" ")
+    mated_pairs    = build_mated_pairs(ctrl_by_id, adv_by_id)
+    nonmated_pairs = build_nonmated_pairs(ctrl_by_id, adv_by_id, len(mated_pairs), rng)
+
+    mated_scores    = scores_from_pairs_all_models(mated_pairs,    ctrl_embs_all, adv_embs_all)
+    nonmated_scores = scores_from_pairs_all_models(nonmated_pairs, ctrl_embs_all, adv_embs_all)
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    _draw_dist(ax, mated_scores,    PALETTE["mated"],     "Mated")
+    _draw_dist(ax, nonmated_scores, PALETTE["non_mated"], "Non-mated", linestyle=":")
+    _style_ax(ax, f"{label}\nMated vs Non-Mated Score Distributions")
+    _draw_threshold_lines(ax, mated_scores, nonmated_scores)
+    _unify_ylim([ax])
+    fig.tight_layout()
+    _save(fig, out_dir / "plot1_mated_vs_nonmated.png")
+    print("done")
+
+    # ── PLOT 2 ─────────────────────────────────────────────────────────────────
+    print("  Plot 2 …", end=" ")
+
+    def _filter_adv_by_pose(flag: str) -> dict[str, list[str]]:
+        filtered: dict[str, list[str]] = defaultdict(list)
+        for path, meta in atk_meta.items():
+            if path in all_adv_paths and meta.get(flag, 0):
+                ident = meta.get("identity_name", "")
+                if ident:
+                    filtered[ident].append(path)
+        return filtered
+
+    adv_frontal = _filter_adv_by_pose("is_frontal")
+    adv_profile = _filter_adv_by_pose("is_profile")
+
+    def _pose_mated_nonmated(adv_subset: dict[str, list[str]]) -> tuple[np.ndarray, np.ndarray]:
+        m_pairs  = build_mated_pairs(ctrl_by_id, adv_subset)
+        nm_pairs = build_nonmated_pairs(ctrl_by_id, adv_subset, len(m_pairs), rng)
+        return (
+            scores_from_pairs_all_models(m_pairs,  ctrl_embs_all, adv_embs_all),
+            scores_from_pairs_all_models(nm_pairs, ctrl_embs_all, adv_embs_all),
+        )
+
+    m_front,  nm_front  = _pose_mated_nonmated(adv_frontal)
+    m_profil, nm_profil = _pose_mated_nonmated(adv_profile)
+
+    COL_FRONTAL = "#1f77b4"
+    COL_PROFILE = "#d62728"
+    fig, ax = plt.subplots(figsize=(8, 4))
+    _draw_dist(ax, m_front,   COL_FRONTAL, "Mated – Frontal")
+    _draw_dist(ax, nm_front,  COL_FRONTAL, "Non-mated – Frontal", linestyle=":")
+    _draw_dist(ax, m_profil,  COL_PROFILE, "Mated – Profile")
+    _draw_dist(ax, nm_profil, COL_PROFILE, "Non-mated – Profile", linestyle=":")
+    _style_ax(ax, f"{label}\nPose-Stratified Score Distributions")
+    _unify_ylim([ax])
+    fig.tight_layout()
+    _save(fig, out_dir / "plot2_pose_breakdown.png")
+    print("done")
+
+    # ── PLOT 3 ─────────────────────────────────────────────────────────────────
+    pattern_combo_scores: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+    print("  Plot 3 …", end=" ")
+
+    pattern_ids: set[int] = set()
+    for meta in atk_meta.values():
+        pid = meta.get("pattern_id", 0)
+        if pid and pid > 0:
+            pattern_ids.add(int(pid))
+    pattern_ids_sorted = sorted(pattern_ids)
+
+    adv_by_id_pat: dict[tuple[str, int], list[str]] = defaultdict(list)
+    for path, meta in atk_meta.items():
+        if path not in all_adv_paths:
+            continue
+        pid   = int(meta.get("pattern_id", 0))
+        ident = meta.get("identity_name", "")
+        if pid > 0 and ident:
+            adv_by_id_pat[(ident, pid)].append(path)
+
+    adv_by_pat: dict[int, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+    for (ident, pid), paths in adv_by_id_pat.items():
+        adv_by_pat[pid][ident].extend(paths)
+
+    combos = list(itertools.combinations(pattern_ids_sorted, 2))
+
+    if not combos:
+        print("no pattern combinations found – skipping.")
+    else:
+        n_combos = len(combos)
+        ncols    = min(3, n_combos)
+        nrows    = (n_combos + ncols - 1) // ncols
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(5 * ncols, 4 * nrows),
+            squeeze=False,
+        )
+        fig.suptitle(
+            f"{label}\nCross-Pattern Score Distributions (adversarial pA vs adversarial pB)",
+            fontsize=11, fontweight="bold",
+        )
+
+        COMBO_COLORS = [
+            ("#e41a1c", "#377eb8"), ("#4daf4a", "#984ea3"),
+            ("#ff7f00", "#a65628"), ("#f781bf", "#999999"),
+            ("#e41a1c", "#4daf4a"), ("#377eb8", "#ff7f00"),
+            ("#984ea3", "#a65628"), ("#f781bf", "#e41a1c"),
+            ("#4daf4a", "#377eb8"), ("#ff7f00", "#984ea3"),
+        ]
+        NM_COLOR = "#555555"
+
+        for idx, (pA, pB) in enumerate(combos):
+            ax         = axes[idx // ncols][idx % ncols]
+            col_pA, _  = COMBO_COLORS[idx % len(COMBO_COLORS)]
+
+            adv_pA: dict[str, list[str]] = dict(adv_by_pat.get(pA, {}))
+            adv_pB: dict[str, list[str]] = dict(adv_by_pat.get(pB, {}))
+
+            shared_ids = set(adv_pA) & set(adv_pB)
+            mated_pairs_p3: list[tuple[str, str]] = []
+            for ident in shared_ids:
+                for a in adv_pA[ident]:
+                    for b in adv_pB[ident]:
+                        mated_pairs_p3.append((a, b))
+
+            n_nm    = len(mated_pairs_p3)
+            pA_ids  = list(adv_pA.keys())
+            pB_ids  = list(adv_pB.keys())
+            nonmated_pairs_p3: list[tuple[str, str]] = []
+            attempts = 0
+            while len(nonmated_pairs_p3) < n_nm and attempts < n_nm * 20:
+                attempts += 1
+                if not pA_ids or not pB_ids:
+                    break
+                id_a = rng.choice(pA_ids)
+                id_b = rng.choice(pB_ids)
+                if id_a == id_b:
+                    continue
+                a = rng.choice(adv_pA[id_a])
+                b = rng.choice(adv_pB[id_b])
+                nonmated_pairs_p3.append((a, b))
+
+            m_scores  = scores_adv_adv_all_models(mated_pairs_p3,    adv_embs_all)
+            nm_scores = scores_adv_adv_all_models(nonmated_pairs_p3, adv_embs_all)
+
+            pattern_combo_scores[(pA, pB)] = (m_scores, nm_scores)
+            _draw_dist(ax, m_scores,  col_pA,   f"Mated P{pA}↔P{pB}", bins=30)
+            _draw_dist(ax, nm_scores, NM_COLOR, "Non-mated",           bins=30, linestyle="--")
+            _style_ax(ax, f"Pattern {pA} vs Pattern {pB}")
+            _draw_threshold_lines(ax, m_scores, nm_scores)
+
+        for idx in range(n_combos, nrows * ncols):
+            axes[idx // ncols][idx % ncols].set_visible(False)
+
+        _unify_ylim([axes[r][c] for r in range(nrows) for c in range(ncols)])
+        fig.tight_layout()
+        _save(fig, out_dir / "plot3_cross_pattern.png")
+        print("done")
+
+    # ── PLOT 4 ─────────────────────────────────────────────────────────────────
+    print("  Plot 4 …", end=" ")
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    COL_CTRL_ADV = PALETTE["mated"]
+    _draw_dist(ax, mated_scores,    COL_CTRL_ADV, "Mated ctrl↔adv (all)",     bins=BINS, fill=False)
+    _draw_dist(ax, nonmated_scores, COL_CTRL_ADV, "Non-mated ctrl↔adv (all)", bins=BINS, linestyle=":", fill=False)
+
+    if combos:
+        COMBO_COLORS_P4 = [
+            ("#e41a1c", "#377eb8"), ("#4daf4a", "#984ea3"),
+            ("#ff7f00", "#a65628"), ("#f781bf", "#999999"),
+            ("#e41a1c", "#4daf4a"), ("#377eb8", "#ff7f00"),
+            ("#984ea3", "#a65628"), ("#f781bf", "#e41a1c"),
+            ("#4daf4a", "#377eb8"), ("#ff7f00", "#984ea3"),
+        ]
+        for idx, (pA, pB) in enumerate(combos):
+            col_pA, _ = COMBO_COLORS_P4[idx % len(COMBO_COLORS_P4)]
+            m_sc, nm_sc = pattern_combo_scores.get((pA, pB), (np.array([]), np.array([])))
+            _draw_dist(ax, m_sc,  col_pA, f"Mated P{pA}↔P{pB}",     bins=30, fill=False)
+            _draw_dist(ax, nm_sc, col_pA, f"Non-mated P{pA}↔P{pB}", bins=30, linestyle=":", fill=False)
+
+    _style_ax(ax, f"{label}\nCombined: ctrl↔adv (Plot 1) + cross-pattern adv↔adv (Plot 3)")
+    _unify_ylim([ax])
+    fig.tight_layout()
+    _save(fig, out_dir / "plot4_combined.png")
+    print("done")
+
+    # ── BIOMETRIC STATS ────────────────────────────────────────────────────────
+    compute_biometric_stats(
+        model           = label,
+        out_dir         = out_dir,
+        mated_scores    = mated_scores,
+        nonmated_scores = nonmated_scores,
+        pattern_combos  = pattern_combo_scores,
+    )
+
+    return {
+        "model":                label,
+        "mated_scores":         mated_scores,
+        "nonmated_scores":      nonmated_scores,
+        "adv_frontal_scores":   (m_front, nm_front),
+        "adv_profile_scores":   (m_profil, nm_profil),
+        "pattern_combo_scores": pattern_combo_scores,
+        "combos":               combos if combos else [],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Biometric statistics (pyeer)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -807,8 +1157,12 @@ def plot_biometric_summary(models: list[str], out_root: Path) -> None:
     # ── collect data ──────────────────────────────────────────────────────────
     model_data: list[dict] = []   # one entry per model that has data
 
-    for model in models:
-        model_dir = out_root / model
+    # Include the all_models aggregated folder alongside per-model folders
+    all_model_entries = list(models) + [ALL_MODELS_LABEL]
+
+    for model in all_model_entries:
+        folder_name = "all_models" if model == ALL_MODELS_LABEL else model
+        model_dir = out_root / folder_name
         stats_path = model_dir / "biometric_stats.csv"
         if not stats_path.exists():
             continue
@@ -844,9 +1198,13 @@ def plot_biometric_summary(models: list[str], out_root: Path) -> None:
         return
 
     n_models = len(model_data)
+
+    # Total rows = one per model/aggregation + one cross-model comparison row
+    n_rows_total = n_models + 1
+
     fig, axes = plt.subplots(
-        n_models, 3,
-        figsize=(20, 4.5 * n_models),
+        n_rows_total, 3,
+        figsize=(20, 4.5 * n_rows_total),
         squeeze=False,
         gridspec_kw={"width_ratios": [3, 3, 4]},
     )
@@ -870,7 +1228,7 @@ def plot_biometric_summary(models: list[str], out_root: Path) -> None:
         bar_w     = 0.22
         offsets   = np.linspace(-(n_metrics - 1) / 2, (n_metrics - 1) / 2, n_metrics) * bar_w
 
-        metric_colors = {"EER": "#1f77b4", "FNMR@FMR100": "#ff7f0e", "FNMR@FMR1000": "#2ca02c"}
+        metric_colors  = {"EER": "#1f77b4", "FNMR@FMR100": "#ff7f0e", "FNMR@FMR1000": "#2ca02c"}
         metric_csv_key = {"EER": "EER", "FNMR@FMR100": "FNMR@FMR100", "FNMR@FMR1000": "FNMR@FMR1000"}
 
         for m_idx, metric in enumerate(METRICS):
@@ -980,7 +1338,7 @@ def plot_biometric_summary(models: list[str], out_root: Path) -> None:
         last_row = len(table_data)
         for r_idx in range(1, last_row + 1):
             if r_idx == last_row:
-                bg = "#d4e6f1"   # light blue highlight for aggregate row
+                bg = "#d4e6f1"
             else:
                 bg = "#f0f4f8" if r_idx % 2 == 0 else "white"
             for col_idx in range(len(TABLE_COLS)):
@@ -990,6 +1348,104 @@ def plot_biometric_summary(models: list[str], out_root: Path) -> None:
                     cell.set_text_props(fontweight="bold")
 
         ax_tbl.set_title(f"{model} — Accuracy Table", fontsize=9, fontweight="bold")
+
+    # ── Last row: cross-model comparison (raw EER / FNMR@FMR100 / FNMR@FMR1000) ──
+    # One subplot per metric, spanning the full row; each subplot shows one bar
+    # per model/aggregation (x-axis) grouped by experiment (hue).
+    # The three axes are merged by hiding the middle two and using only the
+    # first, or we draw three side-by-side charts in the three columns.
+    COMP_METRICS = [
+        ("EER",          "EER",          "#1f77b4"),
+        ("FNMR@FMR100",  "FNMR@FMR100",  "#ff7f0e"),
+        ("FNMR@FMR1000", "FNMR@FMR1000", "#2ca02c"),
+    ]
+
+    # Collect the union of experiment tags across all models (preserve order
+    # of first occurrence so columns are consistent).
+    seen_exps: list[str] = []
+    for mdata in model_data:
+        for r in mdata["rows"]:
+            tag = r["experiment"]
+            if tag not in seen_exps:
+                seen_exps.append(tag)
+
+    model_labels = [md["model"] for md in model_data]
+    n_model_entries = len(model_labels)
+    # Shorten long model names for the x-axis tick labels
+    short_labels = [
+        lbl if len(lbl) <= 22 else lbl[:20] + "…"
+        for lbl in model_labels
+    ]
+
+    # Colour per experiment (consistent with EXP_COLORS above)
+    exp_color_map = {
+        exp: EXP_COLORS[i % len(EXP_COLORS)]
+        for i, exp in enumerate(seen_exps)
+    }
+
+    comp_row = n_models   # index of the last (comparison) row
+
+    for col_idx, (csv_key, metric_label, _bar_color) in enumerate(COMP_METRICS):
+        ax = axes[comp_row][col_idx]
+
+        n_exps     = len(seen_exps)
+        bar_w      = 0.8 / max(n_exps, 1)
+        x          = np.arange(n_model_entries)
+        offsets    = np.linspace(
+            -(n_exps - 1) / 2,
+             (n_exps - 1) / 2,
+            n_exps,
+        ) * bar_w
+
+        for e_idx, exp in enumerate(seen_exps):
+            vals = []
+            for mdata in model_data:
+                # Find the row for this experiment in this model's CSV
+                val = None
+                for r in mdata["rows"]:
+                    if r["experiment"] == exp:
+                        try:
+                            val = float(r[csv_key])
+                        except (KeyError, ValueError):
+                            val = None
+                        break
+                vals.append(val if val is not None else float("nan"))
+
+            # Highlight the all_models bar with a hatched pattern
+            hatches = [
+                "//" if lbl == ALL_MODELS_LABEL else ""
+                for lbl in model_labels
+            ]
+            for xi, (v, hatch) in enumerate(zip(vals, hatches)):
+                ax.bar(
+                    xi + offsets[e_idx],
+                    v if not np.isnan(v) else 0,
+                    width=bar_w,
+                    label=exp.replace("_", " ") if xi == 0 else "_nolegend_",
+                    color=exp_color_map[exp],
+                    alpha=0.85,
+                    edgecolor="white",
+                    linewidth=0.5,
+                    hatch=hatch,
+                )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(short_labels, fontsize=7, rotation=25, ha="right")
+        ax.set_ylabel(metric_label, fontsize=8)
+        ax.set_ylim(bottom=0)
+        ax.set_title(
+            f"Cross-Model Comparison — {metric_label}\n"
+            f"(bars = experiments; hatched = All Models aggregation)",
+            fontsize=9, fontweight="bold",
+        )
+        ax.legend(
+            fontsize=7, loc="upper left",
+            bbox_to_anchor=(1.01, 1),
+            borderaxespad=0, framealpha=0.7,
+            title="Experiment", title_fontsize=7,
+        )
+        ax.grid(axis="y", lw=0.4, alpha=0.5)
+        ax.spines[["top", "right"]].set_visible(False)
 
     fig.tight_layout()
     out_path = out_root / "biometric_summary.png"
@@ -1139,13 +1595,21 @@ def main() -> None:
         if data is not None:
             model_data_list.append(data)
 
+    # ── All-models aggregated analysis ────────────────────────────────────────
+    print(f"\nGenerating all-models aggregated plots …")
+    all_models_data = generate_plots_for_all_models(models, con, out_root, rng)
+
     con.close()
 
     print("\nGenerating biometric summary figure …")
     plot_biometric_summary(models, out_root)
 
     print("\nGenerating combined overview figure …")
-    generate_combined_overview(model_data_list, out_root)
+    # Append all-models entry at the bottom of the overview grid
+    overview_list = model_data_list[:]
+    if all_models_data is not None:
+        overview_list.append(all_models_data)
+    generate_combined_overview(overview_list, out_root)
 
     print("\nAll done.")
 
