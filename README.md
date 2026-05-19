@@ -1,4 +1,4 @@
-# RMA Face Camouflage Competition
+# Face Camouflage Competition
 
 A desktop application for evaluating adversarial face camouflage attacks against multiple face recognition models. Participants attempt to fool recognition systems while being scored in real time.
 
