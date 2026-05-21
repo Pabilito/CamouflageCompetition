@@ -320,17 +320,19 @@ def _draw_dist(
     bins: int = BINS,
     linestyle: str = "-",
     fill: bool = True,
+    show_n: bool = True,
 ) -> None:
     """Draw a KDE line, optionally with a light fill underneath."""
     if len(scores) == 0:
         return
+    display_label = f"{label} (n={len(scores):,})" if show_n else label
     xs = np.linspace(X_MIN, X_MAX, 500)
     if HAS_KDE and len(scores) > 5:
         try:
             kde = gaussian_kde(scores, bw_method="scott")
             ys  = kde(xs)
             ax.plot(xs, ys, color=color, lw=LINE_WIDTH, alpha=ALPHA_LINE,
-                    linestyle=linestyle, label=f"{label} (n={len(scores):,})")
+                    linestyle=linestyle, label=display_label)
             if fill:
                 ax.fill_between(xs, ys, alpha=ALPHA_FILL, color=color)
             return
@@ -342,19 +344,23 @@ def _draw_dist(
         density=True, histtype="step",
         color=color, lw=LINE_WIDTH, alpha=ALPHA_LINE,
         linestyle=linestyle,
-        label=f"{label} (n={len(scores):,})",
+        label=display_label,
     )
 
 
-def _style_ax(ax: plt.Axes, title: str, xlabel: str = "Cosine Similarity") -> None:
+def _style_ax(ax: plt.Axes, title: str, xlabel: str = "Cosine Similarity",
+              legend_inside: bool = False) -> None:
     ax.set_title(title, fontsize=10, fontweight="bold", pad=6)
     ax.set_xlabel(xlabel, fontsize=9)
     ax.set_ylabel("Density", fontsize=9)
     ax.set_xlim(X_MIN, X_MAX)
     ax.set_ylim(bottom=0)
     ax.tick_params(labelsize=8)
-    ax.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.01, 1),
-              borderaxespad=0, framealpha=0.7)
+    if legend_inside:
+        ax.legend(fontsize=7, loc="upper right", framealpha=0.7)
+    else:
+        ax.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.01, 1),
+                  borderaxespad=0, framealpha=0.7)
     ax.grid(axis="y", lw=0.4, alpha=0.5)
     ax.spines[["top", "right"]].set_visible(False)
 
@@ -492,6 +498,14 @@ def generate_plots_for_model(
     _unify_ylim([ax])
     fig.tight_layout()
     _save(fig, out_dir / "plot1_mated_vs_nonmated.png")
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    _draw_dist(ax, mated_scores,    PALETTE["mated"],     "Mated",     show_n=False)
+    _draw_dist(ax, nonmated_scores, PALETTE["non_mated"], "Non-mated", linestyle=":", show_n=False)
+    _style_ax(ax, f"{model}\nMated vs Non-Mated Score Distributions", legend_inside=True)
+    _unify_ylim([ax])
+    fig.tight_layout()
+    _save(fig, out_dir / "plot1_mated_vs_nonmated_clean.png")
     print("done")
 
     # ── PLOT 2 ─────────────────────────────────────────────────────────────────
@@ -532,6 +546,16 @@ def generate_plots_for_model(
     _unify_ylim([ax])
     fig.tight_layout()
     _save(fig, out_dir / "plot2_pose_breakdown.png")
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    _draw_dist(ax, m_front,   COL_FRONTAL, "Mated – Frontal",     show_n=False)
+    _draw_dist(ax, nm_front,  COL_FRONTAL, "Non-mated – Frontal", linestyle=":", show_n=False)
+    _draw_dist(ax, m_profil,  COL_PROFILE, "Mated – Profile",     show_n=False)
+    _draw_dist(ax, nm_profil, COL_PROFILE, "Non-mated – Profile", linestyle=":", show_n=False)
+    _style_ax(ax, f"{model}\nPose-Stratified Score Distributions", legend_inside=True)
+    _unify_ylim([ax])
+    fig.tight_layout()
+    _save(fig, out_dir / "plot2_pose_breakdown_clean.png")
     print("done")
 
     # ── PLOT 3 ─────────────────────────────────────────────────────────────────
@@ -655,6 +679,29 @@ def generate_plots_for_model(
         _unify_ylim([axes[r][c] for r in range(nrows) for c in range(ncols)])
         fig.tight_layout()
         _save(fig, out_dir / "plot3_cross_pattern.png")
+
+        # ── Plot 3 clean variant ───────────────────────────────────────────────
+        fig_c, axes_c = plt.subplots(
+            nrows, ncols,
+            figsize=(5 * ncols, 4 * nrows),
+            squeeze=False,
+        )
+        fig_c.suptitle(
+            f"{model}\nCross-Pattern Score Distributions (adversarial pA vs adversarial pB)",
+            fontsize=11, fontweight="bold",
+        )
+        for idx, (pA, pB) in enumerate(combos):
+            col_pA, _ = COMBO_COLORS[idx % len(COMBO_COLORS)]
+            ax_c = axes_c[idx // ncols][idx % ncols]
+            m_sc, nm_sc = pattern_combo_scores.get((pA, pB), (np.array([]), np.array([])))
+            _draw_dist(ax_c, m_sc,  col_pA,   f"Mated P{pA}↔P{pB}", bins=30, show_n=False)
+            _draw_dist(ax_c, nm_sc, NM_COLOR, "Non-mated",           bins=30, linestyle="--", show_n=False)
+            _style_ax(ax_c, f"Pattern {pA} vs Pattern {pB}", legend_inside=True)
+        for idx in range(n_combos, nrows * ncols):
+            axes_c[idx // ncols][idx % ncols].set_visible(False)
+        _unify_ylim([axes_c[r][c] for r in range(nrows) for c in range(ncols)])
+        fig_c.tight_layout()
+        _save(fig_c, out_dir / "plot3_cross_pattern_clean.png")
         print("done")
 
     # ── PLOT 4 ─────────────────────────────────────────────────────────────────
@@ -730,7 +777,41 @@ def generate_plots_for_model(
     _unify_ylim([ax])
     fig.tight_layout()
     _save(fig, out_dir / "plot4_combined.png")
+
+    # ── Plot 4 clean variant ───────────────────────────────────────────────────
+    fig_c, ax_c = plt.subplots(figsize=(9, 5))
+    _draw_dist(ax_c, mated_scores,    COL_CTRL_ADV, "Mated ctrl↔adv (all)",     bins=BINS, fill=False, show_n=False)
+    _draw_dist(ax_c, nonmated_scores, COL_CTRL_ADV, "Non-mated ctrl↔adv (all)", bins=BINS, linestyle=":", fill=False, show_n=False)
+    if combos:
+        for idx, (pA, pB) in enumerate(combos):
+            col_p4, _ = COMBO_COLORS[idx % len(COMBO_COLORS)]
+            m_sc_p4, nm_sc_p4 = pattern_combo_scores.get((pA, pB), (np.array([]), np.array([])))
+            _draw_dist(ax_c, m_sc_p4,  col_p4, f"Mated P{pA}↔P{pB}",     bins=30, fill=False, show_n=False)
+            _draw_dist(ax_c, nm_sc_p4, col_p4, f"Non-mated P{pA}↔P{pB}", bins=30, linestyle=":", fill=False, show_n=False)
+    _style_ax(ax_c, f"{model}\nCombined: ctrl↔adv (Plot 1) + cross-pattern adv↔adv (Plot 3)",
+              legend_inside=True)
+    _unify_ylim([ax_c])
+    fig_c.tight_layout()
+    _save(fig_c, out_dir / "plot4_combined_clean.png")
     print("done")
+
+    # ── PER-PATTERN CLEAN PLOTS ────────────────────────────────────────────────
+    _generate_per_pattern_clean_plots(
+        pattern_ids_sorted = pattern_ids_sorted,
+        adv_by_pat         = adv_by_pat,
+        ctrl_by_id         = ctrl_by_id,
+        ctrl_emb           = ctrl_emb,
+        adv_emb            = adv_emb,
+        atk_meta           = atk_meta,
+        rng                = rng,
+        model_label        = model,
+        out_dir            = out_dir,
+        score_fn           = scores_from_pairs,
+        score_adv_fn       = lambda pairs, adv: np.array(
+            [cosine(adv[a], adv[b]) for a, b in pairs if a in adv and b in adv],
+            dtype=np.float32,
+        ),
+    )
 
     # ── BIOMETRIC STATS ────────────────────────────────────────────────────────
     compute_biometric_stats(
@@ -752,6 +833,178 @@ def generate_plots_for_model(
         "combos":              combos if combos else [],
     }
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-pattern clean plot helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _generate_per_pattern_clean_plots(
+    pattern_ids_sorted: list[int],
+    adv_by_pat:         dict,          # pid → {identity: [paths]}
+    ctrl_by_id:         dict,          # identity → [ctrl paths]
+    ctrl_emb:           dict,          # path → embedding  (single-model or averaged via wrapper)
+    adv_emb:            dict,          # path → embedding
+    atk_meta:           dict,          # adv path → meta dict
+    rng:                "random.Random",
+    model_label:        str,
+    out_dir:            "Path",
+    score_fn,          # callable(pairs, ctrl_emb, adv_emb) → np.ndarray
+    score_adv_fn,      # callable(pairs, adv_emb) → np.ndarray
+) -> None:
+    """
+    For each pattern in pattern_ids_sorted, produce clean variants of plots 1–4
+    restricted to adversarial images belonging to that pattern only.
+
+    Output filenames: plot{1-4}_*_pat{N}_clean.png  inside out_dir.
+    """
+    COL_FRONTAL = "#1f77b4"
+    COL_PROFILE = "#d62728"
+    COMBO_COLORS = [
+        ("#e41a1c", "#377eb8"), ("#4daf4a", "#984ea3"),
+        ("#ff7f00", "#a65628"), ("#f781bf", "#999999"),
+        ("#e41a1c", "#4daf4a"), ("#377eb8", "#ff7f00"),
+        ("#984ea3", "#a65628"), ("#f781bf", "#e41a1c"),
+        ("#4daf4a", "#377eb8"), ("#ff7f00", "#984ea3"),
+    ]
+    NM_COLOR    = "#555555"
+    COL_CTRL_ADV = PALETTE["mated"]
+
+    for pid in pattern_ids_sorted:
+        tag   = f"pat{pid}"
+        label = f"Pattern {pid}"
+        adv_by_id_pat: dict[str, list[str]] = dict(adv_by_pat.get(pid, {}))
+
+        if not adv_by_id_pat:
+            continue
+
+        print(f"  Per-pattern clean plots [{label}] …", end=" ")
+
+        # ── Plot 1 — mated vs non-mated ───────────────────────────────────────
+        mated_pairs    = build_mated_pairs(ctrl_by_id, adv_by_id_pat)
+        nonmated_pairs = build_nonmated_pairs(ctrl_by_id, adv_by_id_pat, len(mated_pairs), rng)
+        m_scores  = score_fn(mated_pairs,    ctrl_emb, adv_emb)
+        nm_scores = score_fn(nonmated_pairs, ctrl_emb, adv_emb)
+
+        fig, ax = plt.subplots(figsize=(7, 4))
+        _draw_dist(ax, m_scores,  PALETTE["mated"],     "Mated",     show_n=False)
+        _draw_dist(ax, nm_scores, PALETTE["non_mated"], "Non-mated", linestyle=":", show_n=False)
+        _style_ax(ax, f"{model_label} – {label}\nMated vs Non-Mated Score Distributions",
+                  legend_inside=True)
+        _unify_ylim([ax])
+        fig.tight_layout()
+        _save(fig, out_dir / f"plot1_mated_vs_nonmated_{tag}_clean.png")
+
+        # ── Plot 2 — pose breakdown ───────────────────────────────────────────
+        def _pat_pose_subset(flag: str) -> dict[str, list[str]]:
+            out: dict[str, list[str]] = defaultdict(list)
+            for path, paths_list in adv_by_id_pat.items():
+                ident = path  # adv_by_id_pat key IS the identity
+                for p in paths_list:
+                    if atk_meta.get(p, {}).get(flag, 0):
+                        out[ident].append(p)
+            return out
+
+        adv_frontal_pat = _pat_pose_subset("is_frontal")
+        adv_profile_pat = _pat_pose_subset("is_profile")
+
+        def _pose_scores(adv_subset):
+            mp  = build_mated_pairs(ctrl_by_id, adv_subset)
+            nmp = build_nonmated_pairs(ctrl_by_id, adv_subset, len(mp), rng)
+            return score_fn(mp, ctrl_emb, adv_emb), score_fn(nmp, ctrl_emb, adv_emb)
+
+        m_front,  nm_front  = _pose_scores(adv_frontal_pat)
+        m_profil, nm_profil = _pose_scores(adv_profile_pat)
+
+        fig, ax = plt.subplots(figsize=(8, 4))
+        _draw_dist(ax, m_front,   COL_FRONTAL, "Mated – Frontal",     show_n=False)
+        _draw_dist(ax, nm_front,  COL_FRONTAL, "Non-mated – Frontal", linestyle=":", show_n=False)
+        _draw_dist(ax, m_profil,  COL_PROFILE, "Mated – Profile",     show_n=False)
+        _draw_dist(ax, nm_profil, COL_PROFILE, "Non-mated – Profile", linestyle=":", show_n=False)
+        _style_ax(ax, f"{model_label} – {label}\nPose-Stratified Score Distributions",
+                  legend_inside=True)
+        _unify_ylim([ax])
+        fig.tight_layout()
+        _save(fig, out_dir / f"plot2_pose_breakdown_{tag}_clean.png")
+
+        # ── Plot 3 — cross-pattern (this pattern vs every other) ──────────────
+        other_pids = [p for p in pattern_ids_sorted if p != pid]
+        combos_pat = [(pid, p) for p in other_pids]
+
+        pat_combo_scores: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+
+        if combos_pat:
+            n_combos = len(combos_pat)
+            ncols    = min(3, n_combos)
+            nrows    = (n_combos + ncols - 1) // ncols
+            fig_c, axes_c = plt.subplots(
+                nrows, ncols,
+                figsize=(5 * ncols, 4 * nrows),
+                squeeze=False,
+            )
+            fig_c.suptitle(
+                f"{model_label} – {label}\nCross-Pattern Score Distributions",
+                fontsize=11, fontweight="bold",
+            )
+
+            for c_idx, (pA, pB) in enumerate(combos_pat):
+                col_pA, _ = COMBO_COLORS[c_idx % len(COMBO_COLORS)]
+                ax_c = axes_c[c_idx // ncols][c_idx % ncols]
+
+                adv_pA = dict(adv_by_pat.get(pA, {}))
+                adv_pB = dict(adv_by_pat.get(pB, {}))
+
+                shared_ids = set(adv_pA) & set(adv_pB)
+                mated_p: list[tuple[str, str]] = [
+                    (a, b)
+                    for ident in shared_ids
+                    for a in adv_pA[ident]
+                    for b in adv_pB[ident]
+                ]
+                pA_ids = list(adv_pA.keys())
+                pB_ids = list(adv_pB.keys())
+                nonmated_p: list[tuple[str, str]] = []
+                attempts = 0
+                while len(nonmated_p) < len(mated_p) and attempts < len(mated_p) * 20:
+                    attempts += 1
+                    if not pA_ids or not pB_ids:
+                        break
+                    id_a = rng.choice(pA_ids)
+                    id_b = rng.choice(pB_ids)
+                    if id_a == id_b:
+                        continue
+                    nonmated_p.append((rng.choice(adv_pA[id_a]), rng.choice(adv_pB[id_b])))
+
+                m_sc  = score_adv_fn(mated_p,    adv_emb)
+                nm_sc = score_adv_fn(nonmated_p, adv_emb)
+                pat_combo_scores[(pA, pB)] = (m_sc, nm_sc)
+
+                _draw_dist(ax_c, m_sc,  col_pA,   f"Mated P{pA}↔P{pB}", bins=30, show_n=False)
+                _draw_dist(ax_c, nm_sc, NM_COLOR, "Non-mated",           bins=30, linestyle="--", show_n=False)
+                _style_ax(ax_c, f"Pattern {pA} vs Pattern {pB}", legend_inside=True)
+
+            for idx in range(n_combos, nrows * ncols):
+                axes_c[idx // ncols][idx % ncols].set_visible(False)
+            _unify_ylim([axes_c[r][c] for r in range(nrows) for c in range(ncols)])
+            fig_c.tight_layout()
+            _save(fig_c, out_dir / f"plot3_cross_pattern_{tag}_clean.png")
+
+        # ── Plot 4 — combined ─────────────────────────────────────────────────
+        fig, ax = plt.subplots(figsize=(9, 5))
+        _draw_dist(ax, m_scores,  COL_CTRL_ADV, "Mated ctrl↔adv",     bins=BINS, fill=False, show_n=False)
+        _draw_dist(ax, nm_scores, COL_CTRL_ADV, "Non-mated ctrl↔adv", bins=BINS, linestyle=":", fill=False, show_n=False)
+        for c_idx, (pA, pB) in enumerate(combos_pat):
+            col_pA, _ = COMBO_COLORS[c_idx % len(COMBO_COLORS)]
+            m_sc, nm_sc = pat_combo_scores.get((pA, pB), (np.array([]), np.array([])))
+            _draw_dist(ax, m_sc,  col_pA, f"Mated P{pA}↔P{pB}",     bins=30, fill=False, show_n=False)
+            _draw_dist(ax, nm_sc, col_pA, f"Non-mated P{pA}↔P{pB}", bins=30, linestyle=":", fill=False, show_n=False)
+        _style_ax(ax, f"{model_label} – {label}\nCombined: ctrl↔adv + cross-pattern adv↔adv",
+                  legend_inside=True)
+        _unify_ylim([ax])
+        fig.tight_layout()
+        _save(fig, out_dir / f"plot4_combined_{tag}_clean.png")
+
+        print("done")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -831,6 +1084,14 @@ def generate_plots_for_all_models(
     _unify_ylim([ax])
     fig.tight_layout()
     _save(fig, out_dir / "plot1_mated_vs_nonmated.png")
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    _draw_dist(ax, mated_scores,    PALETTE["mated"],     "Mated",     show_n=False)
+    _draw_dist(ax, nonmated_scores, PALETTE["non_mated"], "Non-mated", linestyle=":", show_n=False)
+    _style_ax(ax, f"{label}\nMated vs Non-Mated Score Distributions", legend_inside=True)
+    _unify_ylim([ax])
+    fig.tight_layout()
+    _save(fig, out_dir / "plot1_mated_vs_nonmated_clean.png")
     print("done")
 
     # ── PLOT 2 ─────────────────────────────────────────────────────────────────
@@ -870,6 +1131,16 @@ def generate_plots_for_all_models(
     _unify_ylim([ax])
     fig.tight_layout()
     _save(fig, out_dir / "plot2_pose_breakdown.png")
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    _draw_dist(ax, m_front,   COL_FRONTAL, "Mated – Frontal",     show_n=False)
+    _draw_dist(ax, nm_front,  COL_FRONTAL, "Non-mated – Frontal", linestyle=":", show_n=False)
+    _draw_dist(ax, m_profil,  COL_PROFILE, "Mated – Profile",     show_n=False)
+    _draw_dist(ax, nm_profil, COL_PROFILE, "Non-mated – Profile", linestyle=":", show_n=False)
+    _style_ax(ax, f"{label}\nPose-Stratified Score Distributions", legend_inside=True)
+    _unify_ylim([ax])
+    fig.tight_layout()
+    _save(fig, out_dir / "plot2_pose_breakdown_clean.png")
     print("done")
 
     # ── PLOT 3 ─────────────────────────────────────────────────────────────────
@@ -969,6 +1240,29 @@ def generate_plots_for_all_models(
         _unify_ylim([axes[r][c] for r in range(nrows) for c in range(ncols)])
         fig.tight_layout()
         _save(fig, out_dir / "plot3_cross_pattern.png")
+
+        # ── Plot 3 clean variant ───────────────────────────────────────────────
+        fig_c, axes_c = plt.subplots(
+            nrows, ncols,
+            figsize=(5 * ncols, 4 * nrows),
+            squeeze=False,
+        )
+        fig_c.suptitle(
+            f"{label}\nCross-Pattern Score Distributions (adversarial pA vs adversarial pB)",
+            fontsize=11, fontweight="bold",
+        )
+        for idx, (pA, pB) in enumerate(combos):
+            col_pA, _ = COMBO_COLORS[idx % len(COMBO_COLORS)]
+            ax_c = axes_c[idx // ncols][idx % ncols]
+            m_sc, nm_sc = pattern_combo_scores.get((pA, pB), (np.array([]), np.array([])))
+            _draw_dist(ax_c, m_sc,  col_pA,   f"Mated P{pA}↔P{pB}", bins=30, show_n=False)
+            _draw_dist(ax_c, nm_sc, NM_COLOR, "Non-mated",           bins=30, linestyle="--", show_n=False)
+            _style_ax(ax_c, f"Pattern {pA} vs Pattern {pB}", legend_inside=True)
+        for idx in range(n_combos, nrows * ncols):
+            axes_c[idx // ncols][idx % ncols].set_visible(False)
+        _unify_ylim([axes_c[r][c] for r in range(nrows) for c in range(ncols)])
+        fig_c.tight_layout()
+        _save(fig_c, out_dir / "plot3_cross_pattern_clean.png")
         print("done")
 
     # ── PLOT 4 ─────────────────────────────────────────────────────────────────
@@ -997,7 +1291,38 @@ def generate_plots_for_all_models(
     _unify_ylim([ax])
     fig.tight_layout()
     _save(fig, out_dir / "plot4_combined.png")
+
+    # ── Plot 4 clean variant ───────────────────────────────────────────────────
+    fig_c, ax_c = plt.subplots(figsize=(9, 5))
+    _draw_dist(ax_c, mated_scores,    COL_CTRL_ADV, "Mated ctrl↔adv (all)",     bins=BINS, fill=False, show_n=False)
+    _draw_dist(ax_c, nonmated_scores, COL_CTRL_ADV, "Non-mated ctrl↔adv (all)", bins=BINS, linestyle=":", fill=False, show_n=False)
+    if combos:
+        for idx, (pA, pB) in enumerate(combos):
+            col_pA, _ = COMBO_COLORS_P4[idx % len(COMBO_COLORS_P4)]
+            m_sc, nm_sc = pattern_combo_scores.get((pA, pB), (np.array([]), np.array([])))
+            _draw_dist(ax_c, m_sc,  col_pA, f"Mated P{pA}↔P{pB}",     bins=30, fill=False, show_n=False)
+            _draw_dist(ax_c, nm_sc, col_pA, f"Non-mated P{pA}↔P{pB}", bins=30, linestyle=":", fill=False, show_n=False)
+    _style_ax(ax_c, f"{label}\nCombined: ctrl↔adv (Plot 1) + cross-pattern adv↔adv (Plot 3)",
+              legend_inside=True)
+    _unify_ylim([ax_c])
+    fig_c.tight_layout()
+    _save(fig_c, out_dir / "plot4_combined_clean.png")
     print("done")
+
+    # ── PER-PATTERN CLEAN PLOTS ────────────────────────────────────────────────
+    _generate_per_pattern_clean_plots(
+        pattern_ids_sorted = pattern_ids_sorted,
+        adv_by_pat         = adv_by_pat,
+        ctrl_by_id         = ctrl_by_id,
+        ctrl_emb           = ctrl_embs_all,   # passed through to score_fn lambda
+        adv_emb            = adv_embs_all,    # passed through to score_fn / score_adv_fn
+        atk_meta           = atk_meta,
+        rng                = rng,
+        model_label        = label,
+        out_dir            = out_dir,
+        score_fn           = lambda pairs, ctrl, adv: scores_from_pairs_all_models(pairs, ctrl, adv),
+        score_adv_fn       = lambda pairs, adv: scores_adv_adv_all_models(pairs, adv),
+    )
 
     # ── BIOMETRIC STATS ────────────────────────────────────────────────────────
     compute_biometric_stats(

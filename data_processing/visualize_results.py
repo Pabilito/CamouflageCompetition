@@ -533,6 +533,113 @@ def plot_cross_pattern_table(rows: list[dict], out_path: Path) -> None:
         col_group_seps=[all_col_idx],
         row_label_header="Pair",
     )
+def _load_pattern_pose_accuracy(rows: list[dict]) -> tuple[list, list, np.ndarray, list]:
+    """
+    Returns (row_labels, col_labels, values_2d, annots_2d).
+    Rows = Pattern × Pose  (group_by="pattern_pose", group_value="<pat>/<pose>").
+    Cols = individual models + "Average".
+    """
+    # Collect all joint group_values present
+    joint_rows = [r for r in rows if r["group_by"] == "pattern_pose"]
+    if not joint_rows:
+        return [], [], np.empty((0, 0)), []
+
+    # Parse and sort row keys
+    keys_seen: list[tuple[str, str]] = []
+    for r in joint_rows:
+        if r["model"] == "ALL_MODELS":
+            continue
+        parts = r["group_value"].split("/", 1)
+        if len(parts) == 2:
+            key = (parts[0], parts[1])
+            if key not in keys_seen:
+                keys_seen.append(key)
+
+    def _pat_sort(k):
+        try:
+            return (0, int(k[0]), k[1])
+        except ValueError:
+            return (1, k[0], k[1])
+
+    # Keep poses in canonical order within each pattern
+    pose_order = ["frontal", "profile", "pitch"]
+    sorted_keys: list[tuple[str, str]] = []
+    patterns = sorted(set(p for p, _ in keys_seen), key=lambda p: (0, int(p)) if p.isdigit() else (1, p))
+    for pat in patterns:
+        poses_for_pat = [po for _, po in keys_seen if _ == pat]
+        ordered_poses = [po for po in pose_order if po in poses_for_pat] + \
+                        [po for po in poses_for_pat if po not in pose_order]
+        for pose in ordered_poses:
+            sorted_keys.append((pat, pose))
+
+    # Build display labels; dashed separator at each new pattern
+    row_labels: list[str] = []
+    sep_before_rows: list[int] = []
+    prev_pat = None
+    for i, (pat, pose) in enumerate(sorted_keys):
+        if pat != prev_pat and i > 0:
+            sep_before_rows.append(i)
+        pat_display = f"pat:{pat}" if pat != "unclassified" else "unclassified"
+        row_labels.append(f"{pat_display} / {pose}")
+        prev_pat = pat
+
+    # Column order: individual models + "Average"
+    model_order_present = [m for m in MODEL_ORDER if any(r["model"] == m for r in joint_rows)]
+    col_labels = [MODEL_SHORT.get(m, m) for m in model_order_present] + ["Average"]
+    avg_col = len(model_order_present)
+
+    n_r = len(sorted_keys)
+    n_c = len(col_labels)
+    values = np.full((n_r, n_c), np.nan)
+    annots: list[list[str]] = [[""] * n_c for _ in range(n_r)]
+
+    ri_map = {k: i for i, k in enumerate(sorted_keys)}
+    mi_map = {m: i for i, m in enumerate(model_order_present)}
+
+    for r in joint_rows:
+        if not r.get("accuracy"):
+            continue
+        parts = r["group_value"].split("/", 1)
+        if len(parts) != 2:
+            continue
+        key = (parts[0], parts[1])
+        ri = ri_map.get(key)
+        if ri is None:
+            continue
+        acc = float(r["accuracy"])
+        ann = f"{acc:.3f}"
+        if r["model"] == "ALL_MODELS":
+            values[ri, avg_col] = acc
+            annots[ri][avg_col] = ann
+        else:
+            ci = mi_map.get(r["model"])
+            if ci is not None:
+                values[ri, ci] = acc
+                annots[ri][ci] = ann
+
+    return row_labels, col_labels, values, annots, sep_before_rows
+
+
+def plot_pattern_pose_accuracy_table(rows: list[dict], out_path: Path) -> None:
+    result = _load_pattern_pose_accuracy(rows)
+    if not result[0]:
+        print("  [WARN] No pattern_pose rows in model_accuracy.csv — skipping.", file=sys.stderr)
+        return
+    row_labels, col_labels, values, annots, sep_before_rows = result
+    avg_col = len(col_labels) - 1
+    _plain_table(
+        title="Accuracy per Pattern × Pose",
+        row_labels=row_labels,
+        col_labels=col_labels,
+        values=values,
+        annots=annots,
+        out_path=out_path,
+        sep_before_rows=sep_before_rows,
+        col_group_seps=[avg_col],
+        row_label_header="Pattern / Pose",
+    )
+
+
 def _add_col_separators(ax: plt.Axes, col_labels: list[str], n_rows: int) -> None:
     """Add faint vertical lines between pose/pattern/overall groups."""
     current_prefix = None
@@ -760,6 +867,9 @@ def main() -> None:
             acc_rows, out_dir / "fig_overall_accuracy_heatmap.png")
         plot_overall_accuracy_table(
             acc_rows, out_dir / "fig_overall_accuracy_table.png")
+        print("\n[1b] Accuracy per pattern × pose")
+        plot_pattern_pose_accuracy_table(
+            acc_rows, out_dir / "fig_pattern_pose_accuracy_table.png")
     else:
         print("[1] model_accuracy.csv not found — skipping")
 

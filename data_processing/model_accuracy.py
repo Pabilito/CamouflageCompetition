@@ -66,12 +66,17 @@ def _compute_accuracy(rows: list[dict]) -> list[dict]:
         else:
             buckets[model]["pattern"]["unclassified"].append(score)
 
+        # joint pattern × pose breakdown
+        pat_key = str(pid) if pid and pid > 0 else "unclassified"
+        joint_key = f"{pat_key}/{pose_label(r)}"
+        buckets[model]["pattern_pose"][joint_key].append(score)
+
     results: list[dict] = []
     for model in MODEL_ORDER:
         if model not in buckets:
             continue
         thr = threshold_for(model)
-        for group_by in ("overall", "pose", "pattern"):
+        for group_by in ("overall", "pose", "pattern", "pattern_pose"):
             items = buckets[model][group_by]
             for group_value in sorted(items.keys()):
                 scores = np.array(items[group_value])
@@ -103,7 +108,7 @@ def _compute_accuracy(rows: list[dict]) -> list[dict]:
         if model not in buckets:
             continue
         thr = threshold_for(model)
-        for group_by in ("overall", "pose", "pattern"):
+        for group_by in ("overall", "pose", "pattern", "pattern_pose"):
             for group_value, scores_list in buckets[model][group_by].items():
                 existing_scores, existing_rec = combined[group_by][group_value]
                 existing_scores.extend(scores_list)
@@ -112,7 +117,7 @@ def _compute_accuracy(rows: list[dict]) -> list[dict]:
                     existing_scores, existing_rec + recognised
                 )
 
-    for group_by in ("overall", "pose", "pattern"):
+    for group_by in ("overall", "pose", "pattern", "pattern_pose"):
         for group_value in sorted(combined[group_by].keys()):
             scores_list, recognised = combined[group_by][group_value]
             if not scores_list:

@@ -1,7 +1,9 @@
 /Ignore/*
 data_processing/Comp1
 data_processing/results
+data_processing/avg_similarity_by_identity.py
 *.sqlite
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
