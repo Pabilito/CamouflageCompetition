@@ -183,7 +183,10 @@ def plot_overall_accuracy_heatmap(rows: list[dict], out_path: Path) -> None:
     plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white")
 
     ax.set_title("Overall Accuracy per Model", color="white", **FONT_TITLE, pad=12)
-    fig.tight_layout()
+    fig.text(0.5, 0.965,
+             "mated only (TPR) — adversarial vs claimed identity at fixed LFW threshold",
+             ha="center", va="top", fontsize=8.5, style="italic", color="#cccccc")
+    fig.tight_layout(rect=(0, 0, 1, 0.955))
     fig.savefig(out_path, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -233,6 +236,7 @@ def plot_overall_accuracy_table(rows: list[dict], out_path: Path) -> None:
     all_idx = len(model_labels) - 1  # All Models is last row
     _plain_table(
         title="Overall Accuracy per Model",
+        subtitle="mated only (TPR) — adversarial vs claimed identity at fixed LFW threshold",
         row_labels=model_labels,
         col_labels=[group_label_map[g] for g in group_order],
         values=values,
@@ -504,7 +508,10 @@ def plot_cross_pattern_heatmap(rows: list[dict], out_path: Path) -> None:
 
     ax.set_title("Cross-Pattern Accuracy per Model (per-model thresholds)",
                  color="white", **FONT_TITLE, pad=12)
-    fig.tight_layout()
+    fig.text(0.5, 0.965,
+             "mated only (TPR) — same-identity adv-pA × adv-pB pairs at fixed LFW threshold",
+             ha="center", va="top", fontsize=8.5, style="italic", color="#cccccc")
+    fig.tight_layout(rect=(0, 0, 1, 0.955))
     fig.savefig(out_path, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -523,6 +530,7 @@ def plot_cross_pattern_table(rows: list[dict], out_path: Path) -> None:
     all_col_idx = len(model_labels) - 1  # All Models is last column
     _plain_table(
         title="Cross-Pattern Accuracy per Model",
+        subtitle="mated only (TPR) — same-identity adv-pA × adv-pB pairs at fixed LFW threshold",
         row_labels=pair_labels,
         col_labels=model_labels,
         values=values,
@@ -684,6 +692,7 @@ def _plain_table(title: str,
                  bold_rows: "list[int] | None" = None,
                  col_group_seps: "list[int] | None" = None,
                  row_label_header: str = "",
+                 subtitle: str = "",
                  fmt: str = ".3f") -> None:
     """
     Render a clean dark-background table with no cell colours.
@@ -693,6 +702,7 @@ def _plain_table(title: str,
     sep_before_rows  : row indices before which a horizontal rule is drawn
     bold_rows        : row indices whose label is rendered bold + amber
     col_group_seps   : column indices before which a vertical rule is drawn
+    subtitle         : optional grey italic line drawn just below the title
     fmt              : number format when annots entry is empty (fallback)
     """
     import numpy as np
@@ -715,7 +725,8 @@ def _plain_table(title: str,
     ROW_LBL_W = max(1.8, max(len(l) for l in row_labels) * 0.11 + 0.3)
     HDR_H_IN  = 0.55          # header row height
     ROW_H_IN  = 0.38          # data row height
-    TOP_PAD   = 0.35          # title only
+    SUB_H_IN  = 0.28 if subtitle else 0.0   # extra vertical space for subtitle
+    TOP_PAD   = 0.35 + SUB_H_IN          # title + (optional) subtitle
     BOT_PAD   = 0.15
 
     fig_w = ROW_LBL_W + n_cols * COL_W_IN + 0.3
@@ -746,6 +757,10 @@ def _plain_table(title: str,
     ax.text(fig_w / 2, fig_h - 0.12, title,
             ha="center", va="top", fontsize=12, fontweight="bold",
             color=FG, transform=ax.transData)
+    if subtitle:
+        ax.text(fig_w / 2, fig_h - 0.12 - 0.22, subtitle,
+                ha="center", va="top", fontsize=8.5, style="italic",
+                color=MUTED, transform=ax.transData)
 
     # ── header background ─────────────────────────────────────────────────────
     from matplotlib.patches import FancyBboxPatch as FBP

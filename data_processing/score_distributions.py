@@ -1701,13 +1701,15 @@ def generate_accuracy_threshold_tables(
         out_path: Path,
         row_data_override=None, # if given, used instead of all_row_data
         legend_lines=None,      # list of (colour, bold_label, description) or None
+        subtitle: str = "",     # optional grey italic caption above the table
     ) -> None:
         _row_data = row_data_override if row_data_override is not None else all_row_data
         _n_data   = sum(1 for d in _row_data if d is not None)
         _n_sep    = sum(1 for d in _row_data if d is None)
         LEG_H     = 0.30 * len(legend_lines) + 0.15 if legend_lines else 0.0
+        SUB_H     = 0.36 if subtitle else 0.0
         fig_w = COL_W_LABEL + COL_W_DATA * n_cols + 0.15
-        fig_h = HDR_H + ROW_H * _n_data + (ROW_H * 0.35) * _n_sep + 0.15 + LEG_H
+        fig_h = HDR_H + ROW_H * _n_data + (ROW_H * 0.35) * _n_sep + 0.15 + LEG_H + SUB_H
         fig = plt.figure(figsize=(fig_w, fig_h), facecolor=C_BG)
         ax  = fig.add_axes([0, 0, 1, 1])
         ax.set_facecolor(C_BG)
@@ -1717,7 +1719,14 @@ def generate_accuracy_threshold_tables(
 
         total_w = COL_W_LABEL + COL_W_DATA * n_cols
         left    = (fig_w - total_w) / 2
-        top     = fig_h - 0.075
+        top     = fig_h - 0.075 - SUB_H
+
+        if subtitle:
+            ax.text(
+                fig_w / 2, fig_h - 0.18, subtitle,
+                ha="center", va="top", color="#cccccc",
+                fontsize=8.5, style="italic",
+            )
 
         col_xs = [left] + [left + COL_W_LABEL + COL_W_DATA * i for i in range(n_cols)]
         col_ws = [COL_W_LABEL] + [COL_W_DATA] * n_cols
@@ -1876,6 +1885,7 @@ def generate_accuracy_threshold_tables(
     _render_dark_table(
         cell_value_fn = lambda c: "—" if np.isnan(c[1]) else f"{c[1]:.3f}",
         out_path      = out_root / "fig_accuracy_threshold_accuracy.png",
+        subtitle      = "mated + non-mated (balanced accuracy) — threshold re-optimised per row",
     )
     print("done")
 
