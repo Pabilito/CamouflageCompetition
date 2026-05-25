@@ -244,7 +244,281 @@ def _compute_per_model_records(con, attack_rows: list[dict]) -> list[dict]:
     return records
 
 
+def _compute_cross_pattern_records(con) -> list[dict]:
+    """
+    Compute gallery positions for cross-pattern adversarial search.
+    Mirrors _load_pattern_groups from cross_pattern_similarity.py:
+    groups are built from attacks directly; embeddings looked up separately.
+
+    For every ordered pair (query_pid, gallery_pid):
+      Query   = adversarial image of pattern query_pid for identity X
+      Gallery = adversarial images of pattern gallery_pid, one per identity
+      Position = 1-based rank of X in that gallery (descending cosine sim)
+    Only identities with images of BOTH patterns are included.
+    """
+    print("  Loading pattern groups for cross-pattern gallery search...")
+
+    # Step 1: build {identity: {pattern_id: [image_path,...]}} from attacks only
+    try:
+        atk_rows = con.execute(
+            "SELECT DISTINCT identity_name, image_path, pattern_id "
+            "FROM attacks "
+            "WHERE identity_name IS NOT NULL AND identity_name != \'\' "
+            "  AND pattern_id > 0"
+        ).fetchall()
+    except Exception as exc:
+        print(f"  [WARN] cross-pattern attacks query failed: {exc}")
+        return []
+
+    pattern_groups = defaultdict(lambda: defaultdict(list))
+    seen = set()
+    for r in atk_rows:
+        key = (r["identity_name"], r["image_path"], r["pattern_id"])
+        if key not in seen:
+            seen.add(key)
+            pattern_groups[r["identity_name"]][r["pattern_id"]].append(r["image_path"])
+
+    multi_pat_ids = {
+        ident for ident, pats in pattern_groups.items() if len(pats) >= 2
+    }
+    if not multi_pat_ids:
+        print("  [WARN] No identities with >= 2 patterns — cross-pattern gallery search skipped.")
+        return []
+
+    all_pids = sorted({pid for pats in pattern_groups.values() for pid in pats})
+    print(f"  Identities with >= 2 patterns: {len(multi_pat_ids)}  |  Patterns: {all_pids}")
+
+    # Step 2: load embeddings keyed by image_path -> model -> emb
+    try:
+        emb_rows = con.execute(
+            "SELECT DISTINCT e.image_path, e.model_name, e.embedding "
+            "FROM embeddings e "
+            "INNER JOIN attacks a ON a.image_path = e.image_path "
+            "WHERE a.pattern_id > 0"
+        ).fetchall()
+    except Exception as exc:
+        print(f"  [WARN] cross-pattern embeddings query failed: {exc}")
+        return []
+
+    adv = {}
+    for r in emb_rows:
+        emb = np.frombuffer(r["embedding"], dtype=np.float32).copy()
+        adv.setdefault(r["image_path"], {})[r["model_name"]] = emb
+
+    # Step 3: pose metadata
+    try:
+        pose_rows = con.execute(
+            "SELECT DISTINCT image_path, is_frontal, is_profile, is_pitch "
+            "FROM attacks WHERE pattern_id > 0"
+        ).fetchall()
+    except Exception:
+        pose_rows = []
+    pose_meta = {r["image_path"]: pose_label(dict(r)) for r in pose_rows}
+
+    models = [m for m in MODEL_ORDER if any(m in adv.get(p, {}) for p in adv)]
+    if not models:
+        print("  [WARN] No model embeddings found for cross-pattern search.")
+        return []
+
+    records = []
+
+    for query_pid in all_pids:
+        # Gallery: ALL identities that have at least one image of gallery_pid,
+        # independent of the query pattern.  This makes gallery size constant
+        # across query directions for the same gallery pattern (e.g. P1 as
+        # gallery is always 51 ids whether queried by P2 or P3).
+        for gallery_pid in all_pids:
+            if query_pid == gallery_pid:
+                continue
+
+            gallery_identities = sorted(
+                ident for ident, pats in pattern_groups.items()
+                if gallery_pid in pats
+            )
+            if not gallery_identities:
+                continue
+
+            # Queries: identities that have a query_pid image AND are present
+            # in the gallery (otherwise they're unrankable, so skip).
+            gallery_id_set = set(gallery_identities)
+            query_identities = sorted(
+                ident for ident, pats in pattern_groups.items()
+                if query_pid in pats and ident in gallery_id_set
+            )
+            if not query_identities:
+                continue
+
+            print(f"    Cross-pattern P{query_pid}->P{gallery_pid}: "
+                  f"gallery={len(gallery_identities)} ids, "
+                  f"queries={len(query_identities)} ids ...", end=" ")
+
+            # Build gallery: {identity: {model: [emb,...]}} for gallery_pid,
+            # over ALL gallery_identities (not just query-shared ones).
+            gallery = {}
+            for gid in gallery_identities:
+                for path in pattern_groups[gid].get(gallery_pid, []):
+                    for model, emb in adv.get(path, {}).items():
+                        gallery.setdefault(gid, {}).setdefault(model, []).append(emb)
+
+            gallery_ids = sorted(gallery.keys())
+
+            for true_id in query_identities:
+                query_paths = pattern_groups[true_id].get(query_pid, [])
+
+                # Per-model records
+                for model in models:
+                    for q_path in query_paths:
+                        query = adv.get(q_path, {}).get(model)
+                        if query is None:
+                            continue
+                        qnorm = np.linalg.norm(query)
+                        if qnorm < 1e-10:
+                            continue
+                        id_scores = []
+                        for gid in gallery_ids:
+                            embs = gallery.get(gid, {}).get(model, [])
+                            if not embs:
+                                continue
+                            best = max(
+                                float(np.dot(query, e) / (qnorm * np.linalg.norm(e) + 1e-10))
+                                for e in embs
+                            )
+                            id_scores.append((gid, best))
+                        if not id_scores:
+                            continue
+                        id_scores.sort(key=lambda x: x[1], reverse=True)
+                        ranked = [x[0] for x in id_scores]
+                        position = (ranked.index(true_id) + 1) if true_id in ranked else len(ranked) + 1
+                        records.append({
+                            "image_path":        q_path,
+                            "model":             model,
+                            "identity":          true_id,
+                            "position":          position,
+                            "gallery_total":     len(id_scores),
+                            "pose":              pose_meta.get(q_path, "unknown"),
+                            "pattern_id":        query_pid,
+                            "cross_query_pid":   query_pid,
+                            "cross_gallery_pid": gallery_pid,
+                        })
+
+                # Avg-sim record
+                q_path_for_avg = next((p for p in query_paths if adv.get(p)), None)
+                if q_path_for_avg:
+                    model_embs = adv[q_path_for_avg]
+                    id_scores_avg = {}
+                    for gid in gallery_ids:
+                        for model, query in model_embs.items():
+                            embs = gallery.get(gid, {}).get(model, [])
+                            if not embs:
+                                continue
+                            qnorm = np.linalg.norm(query)
+                            if qnorm < 1e-10:
+                                continue
+                            best = max(
+                                float(np.dot(query, e) / (qnorm * np.linalg.norm(e) + 1e-10))
+                                for e in embs
+                            )
+                            id_scores_avg.setdefault(gid, []).append(best)
+                    if id_scores_avg:
+                        avg_sc = [(gid, sum(s)/len(s)) for gid, s in id_scores_avg.items()]
+                        avg_sc.sort(key=lambda x: x[1], reverse=True)
+                        ranked_avg = [x[0] for x in avg_sc]
+                        pos_avg = (ranked_avg.index(true_id) + 1) if true_id in ranked_avg else len(ranked_avg) + 1
+                        records.append({
+                            "image_path":        q_path_for_avg,
+                            "model":             "ALL_SIM_AVG",
+                            "identity":          true_id,
+                            "position":          pos_avg,
+                            "gallery_total":     len(avg_sc),
+                            "pose":              pose_meta.get(q_path_for_avg, "unknown"),
+                            "pattern_id":        query_pid,
+                            "cross_query_pid":   query_pid,
+                            "cross_gallery_pid": gallery_pid,
+                        })
+
+            print("done")
+
+    print(f"  Cross-pattern records: {len(records)}")
+    return records
+
+
 def _compute_metrics(records: list[dict]) -> tuple[list[dict], list[str]]:
+    """
+    Compute gallery-search metrics for every (model, group_by, group_value).
+    Also appends an ALL_MODELS aggregate row for each group.
+
+    Returns (result_rows, models_present).
+    """
+    models_present = [m for m in MODEL_ORDER
+                      if any(r["model"] == m for r in records)]
+    if not models_present:  # fallback: "all" pseudo-model
+        models_present = list(dict.fromkeys(
+            r["model"] for r in records))
+
+    # ── bucket: model → group_by → group_value → [positions]
+    buckets: dict[str, dict[str, dict[str, list[int]]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(list))
+    )
+    for r in records:
+        m   = r["model"]
+        pos = r["position"]
+        buckets[m]["overall"]["all"].append(pos)
+        buckets[m]["pose"][r["pose"]].append(pos)
+        pid = r["pattern_id"]
+        buckets[m]["pattern"][str(pid) if pid > 0 else "unclassified"].append(pos)
+
+    results: list[dict] = []
+
+    def _row(model: str, model_short: str, group_by: str,
+             group_value: str, positions: list[int]) -> dict:
+        arr = np.array(positions, dtype=float)
+        n   = len(arr)
+        # Rank-N accuracy: fraction where position >= N (attack fooled >= N-1 ids)
+        rank_n = {f"rank{k}_acc": float(np.mean(arr <= k)) if n else np.nan
+                  for k in RANK_N_VALUES}
+        # Attack success: position > 1 (model did NOT immediately recognise)
+        asr = float(np.mean(arr > 1)) if n else np.nan
+        # Mean Reciprocal Rank: mean(1/position); lower = better for attacker
+        mrr = float(np.mean(1.0 / arr)) if n else np.nan
+        row = {
+            "model":        model,
+            "model_short":  model_short,
+            "group_by":     group_by,
+            "group_value":  group_value,
+            "n_images":     n,
+            "mean_pos":     float(np.mean(arr))   if n else np.nan,
+            "std_pos":      float(np.std(arr))    if n else np.nan,
+            "median_pos":   float(np.median(arr)) if n else np.nan,
+            "min_pos":      float(np.min(arr))    if n else np.nan,
+            "max_pos":      float(np.max(arr))    if n else np.nan,
+            "attack_success_rate": asr,
+            "mrr":                 mrr,
+        }
+        row.update(rank_n)
+        return row
+
+    # Per-model rows
+    for model in models_present:
+        short = MODEL_SHORT.get(model, model)
+        for group_by in ("overall", "pose", "pattern"):
+            for group_value, positions in sorted(buckets[model][group_by].items()):
+                results.append(_row(model, short, group_by, group_value, positions))
+
+    # ALL_MODELS aggregate: pool positions across models
+    all_buckets: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+    for model in models_present:
+        for group_by in ("overall", "pose", "pattern"):
+            for group_value, positions in buckets[model][group_by].items():
+                all_buckets[group_by][group_value].extend(positions)
+
+    for group_by in ("overall", "pose", "pattern"):
+        for group_value, positions in sorted(all_buckets[group_by].items()):
+            results.append(_row("ALL_MODELS", "All Models",
+                                group_by, group_value, positions))
+
+    return results, models_present
+
+
     """
     Compute gallery-search metrics for every (model, group_by, group_value).
     Also appends an ALL_MODELS aggregate row for each group.
@@ -1311,6 +1585,7 @@ def _build_pattern_row_specs(
     models_present: list[str],
     all_pids: list[int],
     has_avg_sim: bool,
+    cross_pattern_records: list[dict] | None = None,
 ) -> list[tuple[str, int, dict]]:
     """
     Build the shared row_specs list used by both pattern table functions.
@@ -1319,8 +1594,15 @@ def _build_pattern_row_specs(
     metric_map maps model_short -> _position_stats_row dict.
 
     Section 1: one row per pattern pid  ("P1", "P2", ...)
-    Section 2: two rows per combo (pA < pB), query direction first
-               ("P{A} query  (P{A}+P{B})", "P{B} query  (P{A}+P{B})")
+               Query = adversarial image of that pattern
+               Gallery = control images (standard)
+
+    Section 2: two rows per ordered combo (pA, pB) with pA < pB
+               "P{B} query \u2192 P{A} gallery" — query=pB adv, gallery=pA adv
+               "P{A} query \u2192 P{B} gallery" — query=pA adv, gallery=pB adv
+               Positions come from cross_pattern_records (no control gallery
+               involved).  If cross_pattern_records is empty, Section 2 is
+               skipped entirely.
     """
     row_specs: list[tuple[str, int, dict]] = []
 
@@ -1331,7 +1613,7 @@ def _build_pattern_row_specs(
                 metric_map[ms] = _position_stats_row("", ms, label, positions)
         row_specs.append((label, section, metric_map))
 
-    # Section 1: per-pattern
+    # Section 1: per-pattern (ctrl gallery, unchanged)
     for pid in all_pids:
         pat_recs = [r for r in records if r.get("pattern_id", 0) == pid]
         by_model: dict[str, list[int]] = {}
@@ -1345,28 +1627,36 @@ def _build_pattern_row_specs(
             ]
         _add_row(f"P{pid}", 1, by_model)
 
-    # Section 2: cross-pattern pairs
+    # Section 2: cross-pattern adv-vs-adv pairs.
+    # Query and gallery are BOTH adversarial images (no control involved).
+    # Requires cross_pattern_records; no fallback.
+    if not cross_pattern_records:
+        print("  [WARN] No cross-pattern records available "
+              "\u2014 Section 2 (adv-vs-adv) skipped. "
+              "Table will show Section 1 (control gallery) rows only.")
+        return row_specs
+
     combos = [(pA, pB) for i, pA in enumerate(all_pids) for pB in all_pids[i + 1:]]
     for pA, pB in combos:
-        ids_pA = {r["identity"] for r in records if r.get("pattern_id", 0) == pA}
-        ids_pB = {r["identity"] for r in records if r.get("pattern_id", 0) == pB}
-        shared_ids = ids_pA & ids_pB
-        if not shared_ids:
-            continue
-        for query_pid in (pA, pB):
-            label    = f"P{query_pid} query  (P{pA}\u21d4P{pB})"
-            pat_recs = [r for r in records
-                        if r.get("pattern_id", 0) == query_pid
-                        and r["identity"] in shared_ids]
-            by_model = {}
+        # Two directions per combo:
+        #   query=pB, gallery=pA   ->  "P{B} query -> P{A} gallery"
+        #   query=pA, gallery=pB   ->  "P{A} query -> P{B} gallery"
+        for query_pid, gallery_pid in [(pB, pA), (pA, pB)]:
+            label = f"P{query_pid} query \u2192 P{gallery_pid} gallery"
+            cp_recs = [
+                r for r in cross_pattern_records
+                if r.get("cross_query_pid")   == query_pid
+                and r.get("cross_gallery_pid") == gallery_pid
+            ]
+            by_model: dict[str, list[int]] = {}
             for m in models_present:
                 short = MODEL_SHORT.get(m, m)
-                by_model[short] = [r["position"] for r in pat_recs if r["model"] == m]
+                by_model[short] = [r["position"] for r in cp_recs
+                                   if r["model"] == m]
             if has_avg_sim:
                 by_model["All (avg sim)"] = [
-                    r["position"] for r in (avg_sim_records or [])
-                    if r.get("pattern_id", 0) == query_pid
-                    and r["identity"] in shared_ids
+                    r["position"] for r in cp_recs
+                    if r["model"] == "ALL_SIM_AVG"
                 ]
             _add_row(label, 2, by_model)
 
@@ -1452,6 +1742,7 @@ def plot_pattern_positions_table(
     records: list[dict],
     avg_sim_records: list[dict] | None,
     out_path: Path,
+    cross_pattern_records: list[dict] | None = None,
 ) -> None:
     """
     Complement to fig_gs_positions_table.png.
@@ -1481,7 +1772,8 @@ def plot_pattern_positions_table(
     n_model_cols = len(model_col_labels)
 
     row_specs = _build_pattern_row_specs(
-        records, avg_sim_records, models_present, all_pids, has_avg_sim)
+        records, avg_sim_records, models_present, all_pids, has_avg_sim,
+        cross_pattern_records=cross_pattern_records)
     if not row_specs:
         print("  [WARN] No rows to render -- skipping pattern positions table.")
         return
@@ -1573,6 +1865,7 @@ def plot_pattern_metric_tables(
     records: list[dict],
     avg_sim_records: list[dict] | None,
     out_dir: Path,
+    cross_pattern_records: list[dict] | None = None,
 ) -> None:
     """
     One PNG per metric (6 total):
@@ -1606,7 +1899,8 @@ def plot_pattern_metric_tables(
     has_avg_sim = avg_sim_records is not None and len(avg_sim_records) > 0
 
     row_specs = _build_pattern_row_specs(
-        records, avg_sim_records, models_present, all_pids, has_avg_sim)
+        records, avg_sim_records, models_present, all_pids, has_avg_sim,
+        cross_pattern_records=cross_pattern_records)
     if not row_specs:
         print("  [WARN] No rows -- skipping per-metric pattern tables.")
         return
@@ -1867,6 +2161,11 @@ def main() -> None:
     else:
         print("  [WARN] avg-sim positions unavailable — 'All (avg sim)' row will be omitted.")
 
+    # Cross-pattern records depend on the DB connection (embeddings + attacks),
+    # so compute them BEFORE closing it.
+    print("\nComputing cross-pattern adversarial gallery positions...")
+    cross_pattern_records = _compute_cross_pattern_records(con)
+
     con.close()
 
     if not records:
@@ -1902,17 +2201,20 @@ def main() -> None:
                          avg_sim_results=avg_sim_records)
 
     print("\n[3] Per-pattern & cross-pattern position summary")
+
     plot_pattern_positions_table(
-        records         = records,
-        avg_sim_records = avg_sim_records,
-        out_path        = out_dir / "fig_gs_pattern_positions_table.png",
+        records               = records,
+        avg_sim_records       = avg_sim_records,
+        out_path              = out_dir / "fig_gs_pattern_positions_table.png",
+        cross_pattern_records = cross_pattern_records,
     )
 
     print("\n[4] Per-metric pattern tables (one file per metric)")
     plot_pattern_metric_tables(
-        records         = records,
-        avg_sim_records = avg_sim_records,
-        out_dir         = out_dir,
+        records               = records,
+        avg_sim_records       = avg_sim_records,
+        out_dir               = out_dir,
+        cross_pattern_records = cross_pattern_records,
     )
 
     print(f"\n{'=' * 60}")

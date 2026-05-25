@@ -45,6 +45,12 @@ from pathlib import Path
 from collections import defaultdict
 from typing import Sequence
 
+try:
+    from config import MODEL_THRESHOLDS, DEFAULT_THRESHOLD
+except ImportError:
+    MODEL_THRESHOLDS: dict[str, float] = {}
+    DEFAULT_THRESHOLD: float = 0.25
+
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -296,11 +302,87 @@ def build_nonmated_pairs(
     return pairs
 
 
+def build_ctrl_mated_pairs(
+    ctrl_by_id: dict[str, list[str]],
+) -> list[tuple[str, str]]:
+    """
+    All ordered control × control pairs for the SAME identity,
+    excluding identical-image self-pairs (path_a != path_b).
+    Used for the "no pattern / ctrl↔ctrl" baseline row.
+    """
+    pairs: list[tuple[str, str]] = []
+    for paths in ctrl_by_id.values():
+        for i, a in enumerate(paths):
+            for b in paths[i + 1:]:   # upper triangle only, no self-pairs
+                pairs.append((a, b))
+    return pairs
+
+
+def build_ctrl_nonmated_pairs(
+    ctrl_by_id: dict[str, list[str]],
+    n:          int,
+    rng:        random.Random,
+) -> list[tuple[str, str]]:
+    """
+    *n* random control × control pairs where identities DIFFER.
+    Mirrors the sampling logic of build_nonmated_pairs.
+    """
+    ids = list(ctrl_by_id.keys())
+    pairs: list[tuple[str, str]] = []
+    attempts = 0
+    while len(pairs) < n and attempts < n * 20:
+        attempts += 1
+        id_a = rng.choice(ids)
+        id_b = rng.choice(ids)
+        if id_a == id_b:
+            continue
+        pairs.append((
+            rng.choice(ctrl_by_id[id_a]),
+            rng.choice(ctrl_by_id[id_b]),
+        ))
+    return pairs
+
+
+def scores_ctrl_ctrl(
+    pairs:    list[tuple[str, str]],
+    ctrl_emb: dict[str, np.ndarray],
+) -> np.ndarray:
+    """Cosine similarity for ctrl×ctrl pairs (both paths in ctrl_emb)."""
+    return np.array(
+        [cosine(ctrl_emb[a], ctrl_emb[b])
+         for a, b in pairs if a in ctrl_emb and b in ctrl_emb],
+        dtype=np.float32,
+    )
+
+
+def scores_ctrl_ctrl_all_models(
+    pairs:         list[tuple[str, str]],
+    ctrl_embs_all: dict[str, dict[str, np.ndarray]],
+) -> np.ndarray:
+    """Averaged-across-models cosine similarity for ctrl×ctrl pairs."""
+    out = []
+    for a, b in pairs:
+        vals = [cosine(ctrl_embs_all[m][a], ctrl_embs_all[m][b])
+                for m in ctrl_embs_all
+                if a in ctrl_embs_all[m] and b in ctrl_embs_all[m]]
+        if vals:
+            out.append(float(np.mean(vals)))
+    return np.array(out, dtype=np.float32)
+
+
 def scores_from_pairs(
     pairs:      list[tuple[str, str]],
     ctrl_emb:   dict[str, np.ndarray],
     adv_emb:    dict[str, np.ndarray],
 ) -> np.ndarray:
+    scores = []
+    for c, a in pairs:
+        if c in ctrl_emb and a in adv_emb:
+            scores.append(cosine(ctrl_emb[c], adv_emb[a]))
+    return np.array(scores, dtype=np.float32)
+
+
+
     scores = []
     for c, a in pairs:
         if c in ctrl_emb and a in adv_emb:
@@ -425,8 +507,18 @@ def _draw_threshold_lines(
         pass
 
 
+# ── Regen flag (set by main() from --regen argument) ─────────────────────────
+# When False (default), _save() skips files that already exist on disk.
+# Pass --regen on the CLI to overwrite everything.
+_REGEN: bool = False
+
+
 def _save(fig: plt.Figure, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if not _REGEN and path.exists():
+        print(f"  Skipped (exists) → {path}")
+        plt.close(fig)
+        return
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved → {path}")
@@ -481,6 +573,12 @@ def generate_plots_for_model(
         ident = meta.get("identity_name", "")
         if ident:
             adv_by_id[ident].append(path)
+
+    # ── CTRL-CTRL BASELINE (no pattern) ───────────────────────────────────────
+    cc_mated_pairs     = build_ctrl_mated_pairs(ctrl_by_id)
+    cc_nonmated_pairs  = build_ctrl_nonmated_pairs(ctrl_by_id, len(cc_mated_pairs), rng)
+    cc_mated_scores    = scores_ctrl_ctrl(cc_mated_pairs,    ctrl_emb)
+    cc_nonmated_scores = scores_ctrl_ctrl(cc_nonmated_pairs, ctrl_emb)
 
     # ── PLOT 1 ─────────────────────────────────────────────────────────────────
     print("  Plot 1 …", end=" ")
@@ -832,6 +930,7 @@ def generate_plots_for_model(
         "pattern_combo_scores": pattern_combo_scores,
         "combos":              combos if combos else [],
         "per_pattern_data":    per_pattern_data,
+        "ctrl_ctrl_scores":    (cc_mated_scores, cc_nonmated_scores),
     }
 
 
@@ -1097,6 +1196,12 @@ def generate_plots_for_all_models(
         ident = meta.get("identity_name", "")
         if ident:
             adv_by_id[ident].append(path)
+
+    # ── CTRL-CTRL BASELINE (no pattern) ───────────────────────────────────────
+    cc_mated_pairs     = build_ctrl_mated_pairs(ctrl_by_id)
+    cc_nonmated_pairs  = build_ctrl_nonmated_pairs(ctrl_by_id, len(cc_mated_pairs), rng)
+    cc_mated_scores    = scores_ctrl_ctrl_all_models(cc_mated_pairs,    ctrl_embs_all)
+    cc_nonmated_scores = scores_ctrl_ctrl_all_models(cc_nonmated_pairs, ctrl_embs_all)
 
     # ── PLOT 1 ─────────────────────────────────────────────────────────────────
     print("  Plot 1 …", end=" ")
@@ -1372,6 +1477,7 @@ def generate_plots_for_all_models(
         "pattern_combo_scores": pattern_combo_scores,
         "combos":               combos if combos else [],
         "per_pattern_data":     per_pattern_data,
+        "ctrl_ctrl_scores":     (cc_mated_scores, cc_nonmated_scores),
     }
 
 
@@ -1413,6 +1519,29 @@ def _optimal_threshold_accuracy(
             best_th  = float(t)
 
     return best_th, best_acc
+
+
+def _fixed_threshold_accuracy(
+    mated: np.ndarray,
+    nonmated: np.ndarray,
+    threshold: float,
+) -> tuple[float, float, float]:
+    """
+    Evaluate balanced accuracy at a fixed (pre-defined) threshold.
+
+    Returns (balanced_accuracy, TPR, TNR) where:
+        TPR = P(mated    >= threshold)   — model still recognises the person
+        TNR = P(nonmated  < threshold)   — model correctly rejects impostor
+        balanced_accuracy = 0.5 * (TPR + TNR)
+
+    Falls back to (nan, nan, nan) when either array is empty.
+    """
+    if len(mated) == 0 or len(nonmated) == 0:
+        nan = float("nan")
+        return nan, nan, nan
+    tpr = float((mated    >= threshold).mean())
+    tnr = float((nonmated  < threshold).mean())
+    return 0.5 * (tpr + tnr), tpr, tnr
 
 
 def generate_accuracy_threshold_tables(
@@ -1465,6 +1594,14 @@ def generate_accuracy_threshold_tables(
     ]
     n_cols = len(col_labels)   # one per model/avg entry — no extra average
 
+    # ── Column → model threshold lookup ─────────────────────────────────────
+    # col_labels[i] is the display label; md["model"] is the raw name.
+    # Build a parallel list of thresholds, one per column.
+    col_thresholds: list[float] = []
+    for md in overview_list:
+        raw = md["model"]
+        col_thresholds.append(MODEL_THRESHOLDS.get(raw, DEFAULT_THRESHOLD))
+
     # ── Collect row data ──────────────────────────────────────────────────────
     all_pids: list[int] = sorted({
         pid
@@ -1477,50 +1614,81 @@ def generate_accuracy_threshold_tables(
         for combo in md.get("pattern_combo_scores", {}).keys()
     })
 
+    # ── Section 0: ctrl-ctrl baseline (no pattern) ───────────────────────────
+    row_cc:       list[tuple[float, float]]          = []
+    row_cc_fixed: list[tuple[float, float, float]]   = []
+    for i, md in enumerate(overview_list):
+        cc_m, cc_nm = md.get("ctrl_ctrl_scores", (np.array([]), np.array([])))
+        row_cc.append(_optimal_threshold_accuracy(cc_m, cc_nm))
+        row_cc_fixed.append(_fixed_threshold_accuracy(cc_m, cc_nm, col_thresholds[i]))
+
     # Section 1 rows
     sec1_labels: list[str] = ["All patterns"] + [f"P{pid}" for pid in all_pids]
-    sec1_data:   list[list[tuple[float, float]]] = []
+    sec1_data:      list[list[tuple[float, float]]]             = []
+    sec1_data_fixed: list[list[tuple[float, float, float]]]     = []
 
-    row_all: list[tuple[float, float]] = []
-    for md in overview_list:
+    row_all:       list[tuple[float, float]]          = []
+    row_all_fixed: list[tuple[float, float, float]]   = []
+    for i, md in enumerate(overview_list):
         m  = md.get("mated_scores",    np.array([]))
         nm = md.get("nonmated_scores", np.array([]))
         row_all.append(_optimal_threshold_accuracy(m, nm))
+        row_all_fixed.append(_fixed_threshold_accuracy(m, nm, col_thresholds[i]))
     sec1_data.append(row_all)
+    sec1_data_fixed.append(row_all_fixed)
 
     for pid in all_pids:
-        row_pid: list[tuple[float, float]] = []
-        for md in overview_list:
+        row_pid:       list[tuple[float, float]]          = []
+        row_pid_fixed: list[tuple[float, float, float]]   = []
+        for i, md in enumerate(overview_list):
             ppd = md.get("per_pattern_data", {}).get(pid, {})
             m   = ppd.get("mated_scores",   np.array([]))
             nm  = ppd.get("nonmated_scores", np.array([]))
             row_pid.append(_optimal_threshold_accuracy(m, nm))
+            row_pid_fixed.append(_fixed_threshold_accuracy(m, nm, col_thresholds[i]))
         sec1_data.append(row_pid)
+        sec1_data_fixed.append(row_pid_fixed)
 
     # Section 2 rows
     sec2_labels: list[str] = [f"P{pA}↔P{pB}" for pA, pB in all_combos]
-    sec2_data:   list[list[tuple[float, float]]] = []
+    sec2_data:       list[list[tuple[float, float]]]           = []
+    sec2_data_fixed: list[list[tuple[float, float, float]]]    = []
 
     for (pA, pB) in all_combos:
-        row_combo: list[tuple[float, float]] = []
-        for md in overview_list:
+        row_combo:       list[tuple[float, float]]          = []
+        row_combo_fixed: list[tuple[float, float, float]]   = []
+        for i, md in enumerate(overview_list):
             m_sc, nm_sc = md.get("pattern_combo_scores", {}).get(
                 (pA, pB), (np.array([]), np.array([]))
             )
             row_combo.append(_optimal_threshold_accuracy(m_sc, nm_sc))
+            row_combo_fixed.append(_fixed_threshold_accuracy(m_sc, nm_sc, col_thresholds[i]))
         sec2_data.append(row_combo)
+        sec2_data_fixed.append(row_combo_fixed)
 
-    # Combined row sequence with a separator marker between sections
+    # Combined row sequence:
+    #   [ctrl-ctrl baseline] | sep | [All patterns, P1, P2, …] | sep | [P1↔P2, …]
     SEP = "__sep__"
     all_row_labels = (
-        sec1_labels
+        ["No pattern\n(ctrl↔ctrl)"]
+        + [SEP]
+        + sec1_labels
         + ([SEP] if sec2_labels else [])
         + sec2_labels
     )
     all_row_data = (
-        sec1_data
-        + ([None] if sec2_labels else [])   # None marks separator row
+        [row_cc]
+        + [None]
+        + sec1_data
+        + ([None] if sec2_labels else [])
         + sec2_data
+    )
+    all_row_data_fixed = (
+        [row_cc_fixed]
+        + [None]
+        + sec1_data_fixed
+        + ([None] if sec2_labels else [])
+        + sec2_data_fixed
     )
 
     n_data_rows = sum(1 for d in all_row_data if d is not None)
@@ -1529,11 +1697,17 @@ def generate_accuracy_threshold_tables(
 
     # ── Generic dark-style renderer ───────────────────────────────────────────
     def _render_dark_table(
-        cell_value_fn,   # callable(th, acc) → str
+        cell_value_fn,          # callable(cell_tuple) → str
         out_path: Path,
+        row_data_override=None, # if given, used instead of all_row_data
+        legend_lines=None,      # list of (colour, bold_label, description) or None
     ) -> None:
+        _row_data = row_data_override if row_data_override is not None else all_row_data
+        _n_data   = sum(1 for d in _row_data if d is not None)
+        _n_sep    = sum(1 for d in _row_data if d is None)
+        LEG_H     = 0.30 * len(legend_lines) + 0.15 if legend_lines else 0.0
         fig_w = COL_W_LABEL + COL_W_DATA * n_cols + 0.15
-        fig_h = HDR_H + ROW_H * n_data_rows + (ROW_H * 0.35) * n_sep_rows + 0.15
+        fig_h = HDR_H + ROW_H * _n_data + (ROW_H * 0.35) * _n_sep + 0.15 + LEG_H
         fig = plt.figure(figsize=(fig_w, fig_h), facecolor=C_BG)
         ax  = fig.add_axes([0, 0, 1, 1])
         ax.set_facecolor(C_BG)
@@ -1543,20 +1717,18 @@ def generate_accuracy_threshold_tables(
 
         total_w = COL_W_LABEL + COL_W_DATA * n_cols
         left    = (fig_w - total_w) / 2
-        top     = fig_h - 0.075   # small top margin
+        top     = fig_h - 0.075
 
-        # Column x-positions (left edge of each column)
         col_xs = [left] + [left + COL_W_LABEL + COL_W_DATA * i for i in range(n_cols)]
         col_ws = [COL_W_LABEL] + [COL_W_DATA] * n_cols
 
         # ── Header row ────────────────────────────────────────────────────────
         y_hdr = top - HDR_H
         for ci, (cx, cw) in enumerate(zip(col_xs, col_ws)):
-            bg = C_HEADER_BG
             ax.add_patch(mpatches.FancyBboxPatch(
                 (cx, y_hdr), cw, HDR_H,
                 boxstyle="square,pad=0", linewidth=0,
-                facecolor=bg, clip_on=False,
+                facecolor=C_HEADER_BG, clip_on=False,
             ))
             if ci == 0:
                 label = "Row"
@@ -1570,15 +1742,14 @@ def generate_accuracy_threshold_tables(
                 fontsize=9, fontweight="bold",
             )
 
-        # Thin bottom border under header
         ax.plot([left, left + total_w], [y_hdr, y_hdr],
                 color=C_SEP_LINE, lw=0.8)
 
         # ── Data rows ─────────────────────────────────────────────────────────
         y_cursor = y_hdr
-        data_row_idx = 0   # counts only real (non-separator) rows
+        data_row_idx = 0
 
-        for ri, (row_label, row_data) in enumerate(zip(all_row_labels, all_row_data)):
+        for ri, (row_label, row_data) in enumerate(zip(all_row_labels, _row_data)):
 
             # Separator row
             if row_data is None:
@@ -1617,7 +1788,7 @@ def generate_accuracy_threshold_tables(
             )
 
             # Data cells
-            for ci, (th, acc) in enumerate(row_data):
+            for ci, cell in enumerate(row_data):
                 cx, cw = col_xs[ci + 1], col_ws[ci + 1]
                 is_avg = col_labels[ci] == "Avg (sim)"
                 cell_bg = C_AVG_BG if is_avg else row_bg
@@ -1626,7 +1797,7 @@ def generate_accuracy_threshold_tables(
                     boxstyle="square,pad=0", linewidth=0,
                     facecolor=cell_bg, clip_on=False,
                 ))
-                txt = cell_value_fn(th, acc)
+                txt = cell_value_fn(cell)
                 fg  = C_AVG_FG if is_avg else C_TEXT
                 ax.text(
                     cx + cw / 2, y_cursor + row_h / 2, txt,
@@ -1659,15 +1830,51 @@ def generate_accuracy_threshold_tables(
             color=C_SEP_LINE, lw=1.2, linestyle="--",
         )
 
+        # ── Legend (optional, below outer border) ─────────────────────────────
+        if legend_lines:
+            C_LEG_BG = "#0d1b2a"
+            leg_top  = y_cursor - 0.08
+            leg_h    = 0.30 * len(legend_lines) + 0.10
+            # legend background panel
+            ax.add_patch(mpatches.FancyBboxPatch(
+                (left, leg_top - leg_h), total_w, leg_h,
+                boxstyle="square,pad=0", linewidth=0.8,
+                facecolor=C_LEG_BG, edgecolor=C_SEP_LINE, clip_on=False,
+            ))
+            for li, (colour, bold_part, desc_part) in enumerate(legend_lines):
+                ly = leg_top - 0.12 - li * 0.30
+                # colour swatch
+                ax.add_patch(mpatches.FancyBboxPatch(
+                    (left + 0.12, ly - 0.08), 0.22, 0.16,
+                    boxstyle="round,pad=0.01", linewidth=0,
+                    facecolor=colour, clip_on=False,
+                ))
+                # bold label
+                ax.text(
+                    left + 0.42, ly, bold_part,
+                    ha="left", va="center", color=C_TEXT,
+                    fontsize=8, fontweight="bold",
+                )
+                # description
+                ax.text(
+                    left + 0.42 + len(bold_part) * 0.072, ly, f"  {desc_part}",
+                    ha="left", va="center", color="#aaaaaa",
+                    fontsize=8,
+                )
+
+        if not _REGEN and out_path.exists():
+            print(f"  Skipped (exists) → {out_path}")
+            plt.close(fig)
+            return
         fig.savefig(out_path, dpi=150, bbox_inches="tight",
                     facecolor=C_BG, edgecolor="none")
         plt.close(fig)
         print(f"  Saved → {out_path}")
 
-    # ── Render accuracy table ─────────────────────────────────────────────────
+    # ── Render accuracy table (optimal threshold) ─────────────────────────────
     print("  Building accuracy table …", end=" ")
     _render_dark_table(
-        cell_value_fn = lambda th, acc: "—" if np.isnan(acc) else f"{acc:.3f}",
+        cell_value_fn = lambda c: "—" if np.isnan(c[1]) else f"{c[1]:.3f}",
         out_path      = out_root / "fig_accuracy_threshold_accuracy.png",
     )
     print("done")
@@ -1675,9 +1882,33 @@ def generate_accuracy_threshold_tables(
     # ── Render threshold table ────────────────────────────────────────────────
     print("  Building threshold table …", end=" ")
     _render_dark_table(
-        cell_value_fn = lambda th, acc: "—" if np.isnan(th) else f"{th:.3f}",
+        cell_value_fn = lambda c: "—" if np.isnan(c[0]) else f"{c[0]:.3f}",
         out_path      = out_root / "fig_accuracy_threshold_thresholds.png",
     )
+    print("done")
+
+    # ── Render fixed-threshold accuracy table ─────────────────────────────────
+    # Cells show "acc  (TPR / TNR)" using each model's hardcoded LFW threshold.
+    # Temporarily widen data columns to fit the three-value cell.
+    print("  Building fixed-threshold accuracy table …", end=" ")
+    _orig_col_w = COL_W_DATA
+    COL_W_DATA = 1.90   # wider to fit "0.XXX (0.XXX/0.XXX)"
+    def _fixed_cell(c):
+        acc, tpr, tnr = c
+        if np.isnan(acc):
+            return "—"
+        return f"{acc:.3f}  ({tpr:.3f}/{tnr:.3f})"
+    _render_dark_table(
+        cell_value_fn     = _fixed_cell,
+        out_path          = out_root / "fig_accuracy_fixed_threshold.png",
+        row_data_override = all_row_data_fixed,
+        legend_lines      = [
+            ("#4dd9e8", "acc",  "balanced accuracy = 0.5 × (TPR + TNR)"),
+            ("#57cc6e", "TPR",  "true positive rate — mated pairs scored ≥ threshold  (model recognises the person)"),
+            ("#e07040", "TNR",  "true negative rate — non-mated pairs scored < threshold  (model correctly rejects impostor)"),
+        ],
+    )
+    COL_W_DATA = _orig_col_w
     print("done")
 
 
@@ -2389,13 +2620,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate similarity score distribution plots per model."
     )
-    parser.add_argument("--db",      default="db.sqlite",
+    parser.add_argument("--db",   default="db.sqlite",
                         help="Path to the SQLite database (default: db.sqlite)")
-    parser.add_argument("--out", default="data_processing/results",
+    parser.add_argument("--out",  default="data_processing/results",
                         help="Root output directory (default: data_processing/results)")
-    parser.add_argument("--seed",    type=int, default=RANDOM_SEED,
+    parser.add_argument("--seed", type=int, default=RANDOM_SEED,
                         help="Random seed for non-mated sampling")
+    parser.add_argument("--regen", action="store_true", default=False,
+                        help="Overwrite existing output files (default: skip files "
+                             "that already exist on disk)")
     args = parser.parse_args()
+
+    global _REGEN
+    _REGEN = args.regen
+    if _REGEN:
+        print("--regen: all existing output files will be overwritten.")
+    else:
+        print("Incremental mode: existing output files will be skipped "
+              "(pass --regen to overwrite).")
 
     db_path  = args.db
     out_root = Path(args.out)
