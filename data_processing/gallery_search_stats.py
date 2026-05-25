@@ -1277,6 +1277,493 @@ def _save(fig, out_path: Path) -> None:
 #  stdout summary (mirrors the console-output style of the other scripts)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _filter_records_by_pattern(records: list[dict], pids: set) -> list[dict]:
+    """Return only records whose pattern_id is in *pids*."""
+    return [r for r in records if r.get("pattern_id", 0) in pids]
+
+
+def _position_stats_row(
+    model: str,
+    model_short: str,
+    group_label: str,
+    positions: list[int],
+) -> dict:
+    """Build a single metric dict from a list of gallery positions."""
+    arr = np.array(positions, dtype=float)
+    n   = len(arr)
+    return {
+        "model":       model,
+        "model_short": model_short,
+        "group_label": group_label,
+        "n":           n,
+        "mean_pos":    float(np.mean(arr))   if n else np.nan,
+        "median_pos":  float(np.median(arr)) if n else np.nan,
+        "mrr":         float(np.mean(1.0 / np.maximum(arr, 1))) if n else np.nan,
+        "rank1_acc":   float(np.mean(arr <= 1))  if n else np.nan,
+        "rank5_acc":   float(np.mean(arr <= 5))  if n else np.nan,
+        "rank10_acc":  float(np.mean(arr <= 10)) if n else np.nan,
+    }
+
+
+def _build_pattern_row_specs(
+    records: list[dict],
+    avg_sim_records: list[dict] | None,
+    models_present: list[str],
+    all_pids: list[int],
+    has_avg_sim: bool,
+) -> list[tuple[str, int, dict]]:
+    """
+    Build the shared row_specs list used by both pattern table functions.
+
+    Returns a list of (row_label, section_id, metric_map) where
+    metric_map maps model_short -> _position_stats_row dict.
+
+    Section 1: one row per pattern pid  ("P1", "P2", ...)
+    Section 2: two rows per combo (pA < pB), query direction first
+               ("P{A} query  (P{A}+P{B})", "P{B} query  (P{A}+P{B})")
+    """
+    row_specs: list[tuple[str, int, dict]] = []
+
+    def _add_row(label: str, section: int, by_model: dict) -> None:
+        metric_map: dict[str, dict] = {}
+        for ms, positions in by_model.items():
+            if positions:
+                metric_map[ms] = _position_stats_row("", ms, label, positions)
+        row_specs.append((label, section, metric_map))
+
+    # Section 1: per-pattern
+    for pid in all_pids:
+        pat_recs = [r for r in records if r.get("pattern_id", 0) == pid]
+        by_model: dict[str, list[int]] = {}
+        for m in models_present:
+            short = MODEL_SHORT.get(m, m)
+            by_model[short] = [r["position"] for r in pat_recs if r["model"] == m]
+        if has_avg_sim:
+            by_model["All (avg sim)"] = [
+                r["position"] for r in (avg_sim_records or [])
+                if r.get("pattern_id", 0) == pid
+            ]
+        _add_row(f"P{pid}", 1, by_model)
+
+    # Section 2: cross-pattern pairs
+    combos = [(pA, pB) for i, pA in enumerate(all_pids) for pB in all_pids[i + 1:]]
+    for pA, pB in combos:
+        ids_pA = {r["identity"] for r in records if r.get("pattern_id", 0) == pA}
+        ids_pB = {r["identity"] for r in records if r.get("pattern_id", 0) == pB}
+        shared_ids = ids_pA & ids_pB
+        if not shared_ids:
+            continue
+        for query_pid in (pA, pB):
+            label    = f"P{query_pid} query  (P{pA}\u21d4P{pB})"
+            pat_recs = [r for r in records
+                        if r.get("pattern_id", 0) == query_pid
+                        and r["identity"] in shared_ids]
+            by_model = {}
+            for m in models_present:
+                short = MODEL_SHORT.get(m, m)
+                by_model[short] = [r["position"] for r in pat_recs if r["model"] == m]
+            if has_avg_sim:
+                by_model["All (avg sim)"] = [
+                    r["position"] for r in (avg_sim_records or [])
+                    if r.get("pattern_id", 0) == query_pid
+                    and r["identity"] in shared_ids
+                ]
+            _add_row(label, 2, by_model)
+
+    return row_specs
+
+
+def _make_sep_idx(sections: list[int]) -> list[int]:
+    return [i for i in range(1, len(sections)) if sections[i] != sections[i - 1]]
+
+
+def _draw_pattern_rows(ax, row_specs, sep_idx, sections, col_keys,
+                       LBL_W_IN, COL_W_IN, HDR_H_IN, ROW_H_IN,
+                       TOP_PAD, BOT_PAD, SEP_H_IN, sub_h, sub_w,
+                       col_lbl, caption=""):
+    """
+    Draw alternating rows, section separators and caption into *ax*.
+    Returns y_cursor after the last data row.
+    """
+    from matplotlib.patches import FancyBboxPatch as FBP
+    _FG     = "white"
+    _MUTED  = "#888888"
+    _AMBER  = "#ffdd88"
+    _RULE   = "#444444"
+    _ALT_BG = "#14161f"
+    _CYAN   = "#00d4ff"
+    is_avg = col_lbl == "All (avg sim)"
+
+    rule_y = sub_h - TOP_PAD - HDR_H_IN
+    y_cursor = rule_y
+    data_row_idx = 0
+    all_row_labels = [spec[0] for spec in row_specs]
+    n_cols = len(col_keys)
+
+    for i, row_lbl in enumerate(all_row_labels):
+        if i in sep_idx:
+            y_cursor -= SEP_H_IN
+            ax.plot([0, sub_w], [y_cursor + SEP_H_IN, y_cursor + SEP_H_IN],
+                    color="#555555", lw=0.6, ls="--", zorder=3)
+            ax.plot([0, sub_w], [y_cursor, y_cursor],
+                    color="#555555", lw=0.6, ls="--", zorder=3)
+
+        yc = y_cursor - ROW_H_IN / 2
+        y_cursor -= ROW_H_IN
+
+        if data_row_idx % 2 == 1:
+            ax.add_patch(FBP((0, y_cursor), sub_w, ROW_H_IN,
+                             boxstyle="square,pad=0", linewidth=0,
+                             facecolor=_ALT_BG, zorder=0))
+        data_row_idx += 1
+
+        lbl_color = _CYAN if sections[i] == 1 else _FG
+        ax.text(0.08, yc, row_lbl, ha="left", va="center", fontsize=7.5,
+                color=lbl_color, fontweight="bold" if sections[i] == 1 else "normal",
+                transform=ax.transData, zorder=2)
+
+        _, _, metric_map = row_specs[i]
+        st = metric_map.get(col_lbl)
+        for j, key in enumerate(col_keys):
+            cx  = LBL_W_IN + (j + 0.5) * COL_W_IN
+            v   = st.get(key, float("nan")) if st else float("nan")
+            if v is None or (isinstance(v, float) and v != v):
+                txt = "\u2014"
+            elif key in ("mean_pos", "median_pos"):
+                txt = f"{v:.2f}"
+            else:
+                txt = f"{v:.3f}"
+            ax.text(cx, yc, txt, ha="center", va="center", fontsize=7.5,
+                    color=_AMBER if is_avg else _FG,
+                    transform=ax.transData, zorder=2)
+
+    # bottom rule
+    ax.plot([0, sub_w], [y_cursor, y_cursor], color=_RULE, lw=0.6, zorder=3)
+
+    if caption:
+        ax.text(sub_w / 2, y_cursor - 0.08, caption, ha="center", va="top",
+                fontsize=6.5, color=_MUTED, style="italic",
+                transform=ax.transData, zorder=2)
+
+    return y_cursor
+
+
+def plot_pattern_positions_table(
+    records: list[dict],
+    avg_sim_records: list[dict] | None,
+    out_path: Path,
+) -> None:
+    """
+    Complement to fig_gs_positions_table.png.
+    One sub-table per model (+ All avg sim) side by side.
+    Rows: Section 1 P1/P2/...; Section 2 Px query (Pa+Pb).
+    Cols per sub-table: Mean Pos | Median Pos | MRR | Rank<=1 | Rank<=5 | Rank<=10.
+    Caption shows gallery and dataset counts.
+    """
+    from matplotlib.patches import FancyBboxPatch as FBP
+
+    models_present = [m for m in MODEL_ORDER if any(r["model"] == m for r in records)]
+    if not models_present:
+        models_present = list(dict.fromkeys(r["model"] for r in records))
+
+    all_pids = sorted({r["pattern_id"] for r in records if r.get("pattern_id", 0) > 0})
+    if not all_pids:
+        print("  [WARN] No pattern_id values found -- skipping pattern positions table.")
+        return
+
+    col_keys   = ["mean_pos", "median_pos", "mrr", "rank1_acc", "rank5_acc", "rank10_acc"]
+    col_labels = ["Mean Pos", "Median Pos", "MRR", "Rank <= 1", "Rank <= 5", "Rank <= 10"]
+
+    has_avg_sim      = avg_sim_records is not None and len(avg_sim_records) > 0
+    model_col_labels = [MODEL_SHORT.get(m, m) for m in models_present]
+    if has_avg_sim:
+        model_col_labels = model_col_labels + ["All (avg sim)"]
+    n_model_cols = len(model_col_labels)
+
+    row_specs = _build_pattern_row_specs(
+        records, avg_sim_records, models_present, all_pids, has_avg_sim)
+    if not row_specs:
+        print("  [WARN] No rows to render -- skipping pattern positions table.")
+        return
+
+    sections = [spec[1] for spec in row_specs]
+    sep_idx  = _make_sep_idx(sections)
+    n_rows   = len(row_specs)
+    all_row_labels = [spec[0] for spec in row_specs]
+
+    n_gallery  = len({r["identity"] for r in records})
+    n_adv_imgs = len({r["image_path"] for r in records})
+    caption = (
+        f"Gallery: {n_gallery} identities (control images)"
+        f"  |  Dataset: {n_adv_imgs} adversarial images, {len(all_pids)} pattern(s)"
+    )
+
+    _BG    = "#0f1117"
+    _FG    = "white"
+    _RULE  = "#444444"
+    _HDR_BG = "#1a1e2e"
+    _CYAN  = "#00d4ff"
+    _AMBER = "#ffdd88"
+
+    COL_W_IN = 1.30
+    LBL_W_IN = max(2.0, max(len(l) for l in all_row_labels) * 0.095 + 0.3)
+    HDR_H_IN = 0.50
+    ROW_H_IN = 0.36
+    TOP_PAD  = 0.55
+    BOT_PAD  = 0.35
+    SEP_H_IN = 0.10
+    n_sep    = len(sep_idx)
+    sub_h    = TOP_PAD + HDR_H_IN + n_rows * ROW_H_IN + n_sep * SEP_H_IN + BOT_PAD
+    sub_w    = LBL_W_IN + len(col_keys) * COL_W_IN + 0.2
+    fig_w    = sub_w * n_model_cols + 0.3 * (n_model_cols - 1)
+    fig      = plt.figure(figsize=(fig_w, sub_h), facecolor=_BG)
+
+    for col_idx, col_lbl in enumerate(model_col_labels):
+        x0_frac = col_idx * (sub_w + 0.3) / fig_w
+        ax = fig.add_axes([x0_frac, 0, sub_w / fig_w, 1.0])
+        ax.set_facecolor(_BG)
+        ax.set_xlim(0, sub_w)
+        ax.set_ylim(0, sub_h)
+        ax.axis("off")
+        is_avg = col_lbl == "All (avg sim)"
+
+        # Title (model name)
+        ax.text(sub_w / 2, sub_h - 0.12, col_lbl, ha="center", va="top",
+                fontsize=10, fontweight="bold",
+                color=_AMBER if is_avg else _FG, transform=ax.transData)
+
+        # Header
+        hdr_y0 = sub_h - TOP_PAD - HDR_H_IN
+        ax.add_patch(FBP((0, hdr_y0), sub_w, HDR_H_IN,
+                         boxstyle="square,pad=0", linewidth=0,
+                         facecolor=_HDR_BG, zorder=1))
+        hdr_cy = hdr_y0 + HDR_H_IN / 2
+        ax.text(0.08, hdr_cy, "Pattern / Query", ha="left", va="center",
+                fontsize=7.5, fontweight="bold", color=_CYAN,
+                transform=ax.transData, zorder=2)
+        for j, lbl in enumerate(col_labels):
+            cx = LBL_W_IN + (j + 0.5) * COL_W_IN
+            ax.text(cx, hdr_cy, lbl, ha="center", va="center",
+                    fontsize=7.5, fontweight="bold", color=_CYAN,
+                    transform=ax.transData, zorder=2)
+
+        ax.plot([0, sub_w], [hdr_y0, hdr_y0], color=_RULE, lw=1.0, zorder=3)
+        ax.plot([LBL_W_IN - 0.05, LBL_W_IN - 0.05], [BOT_PAD, sub_h - TOP_PAD],
+                color=_RULE, lw=0.8, zorder=3)
+        x_grp = LBL_W_IN + 3 * COL_W_IN - 0.04
+        ax.plot([x_grp, x_grp], [BOT_PAD, sub_h - TOP_PAD],
+                color=_RULE, lw=0.8, ls="--", alpha=0.6, zorder=3)
+
+        y_end = _draw_pattern_rows(
+            ax, row_specs, sep_idx, sections, col_keys,
+            LBL_W_IN, COL_W_IN, HDR_H_IN, ROW_H_IN,
+            TOP_PAD, BOT_PAD, SEP_H_IN, sub_h, sub_w,
+            col_lbl, caption=caption)
+
+        ax.add_patch(FBP((0, y_end - 0.20), sub_w, sub_h - (y_end - 0.20) - 0.05,
+                         boxstyle="square,pad=0", linewidth=0.8,
+                         edgecolor=_RULE, facecolor="none", zorder=4))
+
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=_BG)
+    plt.close(fig)
+    print(f"Wrote {out_path}")
+
+
+def plot_pattern_metric_tables(
+    records: list[dict],
+    avg_sim_records: list[dict] | None,
+    out_dir: Path,
+) -> None:
+    """
+    One PNG per metric (6 total):
+        fig_gs_pattern_metric_mean_pos.png
+        fig_gs_pattern_metric_median_pos.png
+        fig_gs_pattern_metric_mrr.png
+        fig_gs_pattern_metric_rank1.png
+        fig_gs_pattern_metric_rank5.png
+        fig_gs_pattern_metric_rank10.png
+
+    Each table:
+      Rows    : same two-section layout as fig_gs_pattern_positions_table.png
+      Columns : ALL models + All (avg sim) last (gold, dashed separator)
+      Cell    : single metric value for that (row, model)
+
+    Caption (bottom) identifies:
+      Gallery  -- control / capture images used as gallery identities
+      Dataset  -- adversarial images being queried
+    """
+    from matplotlib.patches import FancyBboxPatch as FBP
+
+    models_present = [m for m in MODEL_ORDER if any(r["model"] == m for r in records)]
+    if not models_present:
+        models_present = list(dict.fromkeys(r["model"] for r in records))
+
+    all_pids = sorted({r["pattern_id"] for r in records if r.get("pattern_id", 0) > 0})
+    if not all_pids:
+        print("  [WARN] No pattern_id values -- skipping per-metric pattern tables.")
+        return
+
+    has_avg_sim = avg_sim_records is not None and len(avg_sim_records) > 0
+
+    row_specs = _build_pattern_row_specs(
+        records, avg_sim_records, models_present, all_pids, has_avg_sim)
+    if not row_specs:
+        print("  [WARN] No rows -- skipping per-metric pattern tables.")
+        return
+
+    sections       = [spec[1] for spec in row_specs]
+    sep_idx        = _make_sep_idx(sections)
+    n_rows         = len(row_specs)
+    all_row_labels = [spec[0] for spec in row_specs]
+
+    model_col_labels = [MODEL_SHORT.get(m, m) for m in models_present]
+    avg_sim_label    = "All (avg sim)"
+    all_col_labels   = model_col_labels + ([avg_sim_label] if has_avg_sim else [])
+    n_cols           = len(all_col_labels)
+    avg_sim_col_idx  = n_cols - 1 if has_avg_sim else None
+
+    n_gallery  = len({r["identity"] for r in records})
+    n_adv_imgs = len({r["image_path"] for r in records})
+    caption = (
+        f"Gallery: {n_gallery} identities (control / capture images)"
+        f"  |  Dataset: {n_adv_imgs} adversarial images, {len(all_pids)} pattern(s)"
+    )
+
+    _BG     = "#0f1117"
+    _FG     = "white"
+    _MUTED  = "#888888"
+    _AMBER  = "#ffdd88"
+    _RULE   = "#444444"
+    _HDR_BG = "#1a1e2e"
+    _ALT_BG = "#14161f"
+    _CYAN   = "#00d4ff"
+
+    COL_W_IN  = 1.35
+    LBL_W_IN  = max(2.0, max(len(l) for l in all_row_labels) * 0.095 + 0.3)
+    HDR_H_IN  = 0.50
+    ROW_H_IN  = 0.36
+    TOP_PAD   = 0.65
+    CAP_H     = 0.32
+    SEP_H_IN  = 0.10
+    n_sep     = len(sep_idx)
+
+    fig_h = TOP_PAD + HDR_H_IN + n_rows * ROW_H_IN + n_sep * SEP_H_IN + CAP_H
+    fig_w = LBL_W_IN + n_cols * COL_W_IN + 0.2
+
+    METRIC_DEFS = [
+        ("mean_pos",   "Mean Gallery Position",   "fig_gs_pattern_metric_mean_pos.png"),
+        ("median_pos", "Median Gallery Position", "fig_gs_pattern_metric_median_pos.png"),
+        ("mrr",        "MRR (Mean Reciprocal Rank)", "fig_gs_pattern_metric_mrr.png"),
+        ("rank1_acc",  "Rank <= 1 Accuracy",       "fig_gs_pattern_metric_rank1.png"),
+        ("rank5_acc",  "Rank <= 5 Accuracy",       "fig_gs_pattern_metric_rank5.png"),
+        ("rank10_acc", "Rank <= 10 Accuracy",      "fig_gs_pattern_metric_rank10.png"),
+    ]
+
+    for metric_key, metric_label, fname in METRIC_DEFS:
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        fig.patch.set_facecolor(_BG)
+        ax.set_facecolor(_BG)
+        ax.set_xlim(0, fig_w)
+        ax.set_ylim(0, fig_h)
+        ax.axis("off")
+
+        # Title
+        ax.text(fig_w / 2, fig_h - 0.12,
+                f"Gallery Search \u2014 {metric_label}",
+                ha="center", va="top", fontsize=11, fontweight="bold",
+                color=_FG, transform=ax.transData)
+        ax.text(fig_w / 2, fig_h - 0.36,
+                "Rows: adversarial pattern / cross-pattern query"
+                "  \u00b7  Columns: recognition model",
+                ha="center", va="top", fontsize=7, color=_MUTED,
+                style="italic", transform=ax.transData)
+
+        # Header row
+        hdr_y0 = fig_h - TOP_PAD - HDR_H_IN
+        ax.add_patch(FBP((0, hdr_y0), fig_w, HDR_H_IN,
+                         boxstyle="square,pad=0", linewidth=0,
+                         facecolor=_HDR_BG, zorder=1))
+        hdr_cy = hdr_y0 + HDR_H_IN / 2
+
+        ax.text(0.08, hdr_cy, "Pattern / Query",
+                ha="left", va="center", fontsize=8, fontweight="bold",
+                color=_CYAN, transform=ax.transData, zorder=2)
+        for ci, col_lbl in enumerate(all_col_labels):
+            cx = LBL_W_IN + (ci + 0.5) * COL_W_IN
+            is_avg_col = ci == avg_sim_col_idx
+            ax.text(cx, hdr_cy, col_lbl, ha="center", va="center",
+                    fontsize=8, fontweight="bold",
+                    color=_AMBER if is_avg_col else _CYAN,
+                    transform=ax.transData, zorder=2)
+
+        ax.plot([0, fig_w], [hdr_y0, hdr_y0], color=_RULE, lw=1.0, zorder=3)
+        ax.plot([LBL_W_IN - 0.05, LBL_W_IN - 0.05],
+                [CAP_H, fig_h - TOP_PAD], color=_RULE, lw=0.8, zorder=3)
+        if avg_sim_col_idx is not None:
+            x_avg = LBL_W_IN + avg_sim_col_idx * COL_W_IN - 0.04
+            ax.plot([x_avg, x_avg], [CAP_H, fig_h - TOP_PAD],
+                    color=_RULE, lw=1.0, ls="--", alpha=0.7, zorder=3)
+
+        # Data rows
+        y_cursor    = hdr_y0
+        data_row_idx = 0
+        for i, row_lbl in enumerate(all_row_labels):
+            if i in sep_idx:
+                y_cursor -= SEP_H_IN
+                ax.plot([0, fig_w], [y_cursor + SEP_H_IN, y_cursor + SEP_H_IN],
+                        color="#555555", lw=0.6, ls="--", zorder=3)
+                ax.plot([0, fig_w], [y_cursor, y_cursor],
+                        color="#555555", lw=0.6, ls="--", zorder=3)
+
+            yc = y_cursor - ROW_H_IN / 2
+            y_cursor -= ROW_H_IN
+
+            if data_row_idx % 2 == 1:
+                ax.add_patch(FBP((0, y_cursor), fig_w, ROW_H_IN,
+                                 boxstyle="square,pad=0", linewidth=0,
+                                 facecolor=_ALT_BG, zorder=0))
+            data_row_idx += 1
+
+            lbl_color = _CYAN if sections[i] == 1 else _FG
+            ax.text(0.08, yc, row_lbl, ha="left", va="center", fontsize=8,
+                    color=lbl_color,
+                    fontweight="bold" if sections[i] == 1 else "normal",
+                    transform=ax.transData, zorder=2)
+
+            _, _, metric_map = row_specs[i]
+            for ci, col_lbl in enumerate(all_col_labels):
+                cx = LBL_W_IN + (ci + 0.5) * COL_W_IN
+                is_avg_col = ci == avg_sim_col_idx
+                st  = metric_map.get(col_lbl)
+                v   = st.get(metric_key, float("nan")) if st else float("nan")
+                if v is None or (isinstance(v, float) and v != v):
+                    txt = "\u2014"
+                elif metric_key in ("mean_pos", "median_pos"):
+                    txt = f"{v:.2f}"
+                else:
+                    txt = f"{v:.3f}"
+                ax.text(cx, yc, txt, ha="center", va="center", fontsize=8,
+                        color=_AMBER if is_avg_col else _FG,
+                        transform=ax.transData, zorder=2)
+
+        # Bottom rule + caption
+        ax.plot([0, fig_w], [y_cursor, y_cursor], color=_RULE, lw=0.6, zorder=3)
+        ax.text(fig_w / 2, y_cursor - 0.08, caption, ha="center", va="top",
+                fontsize=6.5, color=_MUTED, style="italic",
+                transform=ax.transData, zorder=2)
+
+        # Outer border
+        ax.add_patch(FBP((0, y_cursor - 0.22), fig_w,
+                         fig_h - (y_cursor - 0.22) - 0.05,
+                         boxstyle="square,pad=0", linewidth=0.8,
+                         edgecolor=_RULE, facecolor="none", zorder=4))
+
+        out_path = out_dir / fname
+        fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=_BG)
+        plt.close(fig)
+        print(f"Wrote {out_path}")
+
+
 def _print_summary(results: list[dict], models_present: list[str]) -> None:
     shorts = [MODEL_SHORT.get(m, m) for m in models_present]
 
@@ -1413,6 +1900,20 @@ def main() -> None:
     print("\n[2] Position summary (mean / median / MRR / Rank-1,5,10)")
     plot_positions_table(results, out_dir / "fig_gs_positions_table.png",
                          avg_sim_results=avg_sim_records)
+
+    print("\n[3] Per-pattern & cross-pattern position summary")
+    plot_pattern_positions_table(
+        records         = records,
+        avg_sim_records = avg_sim_records,
+        out_path        = out_dir / "fig_gs_pattern_positions_table.png",
+    )
+
+    print("\n[4] Per-metric pattern tables (one file per metric)")
+    plot_pattern_metric_tables(
+        records         = records,
+        avg_sim_records = avg_sim_records,
+        out_dir         = out_dir,
+    )
 
     print(f"\n{'=' * 60}")
     print(f"Done.  Outputs in: {out_dir}")

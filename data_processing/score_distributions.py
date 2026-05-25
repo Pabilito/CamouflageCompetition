@@ -796,7 +796,7 @@ def generate_plots_for_model(
     print("done")
 
     # ── PER-PATTERN CLEAN PLOTS ────────────────────────────────────────────────
-    _generate_per_pattern_clean_plots(
+    per_pattern_data = _generate_per_pattern_clean_plots(
         pattern_ids_sorted = pattern_ids_sorted,
         adv_by_pat         = adv_by_pat,
         ctrl_by_id         = ctrl_by_id,
@@ -831,6 +831,7 @@ def generate_plots_for_model(
         "adv_profile_scores":  (m_profil, nm_profil),
         "pattern_combo_scores": pattern_combo_scores,
         "combos":              combos if combos else [],
+        "per_pattern_data":    per_pattern_data,
     }
 
 
@@ -851,13 +852,26 @@ def _generate_per_pattern_clean_plots(
     out_dir:            "Path",
     score_fn,          # callable(pairs, ctrl_emb, adv_emb) → np.ndarray
     score_adv_fn,      # callable(pairs, adv_emb) → np.ndarray
-) -> None:
+) -> dict:
     """
     For each pattern in pattern_ids_sorted, produce clean variants of plots 1–4
     restricted to adversarial images belonging to that pattern only.
 
     Output filenames: plot{1-4}_*_pat{N}_clean.png  inside out_dir.
+
+    Returns a dict keyed by pattern_id with the computed scores needed by the
+    per-pattern cross-model overview figures:
+        {pid: {
+            "mated_scores":     np.ndarray,
+            "nonmated_scores":  np.ndarray,
+            "adv_frontal_scores": (m_front, nm_front),
+            "adv_profile_scores": (m_profil, nm_profil),
+            "pat_combo_scores": {(pA, pB): (m_sc, nm_sc)},
+            "combos_pat":       [(pA, pB), ...],
+        }}
     """
+    # Accumulated return data
+    per_pattern_data: dict = {}
     COL_FRONTAL = "#1f77b4"
     COL_PROFILE = "#d62728"
     COMBO_COLORS = [
@@ -885,6 +899,10 @@ def _generate_per_pattern_clean_plots(
         nonmated_pairs = build_nonmated_pairs(ctrl_by_id, adv_by_id_pat, len(mated_pairs), rng)
         m_scores  = score_fn(mated_pairs,    ctrl_emb, adv_emb)
         nm_scores = score_fn(nonmated_pairs, ctrl_emb, adv_emb)
+
+        # Store plot-1 scores for cross-model overview
+        per_pattern_data.setdefault(pid, {})["mated_scores"]    = m_scores
+        per_pattern_data[pid]["nonmated_scores"] = nm_scores
 
         fig, ax = plt.subplots(figsize=(7, 4))
         _draw_dist(ax, m_scores,  PALETTE["mated"],     "Mated",     show_n=False)
@@ -916,6 +934,10 @@ def _generate_per_pattern_clean_plots(
         m_front,  nm_front  = _pose_scores(adv_frontal_pat)
         m_profil, nm_profil = _pose_scores(adv_profile_pat)
 
+        # Store plot-2 scores for cross-model overview
+        per_pattern_data[pid]["adv_frontal_scores"] = (m_front,  nm_front)
+        per_pattern_data[pid]["adv_profile_scores"] = (m_profil, nm_profil)
+
         fig, ax = plt.subplots(figsize=(8, 4))
         _draw_dist(ax, m_front,   COL_FRONTAL, "Mated – Frontal",     show_n=False)
         _draw_dist(ax, nm_front,  COL_FRONTAL, "Non-mated – Frontal", linestyle=":", show_n=False)
@@ -932,6 +954,9 @@ def _generate_per_pattern_clean_plots(
         combos_pat = [(pid, p) for p in other_pids]
 
         pat_combo_scores: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+
+        # Store plot-3 combo list for cross-model overview (filled below)
+        per_pattern_data[pid]["combos_pat"] = combos_pat
 
         if combos_pat:
             n_combos = len(combos_pat)
@@ -989,6 +1014,9 @@ def _generate_per_pattern_clean_plots(
             fig_c.tight_layout()
             _save(fig_c, out_dir / f"plot3_cross_pattern_{tag}_clean.png")
 
+        # Store per-combo scores for cross-model overview
+        per_pattern_data[pid]["pat_combo_scores"] = pat_combo_scores
+
         # ── Plot 4 — combined ─────────────────────────────────────────────────
         fig, ax = plt.subplots(figsize=(9, 5))
         _draw_dist(ax, m_scores,  COL_CTRL_ADV, "Mated ctrl↔adv",     bins=BINS, fill=False, show_n=False)
@@ -1005,6 +1033,8 @@ def _generate_per_pattern_clean_plots(
         _save(fig, out_dir / f"plot4_combined_{tag}_clean.png")
 
         print("done")
+
+    return per_pattern_data
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1310,7 +1340,7 @@ def generate_plots_for_all_models(
     print("done")
 
     # ── PER-PATTERN CLEAN PLOTS ────────────────────────────────────────────────
-    _generate_per_pattern_clean_plots(
+    per_pattern_data = _generate_per_pattern_clean_plots(
         pattern_ids_sorted = pattern_ids_sorted,
         adv_by_pat         = adv_by_pat,
         ctrl_by_id         = ctrl_by_id,
@@ -1341,12 +1371,317 @@ def generate_plots_for_all_models(
         "adv_profile_scores":   (m_profil, nm_profil),
         "pattern_combo_scores": pattern_combo_scores,
         "combos":               combos if combos else [],
+        "per_pattern_data":     per_pattern_data,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Biometric statistics (pyeer)
+# Optimal-accuracy threshold table figures
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _optimal_threshold_accuracy(
+    mated: np.ndarray,
+    nonmated: np.ndarray,
+    n_thresholds: int = 400,
+) -> tuple[float, float]:
+    """
+    Find the threshold t* that maximises balanced accuracy:
+        Acc(t) = 0.5 * TPR(t) + 0.5 * TNR(t)
+               = 0.5 * (mated >= t).mean() + 0.5 * (nonmated < t).mean()
+
+    Returns (threshold, accuracy).  Falls back to (nan, nan) when either
+    array is empty.
+    """
+    if len(mated) == 0 or len(nonmated) == 0:
+        return float("nan"), float("nan")
+
+    all_scores = np.concatenate([mated, nonmated])
+    lo, hi     = float(all_scores.min()), float(all_scores.max())
+    if lo == hi:
+        return lo, float("nan")
+
+    thresholds = np.linspace(lo, hi, n_thresholds)
+    best_acc   = -1.0
+    best_th    = thresholds[0]
+
+    for t in thresholds:
+        tpr = float((mated    >= t).mean())
+        tnr = float((nonmated  < t).mean())
+        acc = 0.5 * (tpr + tnr)
+        if acc > best_acc:
+            best_acc = acc
+            best_th  = float(t)
+
+    return best_th, best_acc
+
+
+def generate_accuracy_threshold_tables(
+    overview_list: list[dict],
+    out_root: Path,
+) -> None:
+    """
+    Produce two dark-styled table PNG figures saved to out_root:
+
+    1. ``fig_accuracy_threshold_accuracy.png``
+       Combined table: rows = "All patterns", "P1", "P2", … then "P1↔P2", …
+       Separator line between the two sections.
+       Columns: one per model entry in overview_list (last = "Avg (sim)").
+       No "Average" column — Avg (sim) IS the all-models entry.
+       Cells show balanced accuracy only.
+
+    2. ``fig_accuracy_threshold_thresholds.png``
+       Identical layout but cells show the optimal threshold value only.
+
+    Visual style: dark navy background, cyan bold header text, alternating
+    row stripes, white cell text, no chart title.
+    """
+    if not overview_list:
+        print("  No model data — skipping accuracy threshold tables.")
+        return
+
+    # ── Palette (matches reference screenshot) ───────────────────────────────
+    C_BG        = "#1a2332"   # figure background
+    C_HEADER_BG = "#0d1b2a"   # header row background
+    C_HEADER_FG = "#4dd9e8"   # header text (cyan)
+    C_ROW_A     = "#1a2332"   # odd data row background
+    C_ROW_B     = "#1e2d40"   # even data row background (slightly lighter)
+    C_SEP_ROW   = "#243447"   # section-separator row background
+    C_TEXT      = "#ffffff"   # regular cell text
+    C_SEP_LINE  = "#3a5068"   # thin horizontal rule colour
+    C_ROWLABEL  = "#4dd9e8"   # row-label text (cyan, bold)
+    C_AVG_BG    = "#0d1b2a"   # Avg (sim) column background (same as header)
+    C_AVG_FG    = "#f0c040"   # Avg (sim) column text (gold, to match ref)
+
+    ROW_H   = 0.52   # inches per data row
+    HDR_H   = 0.60   # inches for header row
+    COL_W_LABEL = 1.30   # inches for the row-label column
+    COL_W_DATA  = 1.45   # inches per data column
+
+    # ── Build column labels (no extra "Average" column) ──────────────────────
+    col_labels_raw = [md["model"] for md in overview_list]
+    col_labels = [
+        "Avg (sim)" if lbl == ALL_MODELS_LABEL else lbl.split("/")[-1]
+        for lbl in col_labels_raw
+    ]
+    n_cols = len(col_labels)   # one per model/avg entry — no extra average
+
+    # ── Collect row data ──────────────────────────────────────────────────────
+    all_pids: list[int] = sorted({
+        pid
+        for md in overview_list
+        for pid in md.get("per_pattern_data", {}).keys()
+    })
+    all_combos: list[tuple[int, int]] = sorted({
+        combo
+        for md in overview_list
+        for combo in md.get("pattern_combo_scores", {}).keys()
+    })
+
+    # Section 1 rows
+    sec1_labels: list[str] = ["All patterns"] + [f"P{pid}" for pid in all_pids]
+    sec1_data:   list[list[tuple[float, float]]] = []
+
+    row_all: list[tuple[float, float]] = []
+    for md in overview_list:
+        m  = md.get("mated_scores",    np.array([]))
+        nm = md.get("nonmated_scores", np.array([]))
+        row_all.append(_optimal_threshold_accuracy(m, nm))
+    sec1_data.append(row_all)
+
+    for pid in all_pids:
+        row_pid: list[tuple[float, float]] = []
+        for md in overview_list:
+            ppd = md.get("per_pattern_data", {}).get(pid, {})
+            m   = ppd.get("mated_scores",   np.array([]))
+            nm  = ppd.get("nonmated_scores", np.array([]))
+            row_pid.append(_optimal_threshold_accuracy(m, nm))
+        sec1_data.append(row_pid)
+
+    # Section 2 rows
+    sec2_labels: list[str] = [f"P{pA}↔P{pB}" for pA, pB in all_combos]
+    sec2_data:   list[list[tuple[float, float]]] = []
+
+    for (pA, pB) in all_combos:
+        row_combo: list[tuple[float, float]] = []
+        for md in overview_list:
+            m_sc, nm_sc = md.get("pattern_combo_scores", {}).get(
+                (pA, pB), (np.array([]), np.array([]))
+            )
+            row_combo.append(_optimal_threshold_accuracy(m_sc, nm_sc))
+        sec2_data.append(row_combo)
+
+    # Combined row sequence with a separator marker between sections
+    SEP = "__sep__"
+    all_row_labels = (
+        sec1_labels
+        + ([SEP] if sec2_labels else [])
+        + sec2_labels
+    )
+    all_row_data = (
+        sec1_data
+        + ([None] if sec2_labels else [])   # None marks separator row
+        + sec2_data
+    )
+
+    n_data_rows = sum(1 for d in all_row_data if d is not None)
+    n_sep_rows  = sum(1 for d in all_row_data if d is None)
+    n_total_rows = len(all_row_data)
+
+    # ── Generic dark-style renderer ───────────────────────────────────────────
+    def _render_dark_table(
+        cell_value_fn,   # callable(th, acc) → str
+        out_path: Path,
+    ) -> None:
+        fig_w = COL_W_LABEL + COL_W_DATA * n_cols + 0.15
+        fig_h = HDR_H + ROW_H * n_data_rows + (ROW_H * 0.35) * n_sep_rows + 0.15
+        fig = plt.figure(figsize=(fig_w, fig_h), facecolor=C_BG)
+        ax  = fig.add_axes([0, 0, 1, 1])
+        ax.set_facecolor(C_BG)
+        ax.set_axis_off()
+        ax.set_xlim(0, fig_w)
+        ax.set_ylim(0, fig_h)
+
+        total_w = COL_W_LABEL + COL_W_DATA * n_cols
+        left    = (fig_w - total_w) / 2
+        top     = fig_h - 0.075   # small top margin
+
+        # Column x-positions (left edge of each column)
+        col_xs = [left] + [left + COL_W_LABEL + COL_W_DATA * i for i in range(n_cols)]
+        col_ws = [COL_W_LABEL] + [COL_W_DATA] * n_cols
+
+        # ── Header row ────────────────────────────────────────────────────────
+        y_hdr = top - HDR_H
+        for ci, (cx, cw) in enumerate(zip(col_xs, col_ws)):
+            bg = C_HEADER_BG
+            ax.add_patch(mpatches.FancyBboxPatch(
+                (cx, y_hdr), cw, HDR_H,
+                boxstyle="square,pad=0", linewidth=0,
+                facecolor=bg, clip_on=False,
+            ))
+            if ci == 0:
+                label = "Row"
+            else:
+                label = col_labels[ci - 1]
+            is_avg = (ci > 0 and col_labels[ci - 1] == "Avg (sim)")
+            fg = C_AVG_FG if is_avg else C_HEADER_FG
+            ax.text(
+                cx + cw / 2, y_hdr + HDR_H / 2, label,
+                ha="center", va="center", color=fg,
+                fontsize=9, fontweight="bold",
+            )
+
+        # Thin bottom border under header
+        ax.plot([left, left + total_w], [y_hdr, y_hdr],
+                color=C_SEP_LINE, lw=0.8)
+
+        # ── Data rows ─────────────────────────────────────────────────────────
+        y_cursor = y_hdr
+        data_row_idx = 0   # counts only real (non-separator) rows
+
+        for ri, (row_label, row_data) in enumerate(zip(all_row_labels, all_row_data)):
+
+            # Separator row
+            if row_data is None:
+                sep_h = ROW_H * 0.35
+                y_cursor -= sep_h
+                for cx, cw in zip(col_xs, col_ws):
+                    ax.add_patch(mpatches.FancyBboxPatch(
+                        (cx, y_cursor), cw, sep_h,
+                        boxstyle="square,pad=0", linewidth=0,
+                        facecolor=C_SEP_ROW, clip_on=False,
+                    ))
+                ax.plot([left, left + total_w], [y_cursor + sep_h, y_cursor + sep_h],
+                        color=C_SEP_LINE, lw=0.5, linestyle="--")
+                ax.plot([left, left + total_w], [y_cursor, y_cursor],
+                        color=C_SEP_LINE, lw=0.5, linestyle="--")
+                continue
+
+            row_h = ROW_H
+            y_top = y_cursor
+            y_cursor -= row_h
+
+            row_bg = C_ROW_A if data_row_idx % 2 == 0 else C_ROW_B
+            data_row_idx += 1
+
+            # Row-label cell
+            cx0, cw0 = col_xs[0], col_ws[0]
+            ax.add_patch(mpatches.FancyBboxPatch(
+                (cx0, y_cursor), cw0, row_h,
+                boxstyle="square,pad=0", linewidth=0,
+                facecolor=row_bg, clip_on=False,
+            ))
+            ax.text(
+                cx0 + 0.12, y_cursor + row_h / 2, row_label,
+                ha="left", va="center", color=C_ROWLABEL,
+                fontsize=9, fontweight="bold",
+            )
+
+            # Data cells
+            for ci, (th, acc) in enumerate(row_data):
+                cx, cw = col_xs[ci + 1], col_ws[ci + 1]
+                is_avg = col_labels[ci] == "Avg (sim)"
+                cell_bg = C_AVG_BG if is_avg else row_bg
+                ax.add_patch(mpatches.FancyBboxPatch(
+                    (cx, y_cursor), cw, row_h,
+                    boxstyle="square,pad=0", linewidth=0,
+                    facecolor=cell_bg, clip_on=False,
+                ))
+                txt = cell_value_fn(th, acc)
+                fg  = C_AVG_FG if is_avg else C_TEXT
+                ax.text(
+                    cx + cw / 2, y_cursor + row_h / 2, txt,
+                    ha="center", va="center", color=fg,
+                    fontsize=9,
+                )
+
+            # Thin row separator
+            ax.plot([left, left + total_w], [y_cursor, y_cursor],
+                    color=C_SEP_LINE, lw=0.4)
+
+        # Outer border
+        outer_h = top - y_cursor
+        ax.add_patch(mpatches.FancyBboxPatch(
+            (left, y_cursor), total_w, outer_h,
+            boxstyle="square,pad=0", linewidth=1.2,
+            edgecolor=C_SEP_LINE, facecolor="none", clip_on=False,
+        ))
+        # Vertical separator after row-label column
+        ax.plot(
+            [left + COL_W_LABEL, left + COL_W_LABEL],
+            [y_cursor, top],
+            color=C_SEP_LINE, lw=0.8,
+        )
+        # Vertical separator before Avg (sim) column (last column)
+        x_avg = col_xs[-1]
+        ax.plot(
+            [x_avg, x_avg],
+            [y_cursor, top],
+            color=C_SEP_LINE, lw=1.2, linestyle="--",
+        )
+
+        fig.savefig(out_path, dpi=150, bbox_inches="tight",
+                    facecolor=C_BG, edgecolor="none")
+        plt.close(fig)
+        print(f"  Saved → {out_path}")
+
+    # ── Render accuracy table ─────────────────────────────────────────────────
+    print("  Building accuracy table …", end=" ")
+    _render_dark_table(
+        cell_value_fn = lambda th, acc: "—" if np.isnan(acc) else f"{acc:.3f}",
+        out_path      = out_root / "fig_accuracy_threshold_accuracy.png",
+    )
+    print("done")
+
+    # ── Render threshold table ────────────────────────────────────────────────
+    print("  Building threshold table …", end=" ")
+    _render_dark_table(
+        cell_value_fn = lambda th, acc: "—" if np.isnan(th) else f"{th:.3f}",
+        out_path      = out_root / "fig_accuracy_threshold_thresholds.png",
+    )
+    print("done")
+
+
+
 
 def compute_biometric_stats(
     model:    str,
@@ -1779,6 +2114,171 @@ def plot_biometric_summary(models: list[str], out_root: Path) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Per-pattern cross-model overview figures
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_per_pattern_overview_figures(
+    overview_list: list[dict],
+    out_root: Path,
+) -> None:
+    """
+    For every (plot_type, pattern_id) combination, produce a 2×3 overview figure
+    that shows the same clean plot for every model side-by-side (5 individual
+    models + 1 all-models average panel).
+
+    The grid is always 2 rows × 3 columns regardless of how many models are in
+    overview_list (up to 6 entries: 5 models + avg).  Extra entries beyond 6 are
+    silently ignored; fewer than 6 leave the trailing cells blank.
+
+    Output filenames saved to out_root:
+        overview_plot1_mated_vs_nonmated_pat{N}_clean.png
+        overview_plot2_pose_breakdown_pat{N}_clean.png
+        overview_plot3_cross_pattern_pat{N}_clean.png
+        overview_plot4_combined_pat{N}_clean.png
+
+    Parameters
+    ----------
+    overview_list : list of model-data dicts (each entry must have a
+        ``per_pattern_data`` key produced by _generate_per_pattern_clean_plots).
+        The last entry is expected to be the all-models aggregate.
+    out_root : root results directory where the overview files are written.
+    """
+    if not overview_list:
+        print("  No model data — skipping per-pattern overview figures.")
+        return
+
+    # Collect the union of all pattern ids present across any model
+    all_pattern_ids: set[int] = set()
+    for md in overview_list:
+        all_pattern_ids.update(md.get("per_pattern_data", {}).keys())
+    if not all_pattern_ids:
+        print("  No per-pattern data found — skipping per-pattern overview figures.")
+        return
+
+    NROWS, NCOLS = 2, 3   # fixed 2×3 grid
+    MAX_PANELS   = NROWS * NCOLS   # 6
+
+    # Colour constants (match _generate_per_pattern_clean_plots)
+    COL_FRONTAL  = "#1f77b4"
+    COL_PROFILE  = "#d62728"
+    COMBO_COLORS = [
+        ("#e41a1c", "#377eb8"), ("#4daf4a", "#984ea3"),
+        ("#ff7f00", "#a65628"), ("#f781bf", "#999999"),
+        ("#e41a1c", "#4daf4a"), ("#377eb8", "#ff7f00"),
+        ("#984ea3", "#a65628"), ("#f781bf", "#e41a1c"),
+        ("#4daf4a", "#377eb8"), ("#ff7f00", "#984ea3"),
+    ]
+    NM_COLOR     = "#555555"
+    COL_CTRL_ADV = PALETTE["mated"]
+
+    # ── Helper: draw a single plot-type into an existing axes ─────────────────
+    def _draw_plot1(ax, pd, model_label):
+        m  = pd.get("mated_scores",   np.array([]))
+        nm = pd.get("nonmated_scores", np.array([]))
+        _draw_dist(ax, m,  PALETTE["mated"],     "Mated",     show_n=False)
+        _draw_dist(ax, nm, PALETTE["non_mated"], "Non-mated", linestyle=":", show_n=False)
+        _style_ax(ax, f"{model_label}\nMated vs Non-Mated", legend_inside=True)
+        _unify_ylim([ax])
+
+    def _draw_plot2(ax, pd, model_label):
+        m_f,  nm_f  = pd.get("adv_frontal_scores", (np.array([]), np.array([])))
+        m_p,  nm_p  = pd.get("adv_profile_scores", (np.array([]), np.array([])))
+        _draw_dist(ax, m_f,  COL_FRONTAL, "Mated – Frontal",     show_n=False)
+        _draw_dist(ax, nm_f, COL_FRONTAL, "Non-mated – Frontal", linestyle=":", show_n=False)
+        _draw_dist(ax, m_p,  COL_PROFILE, "Mated – Profile",     show_n=False)
+        _draw_dist(ax, nm_p, COL_PROFILE, "Non-mated – Profile", linestyle=":", show_n=False)
+        _style_ax(ax, f"{model_label}\nPose Breakdown", legend_inside=True)
+        _unify_ylim([ax])
+
+    def _draw_plot3(ax, pd, model_label, pid):
+        combo_scores = pd.get("pat_combo_scores", {})
+        combos_pat   = pd.get("combos_pat", [])
+        for c_idx, (pA, pB) in enumerate(combos_pat):
+            col_pA, _ = COMBO_COLORS[c_idx % len(COMBO_COLORS)]
+            m_sc, nm_sc = combo_scores.get((pA, pB), (np.array([]), np.array([])))
+            _draw_dist(ax, m_sc,  col_pA,   f"Mated P{pA}↔P{pB}", bins=30, show_n=False)
+            _draw_dist(ax, nm_sc, NM_COLOR, "Non-mated",           bins=30, linestyle="--", show_n=False)
+        _style_ax(ax, f"{model_label}\nCross-Pattern (Pat {pid})", legend_inside=True)
+        _unify_ylim([ax])
+
+    def _draw_plot4(ax, pd, model_label, pid):
+        m  = pd.get("mated_scores",   np.array([]))
+        nm = pd.get("nonmated_scores", np.array([]))
+        _draw_dist(ax, m,  COL_CTRL_ADV, "Mated ctrl↔adv",     bins=BINS, fill=False, show_n=False)
+        _draw_dist(ax, nm, COL_CTRL_ADV, "Non-mated ctrl↔adv", bins=BINS, linestyle=":", fill=False, show_n=False)
+        combo_scores = pd.get("pat_combo_scores", {})
+        combos_pat   = pd.get("combos_pat", [])
+        for c_idx, (pA, pB) in enumerate(combos_pat):
+            col_pA, _ = COMBO_COLORS[c_idx % len(COMBO_COLORS)]
+            m_sc, nm_sc = combo_scores.get((pA, pB), (np.array([]), np.array([])))
+            _draw_dist(ax, m_sc,  col_pA, f"Mated P{pA}↔P{pB}",     bins=30, fill=False, show_n=False)
+            _draw_dist(ax, nm_sc, col_pA, f"Non-mated P{pA}↔P{pB}", bins=30, linestyle=":", fill=False, show_n=False)
+        _style_ax(ax, f"{model_label}\nCombined (Pat {pid})", legend_inside=True)
+        _unify_ylim([ax])
+
+    PLOT_DEFS = [
+        ("plot1_mated_vs_nonmated", _draw_plot1, "Mated vs Non-Mated"),
+        ("plot2_pose_breakdown",    _draw_plot2, "Pose Breakdown"),
+        ("plot3_cross_pattern",     _draw_plot3, "Cross-Pattern"),
+        ("plot4_combined",          _draw_plot4, "Combined"),
+    ]
+
+    entries = overview_list[:MAX_PANELS]   # at most 6 panels
+
+    for pid in sorted(all_pattern_ids):
+        for plot_key, draw_fn, plot_title in PLOT_DEFS:
+            out_name = f"overview_{plot_key}_pat{pid}_clean.png"
+            out_path = out_root / out_name
+            print(f"  Per-pattern overview [{plot_title}, Pat {pid}] …", end=" ")
+
+            fig, axes = plt.subplots(
+                NROWS, NCOLS,
+                figsize=(6.5 * NCOLS, 4.5 * NROWS),
+                squeeze=False,
+            )
+            fig.suptitle(
+                f"All Models — {plot_title} | Pattern {pid}",
+                fontsize=14, fontweight="bold", y=1.01,
+            )
+
+            for panel_idx, md in enumerate(entries):
+                row = panel_idx // NCOLS
+                col = panel_idx % NCOLS
+                ax  = axes[row][col]
+                ppd = md.get("per_pattern_data", {}).get(pid)
+
+                # Short model label (last component after '/' or full name)
+                raw_label = md["model"]
+                short_label = raw_label.split("/")[-1]
+
+                if ppd is None:
+                    ax.text(0.5, 0.5, f"{short_label}\n(no data for Pat {pid})",
+                            ha="center", va="center", transform=ax.transAxes, fontsize=9)
+                    ax.set_visible(True)
+                    continue
+
+                # call the right draw helper; plot3/plot4 need pid too
+                if plot_key in ("plot3_cross_pattern", "plot4_combined"):
+                    draw_fn(ax, ppd, short_label, pid)
+                else:
+                    draw_fn(ax, ppd, short_label)
+
+                # Highlight the all-models panel with a distinct border
+                if md["model"] == ALL_MODELS_LABEL:
+                    for spine in ax.spines.values():
+                        spine.set_edgecolor("#e67e22")
+                        spine.set_linewidth(2.0)
+
+            # Hide any unused panels
+            for panel_idx in range(len(entries), NROWS * NCOLS):
+                axes[panel_idx // NCOLS][panel_idx % NCOLS].set_visible(False)
+
+            fig.tight_layout()
+            _save(fig, out_path)
+            print("done")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Combined overview figure (all models × plots 1–4)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1935,6 +2435,12 @@ def main() -> None:
     if all_models_data is not None:
         overview_list.append(all_models_data)
     generate_combined_overview(overview_list, out_root)
+
+    print("\nGenerating per-pattern cross-model overview figures …")
+    generate_per_pattern_overview_figures(overview_list, out_root)
+
+    print("\nGenerating optimal-accuracy threshold tables …")
+    generate_accuracy_threshold_tables(overview_list, out_root)
 
     print("\nAll done.")
 
