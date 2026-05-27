@@ -38,6 +38,7 @@ SCRIPTS: list[tuple[str, str, bool]] = [
     ("gallery_search_stats.py",     "Gallery search statistics and figures",         True),
     ("score_distributions.py",      "Similarity score distribution plots per model", True),
     ("visualize_results.py",        "Visualisations for accuracy / score / pattern", False),
+    ("analyze_color_vs_rank.py",    "Analyze colors",                                True),
 ]
 
 

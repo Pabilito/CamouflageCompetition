@@ -34,6 +34,7 @@ invoked with `--out` only; the rest receive both `--db` and `--out`.
 | `cross_pattern_similarity.py` | Adversarial ↔ adversarial cosine similarity across pattern groups (A ↔ B) | ✓ | `cross_pattern_pairs.csv`, `cross_pattern_summary.csv`, `cross_pattern_by_pair.csv` |
 | `gallery_search_stats.py` | Gallery search Rank-N accuracy, MRR, and position statistics per model and per pattern/cross-pattern pair. Produces two "All Models" rows: per-model pooled average and averaged-similarity method (as used in the UI). All rate values on 0–1 scale. | ✓ | `gallery_search_stats.csv` + 9 PNGs |
 | `score_distributions.py` | Similarity score distribution plots (mated vs non-mated, pose breakdown, cross-pattern, combined) + biometric statistics (EER, FMR100, FMR1000, TPR, AUC) + optimal-accuracy decision threshold tables, all saved per model and in combined overviews | ✓ | per-model PNGs + CSVs; global summary PNGs; per-pattern overview PNGs; threshold table PNGs |
+| `analyze_color_vs_rank.py` | Ranks adversarial images by mean similarity (hardest-to-recognise = rank 1), computes face-region perceptual colour metrics relative to the identity's first control image, and reports Pearson/Spearman correlations between those metrics and ranking position | ✓ | `color_vs_rank.csv`, `color_vs_rank.png` |
 | `visualize_results.py` | Heatmap and table figures for accuracy, score statistics, and cross-pattern results | — | 6 PNGs |
 
 ## Shared configuration
@@ -50,36 +51,44 @@ invoked with `--out` only; the rest receive both `--db` and `--out`.
 All CSV and PNG files are written to `data_processing/results/` (created automatically).
 
 ### current_standings.csv
+
 One row per identity (attacker), ranked by best average similarity score.
 Includes per-model scores for the identity's best image.
 
 ### gallery_search.csv
+
 One row per identity with gallery-search position statistics (best / worst /
 average position, image count).
 
 ### model_accuracy.csv
+
 One row per `(model, group_by, group_value)` combination.  `group_by` is one
 of `overall`, `pose`, or `pattern`.  Includes count, accuracy, mean, std, min,
 max, and median similarity scores.
 
 ### score_statistics.csv
+
 Model-independent statistics.  Each image's score is first averaged across all
 models, then aggregated by pose and pattern.  Includes mean, std, quartiles,
 and per-model attack success rate.
 
 ### cross_pattern_pairs.csv
+
 Raw pairwise results: one row per `(identity, model, image_a, image_b)`
 comparison between a pattern-A and a pattern-B adversarial image.
 
 ### cross_pattern_summary.csv
+
 Aggregated cross-pattern statistics per `(identity, model)`, plus per-model
 totals and a grand total row.
 
 ### cross_pattern_by_pair.csv
+
 Aggregated statistics per `(pattern_pair, model)`, e.g. `1↔2`, `1↔3`.
 Includes per-pattern-pair totals and a grand total row.
 
 ### gallery_search_stats.csv
+
 One row per `(model, group_by, group_value)`.  Per-model positions are
 recomputed at analysis time from the embeddings table: for each
 `(adversarial image, model)` pair, every gallery identity is scored by max
@@ -95,9 +104,41 @@ identity ranks further down the gallery).
 
 **All rate columns** (Rank-N, MRR) are stored and displayed on a 0–1 scale.
 
+### color_vs_rank.csv
+
+One row per adversarial image, ordered by average similarity rank
+(rank 1 = lowest mean similarity = hardest to recognise).
+
+For each image, the script computes face-region colour statistics from the
+aligned 112×112 crop using the same elliptical face mask used elsewhere in
+the project. Metrics include:
+
+- Mean CIE Lab components (`L`, `a`, `b`)
+- Chroma (`C`) and hue angle (`h_deg`)
+- Mean HSV values (`H`, `S`, `V`)
+- Mean RGB values (`R`, `G`, `B`)
+- Lightness variation across the face (`L_std`)
+- Deltas relative to the identity's first control image:
+  `dL`, `da`, `db`, `dC`, `dE`, `dh`, `dS`, `dV`, `dR`, `dG`, `dB`
+
+Also includes the adversarial image rank, mean similarity score, model count,
+identity, image path, and reference-control Lab values.
+
+The script prints Pearson (`r`) and Spearman (`ρ`) correlations between each
+metric and rank. Spearman correlation is generally the more meaningful measure
+because ranking itself is ordinal.
+
 ---
 
 ## Figure files
+
+### analyze_color_vs_rank.py — 1 PNG
+
+| File | Contents |
+|------|----------|
+| `color_vs_rank.png` | Scatter plots of adversarial rank versus each colour metric (`L`, `a`, `b`, `dL`, `da`, `db`, `C`, `dC`, `dE`, `S`, `dS`, `L_std`) with least-squares trend lines and Pearson/Spearman correlation annotations |
+
+---
 
 ### visualize_results.py — 6 PNGs
 
@@ -218,11 +259,20 @@ other scripts, not the database directly).
 | `--seed` | `42` | Random seed for non-mated pair sampling |
 | `--regen` | off | Overwrite existing output files; by default any file already on disk is skipped |
 
+`analyze_color_vs_rank.py` additionally accepts:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--data-dir` | `data` | Root application data directory used to locate control images |
+| `--csv` | `data_processing/results/color_vs_rank.csv` | Output CSV path |
+| `--plot` | `data_processing/results/color_vs_rank.png` | Output plot path (`''` disables plot generation) |
+
 ## Dependencies
 
 - Python 3.10+
 - `numpy` — statistics and embedding operations (all scripts)
-- `matplotlib` — figure generation (`gallery_search_stats.py`, `visualize_results.py`, `score_distributions.py`)
+- `Pillow` — image loading and colour-space analysis (`analyze_color_vs_rank.py`)
+- `matplotlib` — figure generation (`gallery_search_stats.py`, `visualize_results.py`, `score_distributions.py`, `analyze_color_vs_rank.py`)
 - `scipy` — KDE smoothing in `score_distributions.py` (optional; step-histogram fallback if absent)
 - `pyeer` — biometric statistics in `score_distributions.py` (optional; `pip install pyeer`)
 - `core/database.py` — used only by `extract_rankings.py`
