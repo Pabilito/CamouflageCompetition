@@ -6,8 +6,10 @@ Two sub-tabs:
   • All Images         — every scored image with model filter dropdown
 """
 
+import csv
 import json
 import threading
+from datetime import datetime
 from pathlib import Path
 
 import customtkinter as ctk
@@ -171,7 +173,7 @@ class RankingTab(ctk.CTkFrame):
         # ── Toolbar ───────────────────────────────────────────────────────────
         toolbar = ctk.CTkFrame(self, fg_color="transparent")
         toolbar.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
-        toolbar.columnconfigure(4, weight=1)
+        toolbar.columnconfigure(5, weight=1)
 
         ctk.CTkLabel(toolbar, text="Adversarial Attack Ranking",
                      font=ctk.CTkFont(size=14, weight="bold"),
@@ -188,12 +190,18 @@ class RankingTab(ctk.CTkFrame):
                       fg_color="#1a3a1a", hover_color="#2a5a2a",
                       command=self._open_podium).grid(row=0, column=3, padx=(8, 0))
 
+        self._btn_export_csv = ctk.CTkButton(
+            toolbar, text="⬇  Export CSV", width=130,
+            fg_color="#1a2a3a", hover_color="#2a4a6a",
+            command=self._export_current_tab_csv)
+        self._btn_export_csv.grid(row=0, column=4, padx=(8, 0))
+
 
         ctk.CTkLabel(toolbar,
                      text=f"Avg. similarity threshold: {_THRESHOLD}  •  "
                           "click thumbnails to enlarge  •  🗑 to delete row",
                      font=ctk.CTkFont(size=10), text_color="#555").grid(
-            row=0, column=4, padx=(16, 0), sticky="w")
+            row=0, column=5, padx=(16, 0), sticky="w")
 
         # ── Sub-tab view ──────────────────────────────────────────────────────
         self._tabs = ctk.CTkTabview(self, corner_radius=6)
@@ -2095,6 +2103,231 @@ class RankingTab(ctk.CTkFrame):
                     threading.Thread(target=_load, daemon=True).start()
             else:
                 self._add_thumb(body, path, grid_row, col, label="closest match")
+
+    # ── CSV export ────────────────────────────────────────────────────────────
+    #
+    # Exports the FULL dataset of the currently-active sub-tab (not just the
+    # 20 rows on the current page) to a user-chosen CSV file. Columns mirror
+    # what the active tab displays on screen.
+    #
+    # The export runs against the in-memory cache (self._st_cache /
+    # self._all_cache / self._gs_cache), so:
+    #   • it's instant — no DB round-trip,
+    #   • it reflects exactly what the user is looking at (same filter, same
+    #     ordering, same per-model scores).
+    # If the cache is empty (user hasn't visited this tab since startup, or
+    # data was just cleared), the export is refused with a friendly hint to
+    # refresh first.
+
+    def _export_current_tab_csv(self) -> None:
+        """Pick the right exporter based on the active sub-tab."""
+        current = self._tabs.get()
+        if current == "Current Standings":
+            self._export_standings_csv()
+        elif current == "All Images":
+            self._export_all_images_csv()
+        elif current == "Gallery Search":
+            self._export_gallery_search_csv()
+        else:
+            messagebox.showinfo("Export CSV",
+                                "Unknown tab — nothing to export.")
+
+    @staticmethod
+    def _default_csv_name(prefix: str) -> str:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"{prefix}_{ts}.csv"
+
+    def _ask_save_path(self, default_name: str) -> str | None:
+        """Show a Save-As dialog; return the chosen path or None on cancel."""
+        return filedialog.asksaveasfilename(
+            title="Export CSV",
+            defaultextension=".csv",
+            initialfile=default_name,
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        ) or None
+
+    def _write_csv(self, path: str, header: list[str],
+                   rows: list[list]) -> tuple[bool, str]:
+        """Write rows to `path`. Returns (ok, message)."""
+        try:
+            # utf-8-sig writes a BOM so Excel opens the file with the right encoding.
+            with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+                writer = csv.writer(fh, lineterminator="\n")
+                writer.writerow(header)
+                writer.writerows(rows)
+            return True, f"Exported {len(rows)} row(s) to {Path(path).name}"
+        except Exception as exc:
+            return False, f"Export failed: {exc}"
+
+    def _notify_export(self, ok: bool, msg: str, path: str = "") -> None:
+        """Show a non-blocking confirmation; on success include the folder."""
+        if ok:
+            full = f"{msg}\n\nLocation:\n{path}" if path else msg
+            messagebox.showinfo("Export CSV", full)
+        else:
+            messagebox.showerror("Export CSV", msg)
+
+    # ── Per-tab exporters ─────────────────────────────────────────────────────
+
+    def _export_standings_csv(self) -> None:
+        """Export the Current Standings tab (full leaderboard, all participants)."""
+        if not self._st_cache:
+            messagebox.showinfo(
+                "Export CSV",
+                "Nothing to export yet — the Current Standings cache is empty.\n"
+                "Click ⟳ Refresh first, then try again.")
+            return
+
+        model_names = self._st_cache[0].get("model_names", [])
+        header = (["rank", "attacker", "best_avg"]
+                  + list(model_names)
+                  + ["best_attack_path", "timestamp"])
+
+        rows: list[list] = []
+        for i, entry in enumerate(self._st_cache, start=1):
+            scores = entry.get("scores", {})
+            row = [
+                i,
+                entry.get("identity", ""),
+                f"{entry.get('best_avg', 0.0):.4f}",
+            ]
+            for mn in model_names:
+                s = scores.get(mn)
+                row.append(f"{s:.4f}" if s is not None else "")
+            ts = entry.get("ts", "") or ""
+            row.append(entry.get("path", ""))
+            # Normalise timestamp to "YYYY-MM-DD HH:MM:SS" like the UI
+            row.append(ts[:19].replace("T", " ") if ts else "")
+            rows.append(row)
+
+        default_name = self._default_csv_name("standings")
+        save_path = self._ask_save_path(default_name)
+        if not save_path:
+            return
+
+        def _bg():
+            ok, msg = self._write_csv(save_path, header, rows)
+            try:
+                if self.winfo_exists():
+                    self.after(0, lambda: self._notify_export(ok, msg, save_path))
+            except (RuntimeError, tk.TclError):
+                pass
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _export_all_images_csv(self) -> None:
+        """Export the All Images tab (every scored image, current model filter)."""
+        if not self._all_cache:
+            messagebox.showinfo(
+                "Export CSV",
+                "Nothing to export yet — the All Images cache is empty.\n"
+                "Click ⟳ Refresh first, then try again.")
+            return
+
+        is_average  = (self._all_cache_model == _ALL_MODELS)
+        model_label = self._all_cache_model or _ALL_MODELS
+        score_col   = "avg_similarity" if is_average else "similarity"
+
+        header = [
+            "rank", "attacker", "model", score_col,
+            "attack_path", "closest_path", "timestamp",
+            "pattern_id", "is_frontal", "is_profile", "is_pitch",
+        ]
+
+        rows: list[list] = []
+        for i, entry in enumerate(self._all_cache, start=1):
+            tags = entry.get("tags") or {}
+            ts = entry.get("created_at", "") or ""
+            rows.append([
+                i,
+                entry.get("attacker", ""),
+                model_label,
+                f"{entry.get('avg_score', 0.0):.4f}",
+                entry.get("image_path", ""),
+                entry.get("closest_path", "") or "",
+                ts[:19].replace("T", " ") if ts else "",
+                tags.get("pattern_id", 0),
+                int(bool(tags.get("is_frontal"))),
+                int(bool(tags.get("is_profile"))),
+                int(bool(tags.get("is_pitch"))),
+            ])
+
+        # Include the model filter in the default filename so multiple exports
+        # for different models don't overwrite each other.
+        safe_model = (model_label.replace(" ", "_")
+                                  .replace("(", "")
+                                  .replace(")", "")
+                                  .replace("/", "_"))
+        default_name = self._default_csv_name(f"all_images_{safe_model}")
+        save_path = self._ask_save_path(default_name)
+        if not save_path:
+            return
+
+        def _bg():
+            ok, msg = self._write_csv(save_path, header, rows)
+            try:
+                if self.winfo_exists():
+                    self.after(0, lambda: self._notify_export(ok, msg, save_path))
+            except (RuntimeError, tk.TclError):
+                pass
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _export_gallery_search_csv(self) -> None:
+        """Export the Gallery Search tab (one row per attacker identity)."""
+        if not self._gs_cache:
+            messagebox.showinfo(
+                "Export CSV",
+                "Nothing to export yet — the Gallery Search cache is empty.\n"
+                "Click ⟳ Refresh first, then try again.")
+            return
+
+        header = [
+            "rank", "identity", "n_images",
+            "best_position", "worst_position", "avg_position",
+            "all_positions",
+            "best_attack_path",
+            "closest_same_id_path",
+            "closest_any_id_path",
+            "closest_any_id_identity",
+            "closest_any_id_dataset",
+        ]
+
+        rows: list[list] = []
+        for i, entry in enumerate(self._gs_cache, start=1):
+            positions = entry.get("positions", []) or []
+            # Sort positions ascending in the cell so it reads naturally
+            all_pos_str = ";".join(str(p) for p in sorted(positions))
+            top1_ext    = entry.get("worst_top1_ext") or {}
+            rows.append([
+                i,
+                entry.get("identity", ""),
+                entry.get("n_images", len(positions)),
+                entry.get("best_pos", ""),
+                entry.get("worst_pos", ""),
+                f"{entry.get('avg_pos', 0.0):.2f}",
+                all_pos_str,
+                entry.get("best_img", "") or "",
+                entry.get("best_ref", "") or "",
+                entry.get("worst_top1_img", "") or "",
+                entry.get("worst_top1_id", "") or "",
+                top1_ext.get("dataset", "") if top1_ext else "",
+            ])
+
+        default_name = self._default_csv_name("gallery_search")
+        save_path = self._ask_save_path(default_name)
+        if not save_path:
+            return
+
+        def _bg():
+            ok, msg = self._write_csv(save_path, header, rows)
+            try:
+                if self.winfo_exists():
+                    self.after(0, lambda: self._notify_export(ok, msg, save_path))
+            except (RuntimeError, tk.TclError):
+                pass
+
+        threading.Thread(target=_bg, daemon=True).start()
 
     # ── Thumbnail loader ──────────────────────────────────────────────────────
 
