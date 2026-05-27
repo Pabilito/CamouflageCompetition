@@ -6,6 +6,7 @@ Two sub-tabs:
   • All Images         — every scored image with model filter dropdown
 """
 
+import json
 import threading
 from pathlib import Path
 
@@ -378,27 +379,35 @@ class RankingTab(ctk.CTkFrame):
             command=self._gs_add_dataset)
         self._gs_btn_add.grid(row=2, column=0, padx=12, pady=(0, 4))
 
+        # Load a precomputed embeddings file produced by
+        # data_processing/precompute_gallery.py on an external machine.
+        self._gs_btn_load = ctk.CTkButton(
+            gs_right, text="📥  Load Precomputed", width=190,
+            fg_color="#2a3a5a", hover_color="#3a4a7a",
+            command=self._gs_load_precomputed)
+        self._gs_btn_load.grid(row=3, column=0, padx=12, pady=(0, 4))
+
         self._gs_btn_recompute = ctk.CTkButton(
             gs_right, text="↻  Recompute Positions", width=190,
             fg_color="#1a3a1a", hover_color="#2a5a2a",
             command=self._gs_trigger_recompute)
-        self._gs_btn_recompute.grid(row=3, column=0, padx=12, pady=(0, 10))
+        self._gs_btn_recompute.grid(row=4, column=0, padx=12, pady=(0, 10))
 
         # Dataset list (scrollable)
         self._gs_dataset_frame = ctk.CTkScrollableFrame(
             gs_right, fg_color="transparent", width=210, height=280)
-        self._gs_dataset_frame.grid(row=4, column=0, padx=6, pady=(0, 6), sticky="nsew")
+        self._gs_dataset_frame.grid(row=5, column=0, padx=6, pady=(0, 6), sticky="nsew")
         self._gs_dataset_frame.columnconfigure(0, weight=1)
-        gs_right.rowconfigure(4, weight=1)
+        gs_right.rowconfigure(5, weight=1)
 
         # Progress area
         self._gs_progress_label = ctk.CTkLabel(
             gs_right, text="", font=ctk.CTkFont(size=10), text_color="#888",
             wraplength=200, justify="left")
-        self._gs_progress_label.grid(row=5, column=0, padx=12, pady=(4, 2), sticky="w")
+        self._gs_progress_label.grid(row=6, column=0, padx=12, pady=(4, 2), sticky="w")
 
         self._gs_progress_bar = ctk.CTkProgressBar(gs_right, width=200)
-        self._gs_progress_bar.grid(row=6, column=0, padx=12, pady=(0, 10))
+        self._gs_progress_bar.grid(row=7, column=0, padx=12, pady=(0, 10))
         self._gs_progress_bar.set(0)
         self._gs_progress_bar.grid_remove()   # hidden until import starts
 
@@ -959,6 +968,7 @@ class RankingTab(ctk.CTkFrame):
         self._gs_btn_add.configure(text="✕  Cancel", fg_color="#5a0000",
                                    hover_color="#8b0000",
                                    command=self._gs_cancel_import)
+        self._gs_btn_load.configure(state="disabled")
         self._gs_btn_recompute.configure(state="disabled")
         self._gs_progress_bar.grid()
         self._gs_progress_bar.set(0)
@@ -1118,10 +1128,318 @@ class RankingTab(ctk.CTkFrame):
                 fg_color=["#3a7ebf", "#1f538d"],   # CTk default button colours
                 hover_color=["#325882", "#14375e"],
                 command=self._gs_add_dataset)
+            self._gs_btn_load.configure(state="normal")
             self._gs_btn_recompute.configure(state="normal")
             self._gs_refresh_dataset_list()
         except Exception:
             pass
+
+    # ── Precomputed embeddings loader ─────────────────────────────────────
+    #
+    # The companion script data_processing/precompute_gallery.py walks a
+    # folder, aligns + embeds every image, and writes a single .npz file
+    # holding identities, paths and per-model embedding matrices.  This
+    # handler loads such a file back into the database as a new external
+    # gallery dataset — no alignment or embedding happens here, so it's
+    # cheap regardless of dataset size.
+    def _gs_load_precomputed(self) -> None:
+        """Open a .npz file produced by precompute_gallery.py and insert
+        its embeddings into the external gallery."""
+        if self._gs_import_running:
+            return
+
+        file_path = filedialog.askopenfilename(
+            title="Select precomputed embeddings file",
+            filetypes=[("NumPy archive", "*.npz"), ("All files", "*.*")],
+        )
+        if not file_path:
+            return
+        file_path = Path(file_path)
+
+        import numpy as np
+
+        # ── Load + validate ───────────────────────────────────────────────
+        try:
+            data = np.load(file_path, allow_pickle=True)
+        except Exception as exc:
+            messagebox.showerror(
+                "Load failed",
+                f"Could not open {file_path.name}:\n{exc}",
+            )
+            return
+
+        try:
+            file_models = [str(x) for x in data["model_names"]]
+            identities  = [str(x) for x in data["identities"]]
+            file_paths  = [str(x) for x in data["paths"]]
+            meta_raw    = data["meta"].item() if "meta" in data.files else "{}"
+            meta = json.loads(meta_raw) if isinstance(meta_raw, str) else {}
+        except Exception as exc:
+            messagebox.showerror(
+                "Load failed",
+                f"{file_path.name} is missing required arrays:\n{exc}",
+            )
+            data.close()
+            return
+
+        # Strict model-set check — user-selected behaviour.
+        engine_models = set(self._engine.model_names)
+        file_model_set = set(file_models)
+        if engine_models != file_model_set:
+            missing = sorted(engine_models - file_model_set)
+            extra   = sorted(file_model_set - engine_models)
+            lines = ["Model mismatch — cannot load."]
+            if missing:
+                lines.append(f"Missing in file: {', '.join(missing)}")
+            if extra:
+                lines.append(f"Extra in file: {', '.join(extra)}")
+            lines.append("\nThe file must contain embeddings for exactly "
+                         "the models currently loaded.")
+            messagebox.showerror("Model mismatch", "\n".join(lines))
+            data.close()
+            return
+
+        n = len(identities)
+        if n == 0 or len(file_paths) != n:
+            messagebox.showerror(
+                "Load failed",
+                f"{file_path.name} contains no usable rows "
+                f"(identities={n}, paths={len(file_paths)}).",
+            )
+            data.close()
+            return
+
+        # Per-model embedding matrices
+        emb_matrices: dict[str, np.ndarray] = {}
+        for mn in self._engine.model_names:
+            key = f"emb__{mn}"
+            if key not in data.files:
+                messagebox.showerror(
+                    "Load failed",
+                    f"{file_path.name} is missing array {key!r}.",
+                )
+                data.close()
+                return
+            mat = np.asarray(data[key])
+            if mat.shape[0] != n:
+                messagebox.showerror(
+                    "Load failed",
+                    f"{file_path.name}: embedding count for {mn} "
+                    f"({mat.shape[0]}) does not match identity count ({n}).",
+                )
+                data.close()
+                return
+            emb_matrices[mn] = mat.astype("float32", copy=False)
+        data.close()
+
+        # ── Optional path remap ───────────────────────────────────────────
+        # Paths inside the file refer to wherever the script ran.  If the
+        # user has a local copy of the images, they can map the recorded
+        # prefix → a local prefix so thumbnails resolve.  Both empty fields
+        # = keep paths as-is.
+        sample_path = file_paths[0] if file_paths else ""
+        prefixes = self._gs_ask_path_remap(sample_path)
+        if prefixes is None:                         # cancelled
+            return
+        src_prefix, dst_prefix = prefixes
+        if src_prefix:
+            remapped: list[str] = []
+            for p in file_paths:
+                if p.startswith(src_prefix):
+                    remapped.append(dst_prefix + p[len(src_prefix):])
+                else:
+                    remapped.append(p)
+            file_paths = remapped
+
+        # ── Register dataset + insert embeddings ──────────────────────────
+        display_name = meta.get("display_name") or file_path.stem
+        source_label = meta.get("source_folder") or str(file_path)
+        dataset_id = self._db.add_ext_gallery_dataset(source_label, display_name)
+        already_done = self._db.get_ext_gallery_existing_paths(dataset_id)
+
+        self._gs_import_running = True
+        self._gs_btn_add.configure(state="disabled")
+        self._gs_btn_load.configure(state="disabled", text="Loading…")
+        self._gs_btn_recompute.configure(state="disabled")
+        self._gs_progress_bar.grid()
+        self._gs_progress_bar.set(0)
+        self._gs_progress_label.configure(
+            text=f"Loading {display_name}…  0 / {n}", text_color="#888")
+
+        model_names = list(self._engine.model_names)
+
+        def _bg() -> None:
+            inserted = 0
+            skipped  = 0
+            BATCH_SIZE = 500
+            batch: list[tuple] = []
+
+            def _flush():
+                if not batch:
+                    return
+                try:
+                    self._db.bulk_upsert_ext_gallery_embeddings(list(batch))
+                except Exception as e:
+                    print(f"[LOAD PRECOMPUTED] DB write error: {e}")
+                batch.clear()
+
+            def _post_progress(done: int):
+                try:
+                    if self.winfo_exists():
+                        frac = done / max(1, n)
+                        self.after(0, lambda d=done, f=frac:
+                            self._gs_load_progress(f, d, n))
+                except Exception:
+                    pass
+
+            for i in range(n):
+                path_str = file_paths[i]
+                identity = identities[i]
+                if path_str in already_done:
+                    skipped += 1
+                else:
+                    for mn in model_names:
+                        blob = emb_matrices[mn][i].tobytes()
+                        batch.append(
+                            (dataset_id, path_str, identity, mn, blob))
+                    inserted += 1
+                    if len(batch) >= BATCH_SIZE:
+                        _flush()
+
+                if (i + 1) % 200 == 0 or (i + 1) == n:
+                    _post_progress(i + 1)
+
+            _flush()
+
+            try:
+                real_count = self._db.count_ext_gallery_embeddings(dataset_id)
+                self._db.update_ext_gallery_image_count(dataset_id, real_count)
+                print(f"[LOAD PRECOMPUTED] {display_name}: "
+                      f"inserted={inserted}, skipped={skipped}, "
+                      f"db_total={real_count}")
+            except Exception as e:
+                print(f"[LOAD PRECOMPUTED] Count error: {e}")
+
+            try:
+                if self.winfo_exists():
+                    self.after(0, lambda: self._gs_load_done(
+                        inserted=inserted, skipped=skipped))
+            except Exception:
+                pass
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _gs_load_progress(self, frac: float, done: int, total: int) -> None:
+        try:
+            self._gs_progress_bar.set(frac)
+            self._gs_progress_label.configure(
+                text=f"Loading…  {done} / {total}", text_color="#888")
+        except Exception:
+            pass
+
+    def _gs_load_done(self, inserted: int, skipped: int) -> None:
+        self._gs_import_running = False
+        try:
+            self._gs_progress_bar.set(1.0)
+            msg = f"Loaded {inserted} image{'s' if inserted != 1 else ''}."
+            if skipped:
+                msg += f"  ({skipped} already present, skipped.)"
+            self._gs_progress_label.configure(text=msg, text_color="#00ff9f")
+            self._gs_btn_add.configure(state="normal")
+            self._gs_btn_load.configure(text="📥  Load Precomputed",
+                                        state="normal")
+            self._gs_btn_recompute.configure(state="normal")
+            self._gs_refresh_dataset_list()
+        except Exception:
+            pass
+
+    def _gs_ask_path_remap(self,
+                           sample_path: str) -> tuple[str, str] | None:
+        """Modal dialog asking the user for an optional path-prefix remap.
+
+        Returns (src_prefix, dst_prefix) — both may be empty strings meaning
+        "use paths verbatim".  Returns None if the user cancels.
+        """
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Path remapping (optional)")
+        dlg.transient(self.winfo_toplevel())
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        result: dict = {}
+
+        ctk.CTkLabel(
+            dlg,
+            text="Image paths in the file refer to the machine where "
+                 "embeddings were computed.",
+            font=ctk.CTkFont(size=11), wraplength=460, justify="left",
+        ).grid(row=0, column=0, columnspan=2, padx=14, pady=(14, 4), sticky="w")
+        ctk.CTkLabel(
+            dlg,
+            text="If you have a local copy of the dataset, map the original "
+                 "prefix to your local prefix so thumbnails resolve. "
+                 "Leave both empty to keep paths unchanged.",
+            font=ctk.CTkFont(size=10), text_color="#888",
+            wraplength=460, justify="left",
+        ).grid(row=1, column=0, columnspan=2, padx=14, pady=(0, 10), sticky="w")
+
+        ctk.CTkLabel(
+            dlg, text="Example path from file:",
+            font=ctk.CTkFont(size=10), text_color="#888",
+        ).grid(row=2, column=0, padx=14, pady=(0, 2), sticky="w")
+        ctk.CTkLabel(
+            dlg, text=sample_path or "(none)",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#c0d8ff", wraplength=460, justify="left",
+        ).grid(row=3, column=0, columnspan=2,
+               padx=14, pady=(0, 12), sticky="w")
+
+        ctk.CTkLabel(dlg, text="Replace this prefix:",
+                     font=ctk.CTkFont(size=11)).grid(
+            row=4, column=0, padx=14, pady=(0, 2), sticky="w")
+        src_entry = ctk.CTkEntry(dlg, width=460)
+        src_entry.grid(row=5, column=0, columnspan=2,
+                       padx=14, pady=(0, 8), sticky="ew")
+
+        ctk.CTkLabel(dlg, text="With this prefix:",
+                     font=ctk.CTkFont(size=11)).grid(
+            row=6, column=0, padx=14, pady=(0, 2), sticky="w")
+        dst_entry = ctk.CTkEntry(dlg, width=460)
+        dst_entry.grid(row=7, column=0, columnspan=2,
+                       padx=14, pady=(0, 14), sticky="ew")
+
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.grid(row=8, column=0, columnspan=2, padx=14, pady=(0, 14), sticky="e")
+
+        def _ok():
+            result["src"] = src_entry.get()
+            result["dst"] = dst_entry.get()
+            dlg.destroy()
+
+        def _cancel():
+            dlg.destroy()
+
+        ctk.CTkButton(btns, text="Cancel", width=90, fg_color="#444",
+                      hover_color="#666", command=_cancel).pack(
+            side="right", padx=(8, 0))
+        ctk.CTkButton(btns, text="Load", width=90,
+                      command=_ok).pack(side="right")
+
+        dlg.update_idletasks()
+        # Centre on the main window
+        try:
+            pw = self.winfo_toplevel()
+            x = pw.winfo_rootx() + (pw.winfo_width() - dlg.winfo_width()) // 2
+            y = pw.winfo_rooty() + (pw.winfo_height() - dlg.winfo_height()) // 3
+            dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+
+        self.wait_window(dlg)
+
+        if not result:
+            return None
+        return result["src"], result["dst"]
 
     def _gs_remove_dataset(self, dataset_id: int) -> None:
         # Find dataset name for the confirmation message
