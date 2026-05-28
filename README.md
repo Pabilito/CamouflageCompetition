@@ -215,9 +215,9 @@ The ranking tab can be **popped out** into its own standalone window via the "Po
 
 Three sub-tabs:
 
-- **Current Standings** — one row per identity showing their best (lowest average) image score, with individual per-model similarity scores. The lowest score in each model column is highlighted. Top 3 highlighted in gold/silver/bronze. Attack thumbnails show tag badges. Paginated (30 rows per page) with go-to-page navigation.
+- **Current Standings** — one row per identity showing their best (lowest average) image score, with individual per-model similarity scores. The lowest score in each model column is highlighted. Top 3 highlighted in gold/silver/bronze. Attack thumbnails show tag badges. Paginated (20 rows per page) with go-to-page navigation.
 
-- **All Images** — every scored image, filterable by model or showing the cross-model average. Displays attack and closest-match thumbnails (loaded asynchronously) with tag badges on attack images. Individual rows can be deleted. Paginated with go-to-page navigation.
+- **All Images** — every scored image, filterable by model or showing the cross-model average. Displays attack and closest-match thumbnails (loaded asynchronously) with tag badges on attack images. Individual rows can be deleted. Paginated (20 rows per page) with go-to-page navigation.
 
 - **Gallery Search** — per-identity summary of gallery search positions across all scored adversarial images. Each row shows:
   - The identity name and colour-coded position badges per image (green = high position = best attack, yellow = 2–5, red = position 1 = model still recognises)
@@ -232,7 +232,7 @@ Three sub-tabs:
   - **＋ Add Folder** — open a folder picker; all images are face-detected, aligned, and embedded across all models in a parallel worker pool (4 threads). Already-embedded images are skipped on re-import
   - **✕ Cancel** — appears during import; stops after the current batch and keeps all partial data already written to the database. Re-adding the same folder later resumes from where it left off
   - Dataset list showing name and image count, with a ✕ remove button per entry (confirmation dialog required)
-  - **↻ Recompute Positions** — recomputes gallery search positions for all existing adversarial images using the merged gallery (control + all external datasets). Disabled during import
+  - **↻ Recompute Positions** — recomputes gallery search positions for all existing adversarial images using the control gallery only (external datasets are stored in the DB for offline scripts but excluded from live ranking). Disabled during import
   - Progress bar and status label showing images processed, accepted, and current identity
   - Gallery summary line showing total identities and images from both control and external sources
 
