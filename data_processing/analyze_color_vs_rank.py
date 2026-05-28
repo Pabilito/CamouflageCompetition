@@ -173,6 +173,143 @@ def signed_hue_delta(h1: float, h2: float) -> float:
     return d
 
 
+# ── PNG correlation table ──────────────────────────────────────────────────
+
+def _write_corr_table(corr_rows: list, out_path: "Path") -> None:
+    """Render the correlation results as a styled PNG table figure."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        from matplotlib.colors import to_rgba
+    except ImportError:
+        print("[TABLE] matplotlib not installed — skipping correlation table.")
+        return
+
+    headers = ["Metric", "Description", "Pearson r", "Spearman ρ", "|ρ|"]
+    col_widths = [0.10, 0.36, 0.16, 0.16, 0.12]  # fractions of figure width
+
+    rows_data = []
+    for key, label, pr, sp in corr_rows:
+        abs_sp = abs(sp) if not (sp != sp) else float("nan")  # isnan
+        rows_data.append([
+            key,
+            label.strip(),
+            f"{pr:+.3f}" if pr == pr else "—",
+            f"{sp:+.3f}" if sp == sp else "—",
+            f"{abs_sp:.3f}" if abs_sp == abs_sp else "—",
+        ])
+
+    n_rows = len(rows_data)
+    fig_h  = 1.0 + n_rows * 0.38 + 0.6   # title + rows + note
+    fig, ax = plt.subplots(figsize=(9, fig_h))
+    ax.axis("off")
+
+    # ── Colour palette ────────────────────────────────────────────────────
+    HDR_BG  = "#1F3864"
+    HDR_FG  = "white"
+    ALT_BG  = "#F2F2F2"
+    POS_BG  = "#D6F0D6"
+    NEG_BG  = "#FCE4D6"
+    NOTE_FG = "#595959"
+
+    ROW_H  = 0.38 / fig_h        # normalised row height
+    HDR_H  = 0.46 / fig_h
+    TOP_Y  = 1.0 - (0.55 / fig_h)   # top of header row (axes-fraction)
+
+    def draw_cell(ax, x, y, w, h, text, bg=None, fg="black",
+                  bold=False, ha="center", fontsize=9.5):
+        if bg:
+            ax.add_patch(mpatches.FancyBboxPatch(
+                (x, y - h), w, h, boxstyle="square,pad=0",
+                linewidth=0, color=bg, transform=ax.transAxes, zorder=1))
+        ax.text(x + w * (0.06 if ha == "left" else 0.5),
+                y - h / 2, text,
+                transform=ax.transAxes, zorder=2,
+                ha=ha, va="center",
+                fontsize=fontsize,
+                fontweight="bold" if bold else "normal",
+                color=fg, clip_on=True)
+
+    # ── Title ─────────────────────────────────────────────────────────────
+    title_y = 1.0 - 0.05 / fig_h
+    ax.text(0.5, title_y,
+            "Colour-Metric × Rank Correlations",
+            transform=ax.transAxes, ha="center", va="top",
+            fontsize=13, fontweight="bold", color="#1F3864")
+
+    # ── Header ────────────────────────────────────────────────────────────
+    x = 0.0
+    for i, (h, cw) in enumerate(zip(headers, col_widths)):
+        draw_cell(ax, x, TOP_Y, cw, HDR_H, h,
+                  bg=HDR_BG, fg=HDR_FG, bold=True, fontsize=9.5)
+        x += cw
+
+    # ── Data rows ─────────────────────────────────────────────────────────
+    for ri, row in enumerate(rows_data):
+        y = TOP_Y - HDR_H - ri * ROW_H
+        x = 0.0
+        _, _, pr_s, sp_s, _ = row
+        # sign-based tint for numeric columns
+        def sign_bg(s):
+            if s.startswith("+"):  return POS_BG
+            if s.startswith("-"):  return NEG_BG
+            return ALT_BG if ri % 2 else "white"
+        row_bg = ALT_BG if ri % 2 else "white"
+
+        for ci, (cell, cw) in enumerate(zip(row, col_widths)):
+            if ci == 0:
+                bg, fg, bold, ha = row_bg, "#1F3864", True, "center"
+            elif ci == 1:
+                bg, fg, bold, ha = row_bg, "black", False, "left"
+            elif ci in (2, 3):
+                bg = sign_bg(cell)
+                fg, bold, ha = "black", False, "center"
+            else:
+                bg, fg, bold, ha = row_bg, "black", False, "center"
+            draw_cell(ax, x, y, cw, ROW_H, cell,
+                      bg=bg, fg=fg, bold=bold, ha=ha, fontsize=9.5)
+            x += cw
+
+    # ── Grid lines ────────────────────────────────────────────────────────
+    total_rows = n_rows
+    # horizontal lines (in axes coordinates via ax.plot)
+    def hline(y, color, lw):
+        ax.plot([0, 1], [y, y], color=color, linewidth=lw,
+                transform=ax.transAxes, zorder=3, solid_capstyle="butt")
+    def vline(x, y0, y1, color, lw):
+        ax.plot([x, x], [y0, y1], color=color, linewidth=lw,
+                transform=ax.transAxes, zorder=3, solid_capstyle="butt")
+
+    hline(TOP_Y,           "#AAAAAA", 0.5)
+    hline(TOP_Y - HDR_H,  HDR_BG,    1.5)
+    for ri in range(total_rows + 1):
+        hline(TOP_Y - HDR_H - ri * ROW_H, "#CCCCCC", 0.4)
+    x = 0.0
+    table_bottom = TOP_Y - HDR_H - total_rows * ROW_H
+    for cw in col_widths:
+        vline(x, table_bottom, TOP_Y, "#CCCCCC", 0.4)
+        x += cw
+    vline(1.0, table_bottom, TOP_Y, "#CCCCCC", 0.4)
+
+    # ── Legend / note ─────────────────────────────────────────────────────
+    note_y = table_bottom - 0.18 / fig_h
+    ax.text(0.0, note_y,
+            "  green = positive ρ   red = negative ρ   "
+            "|ρ| < 0.15 → no real relationship   "
+            "Spearman ρ is the primary signal",
+            transform=ax.transAxes, ha="left", va="top",
+            fontsize=8, color=NOTE_FG, style="italic")
+
+    plt.tight_layout(pad=0.3)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight",
+                facecolor="white", edgecolor="none")
+    plt.close(fig)
+    print(f"[TABLE] wrote {out_path}  ({out_path.stat().st_size/1024:.1f} KB)")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -187,6 +324,8 @@ def main() -> int:
                    help="Output CSV path.")
     p.add_argument("--plot", default="data_processing/results/color_vs_rank.png",
                    help="Output plot path. Use '' to skip plotting.")
+    p.add_argument("--corr-table", default="data_processing/results/color_vs_rank_correlations.png",
+                   help="Output PNG correlation table figure. Use '' to skip.")
     args = p.parse_args()
 
     db_path = Path(args.db)
@@ -367,15 +506,17 @@ def main() -> int:
         ("L_std", "L* std-dev across face"),
     ]
 
-    print()
-    print(f"{'Metric':<10}  {'Pearson r':>10}  {'Spearman ρ':>11}  {'|ρ|':>6}")
-    print("-" * 44)
     corr_rows = []
     for key, _label in METRICS:
         vals = np.array([r[key] for r in rows], dtype=np.float64)
         pr = pearson(vals, rank_arr)
         sp = spearman(vals, rank_arr)
-        corr_rows.append((key, pr, sp))
+        corr_rows.append((key, _label, pr, sp))
+
+    print()
+    print(f"{'Metric':<10}  {'Pearson r':>10}  {'Spearman ρ':>11}  {'|ρ|':>6}")
+    print("-" * 44)
+    for key, _label, pr, sp in corr_rows:
         print(f"{key:<10}  {pr:>+10.3f}  {sp:>+11.3f}  {abs(sp):>6.3f}")
 
     print()
@@ -384,6 +525,10 @@ def main() -> int:
           "rank (worse images have HIGHER values); negative ρ → metric "
           "shrinks with rank (worse images have LOWER values).  "
           "|ρ| < 0.15 typically means no real relationship.")
+
+    # ── Excel correlation table ───────────────────────────────────────────
+    if args.corr_table:
+        _write_corr_table(corr_rows, Path(args.corr_table))
 
     # ── Plot ──────────────────────────────────────────────────────────────
     if args.plot:
