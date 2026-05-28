@@ -72,7 +72,7 @@ class App(ctk.CTk):
                               fg_color=("#1a1a2e", "#1a1a2e"))
         header.pack(fill="x", side="top")
         ctk.CTkLabel(
-            header, text=" RMA Face Camouflage Competition",
+            header, text="Face Camouflage Competition",
             font=ctk.CTkFont(family="Courier New", size=16, weight="bold"),
             text_color="#00d4ff",
         ).pack(side="left", padx=16, pady=10)
@@ -162,7 +162,7 @@ class App(ctk.CTk):
 
         # Create the standalone window
         win = ctk.CTkToplevel(self)
-        win.title("Ranking — RMA Face Camouflage Competition")
+        win.title("Ranking —  Face Camouflage Competition")
         win.geometry("1000x680")
         win.minsize(700, 400)
         win.configure(fg_color=("#0d0d1a", "#0d0d1a"))
