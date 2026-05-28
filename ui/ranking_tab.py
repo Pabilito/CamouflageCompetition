@@ -1466,23 +1466,162 @@ class RankingTab(ctk.CTkFrame):
         if not confirmed:
             return
 
-        self._db.remove_ext_gallery_dataset(dataset_id)
+        deleted = self._db.remove_ext_gallery_dataset(dataset_id)
         self._gs_refresh_dataset_list()
-        self._gs_progress_label.configure(text="Dataset removed.", text_color="#888")
+        self._gs_progress_label.configure(
+            text=f"Dataset removed ({deleted} embedding"
+                 f"{'s' if deleted != 1 else ''} deleted) — reclaiming space…",
+            text_color="#888")
+
+        # Deleting rows frees pages but SQLite keeps the file size; VACUUM
+        # rewrites the file to actually shrink it. It needs an exclusive lock
+        # and can take a few seconds on a large DB, so run it off the UI thread.
+        def _vacuum():
+            try:
+                self._db.vacuum()
+                msg, color = (f"Dataset removed ({deleted} embedding"
+                              f"{'s' if deleted != 1 else ''} deleted)."), "#888"
+            except Exception as exc:
+                msg, color = f"Removed, but VACUUM failed: {exc}", "#ff6b6b"
+            self.after(0, lambda: self._gs_progress_label.configure(
+                text=msg, text_color=color))
+
+        threading.Thread(target=_vacuum, daemon=True).start()
 
     def _gs_trigger_recompute(self) -> None:
-        """Ask the recognition tab to batch-recompute gallery positions using
-        the current merged gallery (control + external datasets), then refresh."""
-        if self._recognition_tab is None:
-            self._gs_progress_label.configure(
-                text="Recognition tab not available.", text_color="#ff6b6b")
-            return
+        """Batch-recompute gallery_position / gallery_total for every
+        adversarial image using CONTROL gallery only. External gallery
+        datasets remain stored in the DB but are deliberately excluded from
+        ranking here — they're available to data_processing scripts that
+        want the full merged gallery.
+
+        Mirrors the algorithm in recognition_tab._recompute_gallery_positions
+        but runs locally so we don't depend on the recognition tab being
+        present and so we control the gallery composition (control-only).
+        """
         self._gs_progress_label.configure(
             text="Recomputing positions…", text_color="#888")
 
         def _bg():
+            import numpy as np
             try:
-                self._recognition_tab._recompute_gallery_positions()
+                model_names = self._engine.model_names
+
+                # Build per-model CONTROL gallery: {model: (id_names, boundaries, mat)}
+                # Same packing as recognition_tab._build_merged_gallery but
+                # without the ext-dataset merge step.
+                gallery_data: dict[str, tuple[list[str], list[int], "np.ndarray"]] = {}
+                for mn in model_names:
+                    ctrl = self._db.get_control_embeddings_for_model(mn)
+                    if not ctrl:
+                        continue
+                    by_id: dict[str, list] = {}
+                    for path, emb in ctrl.items():
+                        # Identity = parent folder name, same convention used
+                        # throughout the app (see _find_top1_any above and
+                        # recognition_tab._reload_gallery).
+                        identity = Path(path).parent.name
+                        by_id.setdefault(identity, []).append(emb)
+
+                    id_names:   list[str] = []
+                    boundaries: list[int] = []
+                    all_embs:   list      = []
+                    for id_name in sorted(by_id.keys()):
+                        embs = by_id[id_name]
+                        if not embs:
+                            continue
+                        id_names.append(id_name)
+                        all_embs.extend(embs)
+                        boundaries.append(len(all_embs))
+                    if all_embs:
+                        gallery_data[mn] = (id_names, boundaries,
+                                            np.stack(all_embs))
+
+                if not gallery_data:
+                    try:
+                        if self.winfo_exists():
+                            self.after(0, lambda: self._gs_progress_label.configure(
+                                text="No control gallery — nothing to rank.",
+                                text_color="#ffd166"))
+                    except Exception:
+                        pass
+                    return
+
+                # Adversarial embeddings (one bulk read per model) — query side.
+                adv_embs: dict[str, dict[str, object]] = {}
+                for mn in model_names:
+                    adv_embs[mn] = self._db.get_adversarial_embeddings_for_model(mn)
+
+                attack_images = self._db.get_distinct_attack_images()
+                if not attack_images:
+                    try:
+                        if self.winfo_exists():
+                            self.after(0, lambda: self._gs_progress_label.configure(
+                                text="No adversarial images to rank.",
+                                text_color="#ffd166"))
+                    except Exception:
+                        pass
+                    return
+
+                updates: list[tuple[str, int, int]] = []
+
+                for atk in attack_images:
+                    img_path = atk["image_path"]
+                    target   = atk["identity_name"]
+                    if not target:
+                        continue
+
+                    id_score_sums:   dict[str, float] = {}
+                    id_score_counts: dict[str, int]   = {}
+
+                    for mn in model_names:
+                        if mn not in gallery_data:
+                            continue
+                        query = adv_embs.get(mn, {}).get(img_path)
+                        if query is None:
+                            # No cached embedding for this image/model. We
+                            # intentionally skip rather than embed on the fly:
+                            # the recognition tab is the source of truth for
+                            # adversarial embeddings, and a missing one here
+                            # means the image hasn't been scored yet.
+                            continue
+
+                        id_names, boundaries, gallery_mat = gallery_data[mn]
+
+                        norms = np.linalg.norm(gallery_mat, axis=1)
+                        qnorm = np.linalg.norm(query)
+                        if qnorm < 1e-10:
+                            continue
+                        sims = (gallery_mat @ query) / (norms * qnorm + 1e-10)
+
+                        prev = 0
+                        for idx, boundary in enumerate(boundaries):
+                            best = float(np.max(sims[prev:boundary]))
+                            prev = boundary
+                            name = id_names[idx]
+                            id_score_sums[name]   = id_score_sums.get(name, 0.0) + best
+                            id_score_counts[name] = id_score_counts.get(name, 0) + 1
+
+                    if not id_score_sums:
+                        continue
+
+                    ranked = sorted(
+                        ((name, id_score_sums[name] / id_score_counts[name])
+                         for name in id_score_sums),
+                        key=lambda x: x[1], reverse=True,
+                    )
+                    total_ids  = len(ranked)
+                    target_pos = next(
+                        (i + 1 for i, (name, _) in enumerate(ranked)
+                         if name == target),
+                        None,
+                    )
+                    if target_pos is not None:
+                        updates.append((img_path, target_pos, total_ids))
+
+                if updates:
+                    self._db.bulk_update_gallery_positions(updates)
+
             except Exception as exc:
                 try:
                     if self.winfo_exists():
@@ -1491,6 +1630,7 @@ class RankingTab(ctk.CTkFrame):
                 except Exception:
                     pass
                 return
+
             try:
                 if self.winfo_exists():
                     self.after(0, self._gs_recompute_done)
@@ -1501,7 +1641,8 @@ class RankingTab(ctk.CTkFrame):
 
     def _gs_recompute_done(self) -> None:
         self._gs_progress_label.configure(
-            text="Positions updated.", text_color="#00ff9f")
+            text="Positions updated (control gallery only).",
+            text_color="#00ff9f")
         self._gs_cache = []
         self._refresh_gallery_search()
 
@@ -1571,10 +1712,12 @@ class RankingTab(ctk.CTkFrame):
                 adv_embs[mn]  = self._db.get_adversarial_embeddings_for_model(mn)
 
             def _find_top1_any(adv_path: str) -> tuple[str, str] | None:
-                """Return (identity_name, image_path) of the closest CONTROL or EXT
+                """Return (identity_name, image_path) of the closest CONTROL
                 gallery image to the adversarial image at adv_path, across all
-                identities. Query embedding comes from adv_embs; gallery candidates
-                come from ctrl_embs + ext gallery — never adversarial images."""
+                identities. Query embedding comes from adv_embs; gallery
+                candidates come from ctrl_embs only — external gallery datasets
+                are intentionally excluded from ranking (they remain stored in
+                the DB and available to data_processing scripts)."""
                 import numpy as np
 
                 id_scores: dict[str, list[float]] = {}
@@ -1601,24 +1744,6 @@ class RankingTab(ctk.CTkFrame):
                         )
                         id_scores.setdefault(id_name, []).append(best)
 
-                    # Ext gallery datasets
-                    for ds in ext_datasets:
-                        try:
-                            ext_rows = self._db.get_ext_gallery_embeddings_for_dataset_model(
-                                ds["id"], mn)
-                        except Exception:
-                            continue
-                        ext_by_id: dict[str, list] = {}
-                        for id_name, emb in ext_rows:
-                            ext_by_id.setdefault(id_name, []).append(emb)
-                        for id_name, embs in ext_by_id.items():
-                            best = max(
-                                float(np.dot(query, emb) /
-                                      (qnorm * np.linalg.norm(emb) + 1e-10))
-                                for emb in embs
-                            )
-                            id_scores.setdefault(id_name, []).append(best)
-
                 if not id_scores:
                     return None
 
@@ -1629,7 +1754,7 @@ class RankingTab(ctk.CTkFrame):
                 )
                 best_id = ranked[0][0]
 
-                # Find the specific closest image for best_id
+                # Find the specific closest CONTROL image for best_id
                 best_score = -2.0
                 best_img   = ""
                 for mn in model_names:
@@ -1639,7 +1764,6 @@ class RankingTab(ctk.CTkFrame):
                     qnorm = np.linalg.norm(query)
                     if qnorm < 1e-10:
                         continue
-                    # Search control images
                     for p, emb in ctrl_embs[mn].items():
                         if Path(p).parent.name != best_id:
                             continue
@@ -1648,21 +1772,6 @@ class RankingTab(ctk.CTkFrame):
                         if s > best_score:
                             best_score = s
                             best_img   = p
-                    # Search ext gallery images (with actual paths)
-                    for ds in ext_datasets:
-                        try:
-                            ext_rows = self._db.get_ext_gallery_embeddings_with_path(
-                                ds["id"], mn)
-                        except Exception:
-                            continue
-                        for img_path, id_name, emb in ext_rows:
-                            if id_name != best_id:
-                                continue
-                            s = float(np.dot(query, emb) /
-                                      (qnorm * np.linalg.norm(emb) + 1e-10))
-                            if s > best_score:
-                                best_score = s
-                                best_img   = img_path   # real path now
 
                 return (best_id, best_img) if best_id else None
 
@@ -1711,31 +1820,16 @@ class RankingTab(ctk.CTkFrame):
 
             cache.sort(key=lambda x: (x["best_pos"], x["avg_pos"]), reverse=True)
 
-            # Gallery size stats: control group (captures table) + ext datasets
+            # Gallery size stats: control group only (ext datasets are stored
+            # in the DB for data_processing scripts but excluded from ranking).
             try:
                 ctrl_stats  = self._db.get_control_gallery_stats()   # {identities, images}
             except Exception:
                 ctrl_stats  = {"identities": 0, "images": 0}
-            try:
-                ext_images   = sum(d["image_count"] for d in ext_datasets)
-                ext_ids_sets: set[str] = set()
-                for d in ext_datasets:
-                    try:
-                        ids = self._db.get_ext_gallery_identity_names(d["id"])
-                        ext_ids_sets.update(ids)
-                    except Exception:
-                        pass
-                ext_identities = len(ext_ids_sets)
-            except Exception:
-                ext_images     = 0
-                ext_identities = 0
 
             gallery_stats = {
                 "ctrl_identities": ctrl_stats.get("identities", 0),
                 "ctrl_images":     ctrl_stats.get("images", 0),
-                "ext_identities":  ext_identities,
-                "ext_images":      ext_images,
-                "ext_datasets":    len(ext_datasets) if ext_datasets else 0,
             }
             return cache, gallery_stats
 
@@ -1825,10 +1919,8 @@ class RankingTab(ctk.CTkFrame):
             if gs:
                 ctrl_part = (f"{gs.get('ctrl_images',0)} ctrl / "
                              f"{gs.get('ctrl_identities',0)} id")
-                ext_part  = (f"{gs.get('ext_images',0)} ext / "
-                             f"{gs.get('ext_identities',0)} id")
                 self._gs_summary.configure(
-                    text=f"0 attackers  •  Gallery: {ctrl_part}  +  {ext_part}")
+                    text=f"0 attackers  •  Gallery: {ctrl_part}")
             else:
                 self._gs_summary.configure(text="0 identities.")
             self._gs_lbl_page.configure(text="")
@@ -1925,14 +2017,10 @@ class RankingTab(ctk.CTkFrame):
         gs = self._gs_gallery_stats
         ctrl_part = (f"{gs.get('ctrl_images',0)} ctrl img / "
                      f"{gs.get('ctrl_identities',0)} identities")
-        ext_part  = (f"{gs.get('ext_images',0)} ext img / "
-                     f"{gs.get('ext_identities',0)} identities "
-                     f"({gs.get('ext_datasets',0)} dataset"
-                     f"{'s' if gs.get('ext_datasets',0) != 1 else ''})")
-        total_gallery_ids = gs.get('ctrl_identities', 0) + gs.get('ext_identities', 0)
+        total_gallery_ids = gs.get('ctrl_identities', 0)
         self._gs_summary.configure(
             text=f"{total} attacker{'s' if total != 1 else ''} ranked  •  "
-                 f"Gallery: {ctrl_part}  +  {ext_part}  "
+                 f"Gallery: {ctrl_part}  "
                  f"= {total_gallery_ids} total identities  •  "
                  f"best position = highest gallery rank  •  "
                  f"showing {start + 1}–{end}")

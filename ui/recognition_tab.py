@@ -1779,8 +1779,11 @@ class RecognitionTab(ctk.CTkFrame):
     def _build_merged_gallery(
         self,
     ) -> dict[str, tuple[list[str], list[int], "np.ndarray"]]:
-        """Build per-model gallery matrices that include BOTH the standard
-        control gallery AND any external gallery datasets.
+        """Build per-model gallery matrices from the standard control gallery.
+
+        (Historically this also merged external gallery datasets, but those
+        are deliberately excluded from the live recognition path now — see
+        the note below. The name is kept for compatibility with callers.)
 
         Returns gallery_data: model_name → (id_names, boundaries, matrix)
         where matrix is shape (N_total_images, embedding_dim) and boundaries
@@ -1800,23 +1803,12 @@ class RecognitionTab(ctk.CTkFrame):
                     emb for _, emb in pairs
                 )
 
-        # Merge external gallery datasets (DB read — runs on background thread)
-        try:
-            datasets = self._db.get_ext_gallery_datasets()
-        except Exception:
-            datasets = []
-
-        for ds in datasets:
-            dataset_id = ds["id"]
-            for mn in model_names:
-                try:
-                    ext_embs = self._db.get_ext_gallery_embeddings_for_dataset_model(
-                        dataset_id, mn
-                    )
-                except Exception:
-                    continue
-                for id_name, emb in ext_embs:
-                    merged.setdefault(mn, {}).setdefault(id_name, []).append(emb)
+        # NOTE: external gallery datasets are intentionally NOT merged here.
+        # The recognition / ranking path uses the control gallery only.
+        # Reading every external dataset and all its embeddings from the DB
+        # on every gallery build was the cause of the slow first launch.
+        # External datasets remain in the DB for offline data_processing
+        # scripts, but they no longer load into the live recognition path.
 
         # Pack into matrix structures
         gallery_data: dict[str, tuple[list[str], list[int], "np.ndarray"]] = {}

@@ -595,12 +595,41 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def remove_ext_gallery_dataset(self, dataset_id: int) -> None:
-        """Delete a dataset and all its embeddings (CASCADE)."""
+    def remove_ext_gallery_dataset(self, dataset_id: int) -> int:
+        """Delete a dataset and all its embeddings.
+
+        We delete the child embeddings explicitly rather than relying on
+        ON DELETE CASCADE: databases created by older app versions have an
+        ext_gallery_embeddings table that predates the foreign-key clause,
+        so the cascade silently does nothing on them and leaves orphaned
+        embeddings behind. Explicit deletion is correct on every DB version.
+
+        Returns the number of embedding rows deleted.
+        """
         with self._connect() as con:
+            emb = con.execute(
+                "DELETE FROM ext_gallery_embeddings WHERE dataset_id=?",
+                (dataset_id,),
+            ).rowcount
             con.execute(
                 "DELETE FROM ext_gallery_datasets WHERE id=?", (dataset_id,)
             )
+        return emb
+
+    def vacuum(self) -> None:
+        """Rebuild the database file, reclaiming free pages left behind by
+        deletes (SQLite never shrinks the file on its own).
+
+        VACUUM cannot run inside a transaction, so we use a dedicated
+        autocommit connection rather than the _connect() context manager.
+        Requires an exclusive lock — callers must ensure no other operation
+        is mid-write. Safe to call when idle.
+        """
+        con = sqlite3.connect(self._path, isolation_level=None)  # autocommit
+        try:
+            con.execute("VACUUM")
+        finally:
+            con.close()
 
     def upsert_ext_gallery_embedding(
         self, dataset_id: int, image_path: str,
