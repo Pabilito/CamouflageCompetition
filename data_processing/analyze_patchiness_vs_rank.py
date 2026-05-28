@@ -87,6 +87,7 @@ from core.database import Database     # noqa: E402
 from analysis_common import (          # noqa: E402
     AVG_KEY, correlate, get_per_model_rankings,
     write_corr_table, write_scatter_grid,
+    compute_pose_breakdown, write_pose_breakdown_table,
 )
 
 
@@ -371,6 +372,13 @@ def main() -> int:
                         "(patchiness_vs_rank_<model>.png). Use '' to skip plots.")
     p.add_argument("--corr-table", default="data_processing/results/patchiness_vs_rank_correlations.png",
                    help="Output merged PNG correlation table. Use '' to skip.")
+    p.add_argument("--pose-table", default="data_processing/results/patchiness_asymmetry_by_pose.png",
+                   help="Output PNG table breaking down the asymmetry metric's "
+                        "correlation by pose subset (all / frontal / profile). "
+                        "Use '' to skip.")
+    p.add_argument("--pose-metric", default="asymmetry",
+                   help="Which metric to break down by pose in --pose-table "
+                        "(default: asymmetry).")
     p.add_argument("--edge-thresh", type=float, default=8.0,
                    help="Lab colour-gradient magnitude (ΔE/step) above which "
                         "a pixel counts as a colour transition (default 8.0).")
@@ -498,6 +506,8 @@ def main() -> int:
                 "score":      entry["score"],
                 "identity":   rec["identity"],
                 "image_path": entry["image_path"],
+                "is_frontal": entry.get("is_frontal", 0),
+                "is_profile": entry.get("is_profile", 0),
             }
             for k in METRIC_KEYS:
                 row[k] = rec[k]
@@ -514,7 +524,8 @@ def main() -> int:
     # ── Write long-form CSV (one row per image×model) ─────────────────────
     csv_path = Path(args.csv)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = (["model", "rank", "score", "identity", "image_path"]
+    fieldnames = (["model", "rank", "score", "identity", "image_path",
+                   "is_frontal", "is_profile"]
                   + METRIC_KEYS)
     with csv_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -562,6 +573,38 @@ def main() -> int:
         write_corr_table(
             per_model_corr, METRICS, Path(args.corr_table),
             title="Patchiness-Metric Correlations (per model)")
+
+    # ── Pose breakdown of the asymmetry (or chosen) metric ────────────────
+    pose_metric = args.pose_metric
+    if pose_metric not in METRIC_KEYS:
+        print(f"[POSE] '{pose_metric}' is not a known metric; "
+              f"skipping pose breakdown.", file=sys.stderr)
+    else:
+        breakdown = compute_pose_breakdown(per_model_rows, pose_metric)
+        metric_label = dict(METRICS)[pose_metric]
+
+        print()
+        print(f"=== {pose_metric} by pose subset ===")
+        print(f"{'Model':<22}  "
+              f"{'all r/ρ (n)':>20}  "
+              f"{'frontal r/ρ (n)':>20}  "
+              f"{'profile r/ρ (n)':>20}")
+        print("-" * 90)
+        for model_name in breakdown:
+            cells = []
+            for sub in ("all", "frontal", "profile"):
+                d = breakdown[model_name][sub]
+                r_  = f"{d['r']:+.2f}" if d['r'] == d['r'] else "—"
+                rho = f"{d['rho']:+.2f}" if d['rho'] == d['rho'] else "—"
+                cells.append(f"{r_}/{rho} (n={d['n']})")
+            print(f"{model_name:<22}  {cells[0]:>20}  "
+                  f"{cells[1]:>20}  {cells[2]:>20}")
+
+        if args.pose_table:
+            write_pose_breakdown_table(
+                breakdown, Path(args.pose_table),
+                title="Asymmetry vs Recognition, by Pose",
+                metric_label=f"metric: {pose_metric} — {metric_label}")
 
     # ── Per-model scatter-grid PNGs ───────────────────────────────────────
     if args.plot_dir:
