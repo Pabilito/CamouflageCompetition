@@ -34,8 +34,9 @@ invoked with `--out` only; the rest receive both `--db` and `--out`.
 | `cross_pattern_similarity.py` | Adversarial ↔ adversarial cosine similarity across pattern groups (A ↔ B) | ✓ | `cross_pattern_pairs.csv`, `cross_pattern_summary.csv`, `cross_pattern_by_pair.csv` |
 | `gallery_search_stats.py` | Gallery search Rank-N accuracy, MRR, and position statistics per model and per pattern/cross-pattern pair. Produces two "All Models" rows: per-model pooled average and averaged-similarity method (as used in the UI). All rate values on 0–1 scale. | ✓ | `gallery_search_stats.csv` + 9 PNGs |
 | `score_distributions.py` | Similarity score distribution plots (mated vs non-mated, pose breakdown, cross-pattern, combined) + biometric statistics (EER, FMR100, FMR1000, TPR, AUC) + optimal-accuracy decision threshold tables, all saved per model and in combined overviews | ✓ | per-model PNGs + CSVs; global summary PNGs; per-pattern overview PNGs; threshold table PNGs |
-| `analyze_color_vs_rank.py` | Ranks adversarial images by mean similarity (hardest-to-recognise = rank 1), computes face-region perceptual colour metrics relative to the identity's first control image, and reports Pearson/Spearman correlations between those metrics and ranking position | ✓ | `color_vs_rank.csv`, `color_vs_rank.png` |
-| `analyze_patchiness_vs_rank.py` | Same ranking as `analyze_color_vs_rank.py`; measures face-region *patchiness* (frequency of colour transitions) using three metric families — edge-density, local-variance/texture-energy, and region-count/segmentation — and reports Pearson/Spearman correlations between each metric and rank. Delta values relative to the identity's first control image are included for the scalar texture metrics. | ✓ | `patchiness_vs_rank.csv`, `patchiness_vs_rank.png`, `patchiness_vs_rank_correlations.png` |
+| `analyze_color_vs_rank.py` | Computes face-region perceptual colour metrics relative to the identity's first control image, then correlates each against recognition strength **per model** (and a cross-model `AVG`). Reports Pearson `r` vs the raw similarity score and Spearman `ρ` vs rank. | ✓ | `color_vs_rank.csv`, one `color_vs_rank_<model>.png` per model, `color_vs_rank_correlations.png` |
+| `analyze_patchiness_vs_rank.py` | Same per-model approach as `analyze_color_vs_rank.py`; measures face-region *patchiness* (frequency of colour transitions) using five metric families — edge-density, local-variance/texture-energy, region-count/segmentation, left–right mirror symmetry, and high-frequency spectral energy — plus deltas vs the first control image for the scalar texture metrics. | ✓ | `patchiness_vs_rank.csv`, one `patchiness_vs_rank_<model>.png` per model, `patchiness_vs_rank_correlations.png` |
+| `analysis_common.py` | **Shared helper module** (not run directly) imported by the two `analyze_*_vs_rank.py` scripts. Provides the Pearson/Spearman primitives, per-model ranking retrieval, the merged correlation-table renderer, and the per-model scatter-grid renderer. Must sit alongside the two analysis scripts. | — | — |
 | `avg_similarity_by_identity.py` | Per-pattern scatter plots of average similarity score (across all models) per adversarial image, with identities sorted by a fixed numeric scheme and vertical cut-off lines marking participant groups. Also produces a combined all-patterns overlay and a grouped boxplot comparing score distributions across participant groups and patterns. | ✓ | `fig_avg_similarity_pat{N}.png`, `fig_avg_similarity_all_patterns.png`, `fig_boxplot_by_group.png` |
 | `visualize_results.py` | Heatmap and table figures for accuracy, score statistics, and cross-pattern results | — | 6 PNGs |
 
@@ -108,8 +109,10 @@ identity ranks further down the gallery).
 
 ### color_vs_rank.csv
 
-One row per adversarial image, ordered by average similarity rank
-(rank 1 = lowest mean similarity = hardest to recognise).
+Long-form table: **one row per (adversarial image × model)**, plus a cross-model
+`AVG` pseudo-model. Each row carries that model's `rank` (rank 1 = lowest
+similarity for that model = hardest to recognise) and raw similarity `score`.
+To reproduce the old one-row-per-image view, filter `model == "AVG"`.
 
 For each image, the script computes face-region colour statistics from the
 aligned 112×112 crop using the same elliptical face mask used elsewhere in
@@ -123,17 +126,18 @@ the project. Metrics include:
 - Deltas relative to the identity's first control image:
   `dL`, `da`, `db`, `dC`, `dE`, `dh`, `dS`, `dV`, `dR`, `dG`, `dB`
 
-Also includes the adversarial image rank, mean similarity score, model count,
-identity, image path, and reference-control Lab values.
+Also includes `model`, `rank`, `score`, `identity`, and `image_path`.
 
-The script prints Pearson (`r`) and Spearman (`ρ`) correlations between each
-metric and rank. Spearman correlation is generally the more meaningful measure
-because ranking itself is ordinal.
+The script prints, **per model**, Pearson (`r`) between each metric and the
+raw similarity score, and Spearman (`ρ`) between each metric and rank. Because
+a lower score means a better attack (and a lower rank number), `r` and `ρ`
+generally carry opposite signs. `|corr| < 0.15` indicates no real relationship.
 
 ### patchiness_vs_rank.csv
 
-One row per adversarial image, ordered by average similarity rank
-(rank 1 = lowest mean similarity = hardest to recognise).
+Long-form table: **one row per (adversarial image × model)**, plus a cross-model
+`AVG` pseudo-model, each with that model's `rank` and raw similarity `score`
+(filter `model == "AVG"` for the cross-model view).
 
 Patchiness metrics computed from the aligned 112×112 crop using the same
 elliptical face mask as `analyze_color_vs_rank.py`:
@@ -141,9 +145,13 @@ elliptical face mask as `analyze_color_vs_rank.py`:
 - **Edge-density:** `edge_density` (fraction of face pixels above gradient threshold), `grad_mean` (mean Lab gradient magnitude, ΔE/px), `grad_p90` (90th-percentile gradient)
 - **Local-variance / texture energy:** `local_var` (mean local L\* variance in 3×3 window), `lab_energy` (mean local Lab variance in 3×3 window), `laplacian_var` (variance of the Laplacian of L\*)
 - **Region-count / segmentation:** `n_regions` (connected colour regions after coarse Lab quantisation), `region_density` (regions per 1 000 face pixels), `color_entropy` (Shannon entropy of quantised-colour histogram, bits)
+- **Left–right mirror symmetry:** `asymmetry` (mean Lab ΔE between the face and its horizontal mirror), `asymmetry_max` (90th-percentile of that mirror ΔE)
+- **High-frequency spectral energy:** `hf_energy` (fraction of 2-D FFT power above a radial spatial-frequency cutoff, averaged over Lab channels, over the whole face region)
 - **Deltas vs first control image:** `d_edge_density`, `d_grad_mean`, `d_lab_energy`, `d_color_entropy`
 
-Also includes rank, mean similarity score, model count, identity, and image path.
+Also includes `model`, `rank`, `score`, `identity`, and `image_path`. As with
+the colour script, Pearson `r` is reported vs the raw similarity score and
+Spearman `ρ` vs rank, per model.
 
 ### avg_similarity output files
 
@@ -157,20 +165,21 @@ Also includes rank, mean similarity score, model count, identity, and image path
 
 ## Figure files
 
-### analyze_color_vs_rank.py — 1 PNG
+### analyze_color_vs_rank.py — per-model PNGs + 1 table
 
 | File | Contents |
 |------|----------|
-| `color_vs_rank.png` | Scatter plots of adversarial rank versus each colour metric (`L`, `a`, `b`, `dL`, `da`, `db`, `C`, `dC`, `dE`, `S`, `dS`, `L_std`) with least-squares trend lines and Pearson/Spearman correlation annotations |
+| `color_vs_rank_<model>.png` | One file **per model** (and a `color_vs_rank_AVG.png` for the cross-model average). 3-column scatter-plot grid, one panel per colour metric (`L`, `a`, `b`, `dL`, `da`, `db`, `C`, `dC`, `dE`, `S`, `dS`, `L_std`); x-axis = that model's similarity score, with least-squares trend line and Pearson `r` (vs score) / Spearman `ρ` (vs rank) annotations |
+| `color_vs_rank_correlations.png` | Merged table: metric rows × model-grouped columns, each model contributing a Pearson `r` (vs score) and Spearman `ρ` (vs rank) sub-column, sign-tinted green/red |
 
 ---
 
-### analyze_patchiness_vs_rank.py — 2 PNGs
+### analyze_patchiness_vs_rank.py — per-model PNGs + 1 table
 
 | File | Contents |
 |------|----------|
-| `patchiness_vs_rank.png` | 3-column scatter-plot grid (one panel per metric) of adversarial rank versus each patchiness metric with least-squares trend lines and Pearson/Spearman annotations |
-| `patchiness_vs_rank_correlations.png` | Summary table of Pearson `r` and Spearman `ρ` for every metric, sorted by `|ρ|` |
+| `patchiness_vs_rank_<model>.png` | One file **per model** (plus `patchiness_vs_rank_AVG.png`). 3-column scatter-plot grid, one panel per patchiness metric; x-axis = that model's similarity score, with trend lines and Pearson `r` / Spearman `ρ` annotations |
+| `patchiness_vs_rank_correlations.png` | Merged table: metric rows × model-grouped columns, each with Pearson `r` (vs score) and Spearman `ρ` (vs rank) sub-columns, sign-tinted green/red |
 
 ---
 
@@ -308,17 +317,18 @@ other scripts, not the database directly).
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--data-dir` | `data` | Root application data directory used to locate control images |
-| `--csv` | `data_processing/results/color_vs_rank.csv` | Output CSV path |
-| `--plot` | `data_processing/results/color_vs_rank.png` | Output plot path (`''` disables plot generation) |
+| `--csv` | `data_processing/results/color_vs_rank.csv` | Output CSV path (long form, one row per image × model) |
+| `--plot-dir` | `data_processing/results` | Directory for the per-model scatter-grid PNGs (`color_vs_rank_<model>.png`); `''` disables plot generation |
+| `--corr-table` | `data_processing/results/color_vs_rank_correlations.png` | Merged correlation table PNG (`''` disables) |
 
 `analyze_patchiness_vs_rank.py` additionally accepts:
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--data-dir` | `data` | Root application data directory used to locate control images |
-| `--csv` | `data_processing/results/patchiness_vs_rank.csv` | Output CSV path |
-| `--plot` | `data_processing/results/patchiness_vs_rank.png` | Scatter-plot grid output path (`''` disables) |
-| `--corr-table` | `data_processing/results/patchiness_vs_rank_correlations.png` | Correlation summary table PNG (`''` disables) |
+| `--csv` | `data_processing/results/patchiness_vs_rank.csv` | Output CSV path (long form, one row per image × model) |
+| `--plot-dir` | `data_processing/results` | Directory for the per-model scatter-grid PNGs (`patchiness_vs_rank_<model>.png`); `''` disables plot generation |
+| `--corr-table` | `data_processing/results/patchiness_vs_rank_correlations.png` | Merged correlation table PNG (`''` disables) |
 | `--edge-thresh` | `8.0` | ΔE threshold for counting a pixel as an edge in `edge_density` |
 | `--quant` | `16` | Number of Lab quantisation levels per channel for region-count and entropy metrics |
 
